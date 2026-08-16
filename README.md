@@ -1,126 +1,140 @@
 # worktree-mgr
 
-为 **dsh**（DeepSeek Harness，运行在 Cordis 插件框架之上的插件化 harness）提供「任务隔离工作区」能力的插件。
+[简体中文](README.zh.md)
 
-模型并行处理多个任务时，每个任务都在独立的 **git 工作区**（git worktree）与独立分支中完成，互不污染主工作区；任务结束自动提交、合并、清理。整个生命周期——**创建 / 同步 / 总览 / 收尾 / 批量清理**——由 5 个工具 + 1 个 CLI 覆盖，全程零手工 git 操作。
+A plugin that provides **task-isolated workspaces** for **dsh** (DeepSeek Harness, a plugin-based harness running on the Cordis plugin framework).
 
-## 核心概念
+When a model processes multiple tasks in parallel, each task is completed in its own **git workspace** (git worktree) on its own branch, without polluting the main workspace; when the task ends, the plugin commits, merges, and cleans up automatically. The full lifecycle — **create / sync / overview / finish / batch cleanup** — is covered by 5 tools + 1 CLI, with zero manual git operations throughout.
 
-| 概念 | 说明 |
+## Core Concepts
+
+| Concept | Description |
 |------|------|
-| 任务（task） | 一项独立工作，如 `add-search-box`。工具以任务名为入口 |
-| 分支 | 由任务名自动派生：`<prefix>/<任务slug>`，默认 `wtm/add-search-box`，也可显式指定 |
-| 工作区 | 位于 vault 目录下（默认平台数据目录 `wtm/vaults/<仓库slug>/`），与主仓库隔离 |
-| 账本 | vault 下的 `index.json`，持久化「任务 ↔ 分支 ↔ 路径」映射（JSON 格式，原子写入 + 互斥锁） |
-| 基分支 | 任务合并的目标分支，默认主工作区当前分支 |
+| Task | A single unit of work, e.g. `add-search-box`. Tools take the task name as entry point |
+| Branch | Derived automatically from the task name: `<prefix>/<task-slug>`, default `wtm/add-search-box`, or explicitly specified |
+| Workspace | Located under the vault directory (default platform data dir `wtm/vaults/<repo-slug>/`), isolated from the main repository |
+| Ledger | `index.json` under the vault, persisting the "task ↔ branch ↔ path" mapping (JSON format, atomic writes + mutex lock) |
+| Base branch | The branch a task merges into; defaults to the main workspace's current branch |
 
-## 特性
+## Features
 
-- **任务驱动**：给模型一个任务名，分支名、路径、账本记录全部自动生成，无需指定分支
-- **分支名安全**：任务名 → slug 规范化（段内 `..`、`.lock` 结尾、段首点等非法形态在源头修正），ref 合法性双重校验；不同任务派生同一 slug 时拒绝创建
-- **未提交改动检测**：基分支脏时拒绝合并（防止混入未完成工作）；任务工作区脏时默认自动快照提交
-- **合并目标一致性**：合并前校验「主工作区当前分支 == 账本基分支」「工作区当前分支 == 账本任务分支」，不一致一律拒绝——杜绝改动被提交到错误分支却报告成功的静默错误
-- **同步与收尾分离**：`wtm_merge` 只合并不清理，`wtm_finish` 提交→合并→删工作区→删分支→清记录；重试场景自动跳过已完成的合并（不产生重复空 merge 提交）
-- **批量清理**：`wtm_purge` 一次收尾多个任务，单任务失败不中断其余，任一失败即非零退出码
-- **仓库级配置**：`<仓库根>/.wtm.json` 支持分支前缀、消息模板、种子文件（带路径越界防护）、生命周期触发器（固定工作目录）
-- **并发安全**：账本写操作带互斥锁——锁内含唯一 token 与心跳刷新，陈旧锁仅在进程崩溃后回收，释放时绝不误删后继持有者的锁
-- **失败恢复**：创建中途失败自动回滚已创建的 worktree 与分支；合并冲突给出 `git merge --abort` 恢复指引
-- **跨平台**：Windows（cmd）与 POSIX（sh）触发器执行；路径比较大小写/分隔符归一化
-- **零依赖、免构建**：纯 Node ESM，`node >= 21` 即可，安装即用
+- **Task-driven**: give the model a task name and the branch name, path, and ledger record are all generated automatically — no need to specify a branch
+- **Branch name safety**: task name → slug normalization (illegal forms such as `..` within a segment, `.lock` suffix, leading dots in a segment are fixed at the source), with dual ref-validity checks; creation is rejected when different tasks derive the same slug
+- **Uncommitted change detection**: merge is refused when the base branch is dirty (prevents mixing in unfinished work); uncommitted changes in the task workspace trigger an automatic snapshot commit by default
+- **Merge target consistency**: before merging, the plugin validates "main workspace current branch == ledger base branch" and "task workspace current branch == ledger task branch"; any mismatch is refused — eliminating the silent error of reporting success while changes land on the wrong branch
+- **Sync and finish separated**: `wtm_merge` only merges without cleanup, while `wtm_finish` commits → merges → deletes workspace → deletes branch → clears the record; retry scenarios automatically skip already-completed merges (no duplicate empty merge commits)
+- **Batch cleanup**: `wtm_purge` finishes multiple tasks at once; a single task failure does not interrupt the rest, and any failure yields a non-zero exit code
+- **Repository-level configuration**: `<repo-root>/.wtm.json` supports branch prefixes, message templates, seed files (with path-escape protection), and lifecycle triggers (fixed working directory)
+- **Concurrency safety**: ledger writes hold a mutex — the lock contains a unique token with heartbeat refresh, stale locks are reclaimed only after a process crash, and release never mistakenly deletes a successor's lock
+- **Failure recovery**: a failed create rolls back the created worktree and branch automatically; merge conflicts provide a `git merge --abort` recovery guide
+- **Cross-platform**: triggers execute on Windows (cmd) and POSIX (sh); path comparison normalizes case and separators
+- **Zero dependencies, no build**: pure Node ESM, `node >= 21` is enough — install and use
 
-## 安装
+## Installing in DSH
 
-### 方式一：作为 dsh bundle 安装（推荐）
+Install the latest version into a profile from GitHub:
 
-在包含本目录的路径下：
+```bash
+dsh plugin --profile demo add github:JohnXu22786/worktree-mgr
+```
+
+Remove it:
+
+```bash
+dsh plugin --profile demo remove worktree-mgr
+```
+
+### Option 1: install as a dsh bundle (recommended)
+
+From a directory containing this package:
 
 ```bash
 dsh plugin --profile demo add ./worktree-mgr
 ```
 
-- `package.json` 声明了 `dsh.bundle.patch → cordis.patch.yml`，dsh 会自动把插件行插入 profile 的配置层；
-- 该层默认 `root: !!js process.cwd()`（以 dsh 启动目录为主仓库），可按需覆盖；
-- 本包为纯 JavaScript，无构建步骤，从 git 安装也不会缺产物。
+- `package.json` declares `dsh.bundle.patch → cordis.patch.yml`, so dsh automatically inserts the plugin line into the profile's configuration layer;
+- That layer defaults to `root: !!js process.cwd()` (the dsh startup directory as the main repository), overridable as needed;
+- This package is pure JavaScript with no build step, so installing from git never misses build artifacts.
 
-### 方式二：overlay 加载（不装进 profile）
+### Option 2: overlay loading (without installing into a profile)
 
 ```bash
 dsh --profile demo --patch ./examples/overlay.yml
 ```
 
-`overlay.yml` 与插件行配置结构一致，适合临时挂载或改配置。
+`overlay.yml` shares the same structure as the plugin line configuration, suitable for temporary mounting or configuration tweaks.
 
-### 方式三：独立 CLI
+### Option 3: standalone CLI
 
 ```bash
-npm link            # 或 node bin/wtm.js ...
+npm link            # or node bin/wtm.js ...
 wtm begin "Add Search Box"
 ```
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 为任务创建隔离工作区（自动派生分支 wtm/add-search-box）
+# 1. Create an isolated workspace for the task (auto-derives branch wtm/add-search-box)
 wtm begin "Add Search Box"
 
-# 2. 在 <vault>/add-search-box 中自由修改代码
-#    （或让模型在任务工作区目录中工作）
+# 2. Edit code freely inside <vault>/add-search-box
+#    (or let the model work inside the task workspace directory)
 
-# 3. 查看所有任务的状态（脏/领先/落后）
+# 3. View the status of all tasks (dirty/ahead/behind)
 wtm status
 
-# 4. 只同步不回填清理：把任务改动合并回基分支，工作区保留
+# 4. Sync only, without finishing: merge task changes back to the base branch, keeping the workspace
 wtm merge "Add Search Box"
 
-# 5. 收尾：快照提交 → 合并 → 移除工作区 → 删除分支 → 清账本
+# 5. Finish: snapshot commit → merge → remove workspace → delete branch → clear ledger
 wtm finish "Add Search Box"
 
-# 6. 批量收尾
-wtm purge "Task A" "Task B"      # 指定任务
-wtm purge --all                  # 全部任务
+# 6. Batch finish
+wtm purge "Task A" "Task B"      # specified tasks
+wtm purge --all                  # all tasks
 ```
 
-所有命令支持 `--json` 输出结构化结果，便于脚本与 harness 消费。
+All commands support `--json` for structured output, making them easy to consume from scripts and the harness.
 
-## 工具接口（模型可见）
+## Tool Interface (Model-Facing)
 
-| 工具 | 作用 | 关键参数 |
+| Tool | Purpose | Key parameters |
 |------|------|----------|
-| `wtm_begin` | 为任务创建隔离工作区 | `task`(必填), `base`, `branch`, `note`, `root` |
-| `wtm_merge` | 同步：任务分支合并回基分支（工作区保留） | `task`(必填), `mode`(commit/refuse), `message`, `root` |
-| `wtm_finish` | 收尾：提交→合并→清理工作区与分支 | `task`(必填), `mode`(commit/abandon/keep), `message`, `root` |
-| `wtm_status` | 任务总览（存在性/脏状态/领先落后） | `root` |
-| `wtm_purge` | 批量收尾 | `tasks`, `all`, `mode`, `message`, `root` |
+| `wtm_begin` | Create an isolated workspace for a task | `task`(required), `base`, `branch`, `note`, `root` |
+| `wtm_merge` | Sync: merge task branch back to base branch (workspace kept) | `task`(required), `mode`(commit/refuse), `message`, `root` |
+| `wtm_finish` | Finish: commit→merge→clean up workspace and branch | `task`(required), `mode`(commit/abandon/keep), `message`, `root` |
+| `wtm_status` | Task overview (existence/dirty state/ahead-behind) | `root` |
+| `wtm_purge` | Batch finish | `tasks`, `all`, `mode`, `message`, `root` |
 
-**mode 语义**
+**`mode` semantics**
 
-- `commit`（默认）：先自动快照提交任务工作区的未提交改动，再合并回基分支，最后清理
-- `refuse`：任务工作区有未提交改动时直接拒绝（仅 `wtm_merge`）
-- `abandon`：丢弃任务全部改动，强制清理工作区并删除分支（不可恢复，谨慎使用）
-- `keep`：仅解除管理，工作区与分支原样保留（仅 `wtm_finish`）
+- `commit` (default): first snapshot-commit the uncommitted changes in the task workspace, then merge back to the base branch, then clean up
+- `refuse`: refuse directly when the task workspace has uncommitted changes (only `wtm_merge`)
+- `abandon`: discard all task changes, force-clean the workspace and delete the branch (irrecoverable, use with care)
+- `keep`: only release management; workspace and branch remain untouched (only `wtm_finish`)
 
-**安全边界**（工具与 CLI 一致）：
+**Safety boundaries** (identical for tools and CLI):
 
-- 基分支工作区存在未提交改动 → 拒绝合并（`wtm_merge` / `wtm_finish` 的 commit 模式）
-- 主工作区当前分支与账本基分支不一致、任务工作区当前分支与账本记录不一致 → 拒绝操作（防止改动落错分支）
-- 任务分支已存在、任务已登记、工作区目录已存在、不同任务派生同一工作区路径 → 拒绝创建
-- 任务名或分支名非法（git ref 规则）→ 在任何 git 操作之前拒绝
-- 种子文件路径越界（`../x` 等逃逸仓库/工作区）→ 拦截并告警
-- 调用被取消（`exec.signal` abort）→ 干净返回；创建中途失败自动回滚已创建的 worktree 与分支
+- Base branch workspace has uncommitted changes → merge refused (`wtm_merge` / `wtm_finish` in commit mode)
+- Main workspace current branch ≠ ledger base branch, or task workspace current branch ≠ ledger record → operation refused (prevents changes landing on the wrong branch)
+- Task branch already exists, task already registered, workspace directory already exists, or different tasks deriving the same workspace path → creation refused
+- Illegal task or branch name (git ref rules) → refused before any git operation
+- Seed file path escapes (`../x` escaping the repo/workspace) → intercepted with a warning
+- Call cancelled (`exec.signal` abort) → clean return; a failed create rolls back created worktrees and branches automatically
 
-## 插件接入说明（harness 如何加载它）
+## Plugin Integration Notes (how the harness loads it)
 
-本插件遵循 dsh 的标准插件协议，共三块拼图：
+This plugin follows dsh's standard plugin protocol, consisting of three pieces:
 
 ```
 worktree-mgr/
-├── package.json        # ① dsh.bundle manifest：声明本包是一个配置层
-├── cordis.patch.yml    # ② 配置层内容：向 profile 插入插件行
-├── index.js            # ③ 入口模块：导出 name / inject / apply
-└── src/                # 实现：naming/config/vault/git/triggers/ops/tools
+├── package.json        # ① dsh.bundle manifest: declares this package as a configuration layer
+├── cordis.patch.yml    # ② Configuration layer content: inserts the plugin line into the profile
+├── index.js            # ③ Entry module: exports name / inject / apply
+└── src/                # Implementation: naming/config/vault/git/triggers/ops/tools
 ```
 
-**① bundle manifest**（`package.json`）：
+**① Bundle manifest** (`package.json`):
 
 ```json
 {
@@ -131,62 +145,62 @@ worktree-mgr/
 }
 ```
 
-**② 配置层**（`cordis.patch.yml`）：
+**② Configuration layer** (`cordis.patch.yml`):
 
 ```yaml
 - insert:
     - id: worktree-mgr
-      name: worktree-mgr        # 按包名解析，Node 模块解析找到 index.js
+      name: worktree-mgr        # resolved by package name; Node module resolution finds index.js
       config:
         root: !!js process.cwd()
 ```
 
-**③ 入口模块**（`index.js`）导出：
+**③ Entry module** (`index.js`) exports:
 
 ```js
 export const name = 'worktree-mgr'
-export const inject = ['tools']              // 声明依赖 tools 注册表
+export const inject = ['tools']              // declares dependency on the tools registry
 export function apply(ctx, config = {}) {
-  ctx.tools.register(...)                    // 注册 5 个工具
+  ctx.tools.register(...)                    // registers the 5 tools
 }
 ```
 
-加载顺序：profile 组装 → 本 bundle 的 patch 层插入插件行 → 加载器等待 `tools` 服务就绪 → 调用 `apply(ctx, config)` → 工具 schema 自动汇入系统提示词，模型即可调用。
+Loading order: profile assembly → this bundle's patch layer inserts the plugin line → the loader waits for the `tools` service → calls `apply(ctx, config)` → tool schemas flow into the system prompt automatically, and the model can invoke them.
 
-**工具定义形态**（与 dsh 工具约定一致）：
+**Tool definition shape** (consistent with dsh tool conventions):
 
 ```js
 {
   name: 'wtm_status',
-  description: '...',                        // 模型可见描述
-  parameters: {                              // 扁平属性表，required: true 为必填
-    root: { type: 'string', description: '仓库路径' }
+  description: '...',                        // model-visible description
+  parameters: {                              // flat property table; required: true means mandatory
+    root: { type: 'string', description: 'repository path' }
   },
   output: {
     schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
-    render: (args, value) => [{ type: 'text', text: '...' }]   // 模型可见内容
+    render: (args, value) => [{ type: 'text', text: '...' }]   // model-visible content
   },
-  async execute(args, exec) { ... }          // 返回规范 JSON；exec.signal 支持取消
+  async execute(args, exec) { ... }          // returns canonical JSON; exec.signal supports cancellation
 }
 ```
 
-**事件/钩子接口**：插件本身不订阅 harness 事件；生命周期扩展通过仓库级配置的 **触发器**（triggers）实现——在 `on_begin` / `on_merge` / `on_finish` 三个节点执行仓库配置的 shell 命令，注入 `WTM_TASK` / `WTM_BRANCH` / `WTM_BASE` / `WTM_PATH` / `WTM_ROOT` 环境变量。触发器有固定工作目录：`on_begin` 在新工作区内执行，`on_merge` / `on_finish` 在主仓库根目录执行。触发器失败只记警告，不中断主流程。
+**Events/hooks interface**: the plugin itself does not subscribe to harness events; lifecycle extensions go through **triggers** in the repository-level configuration — at the `on_begin` / `on_merge` / `on_finish` nodes, repo-configured shell commands run with `WTM_TASK` / `WTM_BRANCH` / `WTM_BASE` / `WTM_PATH` / `WTM_ROOT` environment variables injected. Triggers have fixed working directories: `on_begin` runs inside the new workspace, `on_merge` / `on_finish` run at the main repository root. Trigger failures only log warnings and never interrupt the main flow.
 
-## 配置
+## Configuration
 
-优先级（低 → 高）：**内置默认 < 插件行 config < 仓库 `.wtm.json` < 环境变量 `WTM_*`**
+Precedence (low → high): **built-in defaults < plugin line config < repo `.wtm.json` < environment variables `WTM_*`**
 
-| 键 | 默认 | 说明 |
+| Key | Default | Description |
 |----|------|------|
-| `root` | `process.cwd()` | 主仓库路径（仅插件行/工具参数） |
-| `vault` | 平台数据目录 `wtm/vaults/<仓库slug>/` | 任务工作区与账本存放目录；相对路径按仓库路径解析 |
-| `prefix` | `wtm` | 分支前缀，派生分支为 `<prefix>/<slug>` |
-| `commitMessage` | `chore(wtm): snapshot {task}` | 快照提交模板，占位符 `{task}` `{branch}` `{base}` |
-| `mergeMessage` | `merge(wtm): fold {task} into {base}` | 合并提交模板 |
+| `root` | `process.cwd()` | Main repository path (plugin line / tool parameter only) |
+| `vault` | platform data dir `wtm/vaults/<repo-slug>/` | Directory for task workspaces and the ledger; relative paths resolve against the repo path |
+| `prefix` | `wtm` | Branch prefix; derived branches are `<prefix>/<slug>` |
+| `commitMessage` | `chore(wtm): snapshot {task}` | Snapshot commit template, placeholders `{task}` `{branch}` `{base}` |
+| `mergeMessage` | `merge(wtm): fold {task} into {base}` | Merge commit template |
 
-环境变量：`WTM_ROOT`（工具与 CLI 均生效）、`WTM_VAULT`、`WTM_PREFIX`、`WTM_COMMIT_MESSAGE`、`WTM_MERGE_MESSAGE`（`WTM_ROOT` 优先级低于工具参数与插件配置）。
+Environment variables: `WTM_ROOT` (effective for both tools and CLI), `WTM_VAULT`, `WTM_PREFIX`, `WTM_COMMIT_MESSAGE`, `WTM_MERGE_MESSAGE` (`WTM_ROOT` has lower precedence than tool parameters and plugin config).
 
-### 仓库级配置 `<仓库根>/.wtm.json`
+### Repository-level config `<repo-root>/.wtm.json`
 
 ```json
 {
@@ -203,51 +217,55 @@ export function apply(ctx, config = {}) {
 }
 ```
 
-- `vault` **必须位于仓库工作树之外**（否则主工作区会被 vault 目录持续弄脏，插件会直接拒绝）；
-- `seed.files`：创建任务工作区时从主仓库复制到工作区的文件（如团队约定文档）；路径必须位于仓库/工作区内，越界条目会被拦截并告警；
-- `triggers.*`：生命周期钩子命令数组，见上文「事件/钩子接口」。
+- `vault` **must be outside the repository working tree** (otherwise the vault directory would keep dirtying the main workspace, and the plugin refuses outright);
+- `seed.files`: files copied from the main repository into the workspace when the task workspace is created (e.g. team convention docs); paths must stay within the repo/workspace — out-of-bounds entries are intercepted with a warning;
+- `triggers.*`: lifecycle hook command arrays, see "Events/hooks interface" above.
 
-未知键会产生警告并被忽略；损坏的 `.wtm.json` 不阻塞操作，仅告警。
+Unknown keys produce a warning and are ignored; a corrupted `.wtm.json` never blocks operations, only warns.
 
-## 安全说明（重要）
+## Security Notes (Important)
 
-- **仓库配置即代码**：`.wtm.json` 的 `seed.files` 会把仓库内的文件复制进工作区，`triggers.*` 会以当前用户权限执行任意 shell 命令。**只应在可信仓库中启用本插件**——克隆并操作不可信仓库时，仓库自带的 `.wtm.json` 等同于自动获得你的执行权限。无需此能力时留空 `seed`/`triggers` 即可。
-- **快照提交包含未跟踪文件**：任务工作区脏时，默认快照会 `git add -A` 提交全部改动（含未跟踪文件，如构建产物）。不想把大目录纳入历史，请先在任务工作区维护 `.gitignore`，或使用 `refuse` 模式手动处理。
-- **abandon 不可恢复**：`wtm_finish --mode abandon` 与批量 `wtm_purge` 会强制删除工作区并删除任务分支（`-D`），其中的改动无法恢复，仅应在确认丢弃时使用。
+- **Repository config is code**: `.wtm.json`'s `seed.files` copies files from the repo into workspaces, and `triggers.*` runs arbitrary shell commands with your user's privileges. **Only enable this plugin in trusted repositories** — when cloning and operating on untrusted repositories, a repo-supplied `.wtm.json` is equivalent to granting it your execution permissions. Leave `seed`/`triggers` empty when you don't need this capability.
+- **Snapshot commits include untracked files**: when the task workspace is dirty, the default snapshot `git add -A` commits everything (including untracked files such as build artifacts). To keep large directories out of history, maintain a `.gitignore` in the task workspace, or handle it manually with `refuse` mode.
+- **abandon is irrecoverable**: `wtm_finish --mode abandon` and batch `wtm_purge` force-delete workspaces and delete task branches (`-D`); changes there cannot be recovered, so only use them when you have confirmed the discard.
 
-## 账本与并发
+## Ledger and Concurrency
 
-- 账本：`<vault>/index.json`，`{version: 1, records: [{task, branch, base, path, createdAt, updatedAt, note?}]}`
-- 写入原子（临时文件 + rename），且全程持有 `.lock` 互斥锁；
-- 锁内含持有者唯一 token 与 30s 心跳刷新：进程崩溃后锁超过 5 分钟判定陈旧并回收；释放时校验 token，绝不误删后继持有者的锁；等待超时默认 5 秒。
+- Ledger: `<vault>/index.json`, `{version: 1, records: [{task, branch, base, path, createdAt, updatedAt, note?}]}`
+- Writes are atomic (temp file + rename) and hold a `.lock` mutex for the entire operation;
+- The lock contains a unique holder token with a 30s heartbeat refresh: after a process crash, a lock older than 5 minutes is deemed stale and reclaimed; release validates the token so a successor's lock is never mistakenly deleted; the wait timeout defaults to 5 seconds.
 
-## 开发与测试
+## Development and Testing
 
 ```bash
-npm test          # node --test，零第三方依赖
-npm run typecheck # 可选：需 dev 安装 typescript + @types/node
+npm test          # node --test, zero third-party dependencies
+npm run typecheck # optional: requires dev-installed typescript + @types/node
 ```
 
-测试覆盖：命名规则、配置合并、账本（原子写/锁/陈旧回收/损坏恢复）、git 输出解析、触发器、生命周期编排（fake git 注入）、工具 schema、以及调用真实 git 的集成测试（begin → 改文件 → status → finish 全链路）。
+Test coverage: naming rules, config merging, ledger (atomic writes/lock/stale reclamation/corruption recovery), git output parsing, triggers, lifecycle orchestration (fake git injection), tool schemas, plus integration tests against real git (full begin → modify files → status → finish chain).
 
-## 目录结构
+## Directory Structure
 
 ```
 worktree-mgr/
-├── package.json          # bundle manifest + 元数据
-├── cordis.patch.yml      # 插件配置层
-├── index.js              # dsh 插件入口（name/inject/apply）
-├── bin/wtm.js            # 独立 CLI
+├── package.json          # bundle manifest + metadata
+├── cordis.patch.yml      # plugin configuration layer
+├── index.js              # dsh plugin entry (name/inject/apply)
+├── bin/wtm.js            # standalone CLI
 ├── src/
-│   ├── naming.js         # 任务名→分支映射与 ref 校验
-│   ├── config.js         # 配置合并与模板渲染
-│   ├── vault.js          # 账本持久化（原子写/锁）
-│   ├── git.js            # git 执行层与输出解析
-│   ├── triggers.js       # 生命周期触发器
-│   ├── ops.js            # 生命周期编排（begin/merge/finish/status/purge）
-│   └── tools.js          # dsh 工具定义
+│   ├── naming.js         # task name → branch mapping and ref validation
+│   ├── config.js         # config merging and template rendering
+│   ├── vault.js          # ledger persistence (atomic writes/lock)
+│   ├── git.js            # git execution layer and output parsing
+│   ├── triggers.js       # lifecycle triggers
+│   ├── ops.js            # lifecycle orchestration (begin/merge/finish/status/purge)
+│   └── tools.js          # dsh tool definitions
 ├── examples/
-│   ├── .wtm.json.example # 仓库配置示例
-│   └── overlay.yml       # dsh overlay 示例
-└── tests/                # node:test 单元 + 集成测试
+│   ├── .wtm.json.example # repository config example
+│   └── overlay.yml       # dsh overlay example
+└── tests/                # node:test unit + integration tests
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
