@@ -1,0 +1,15 @@
+# worktree-mgr 插件配置层（dsh bundle patch）
+#
+# profile 引用本包后，加载器将此层插入配置树，注册 id=worktree-mgr 的插件行。
+# 用户可在自己的 profile cordis.patch.yml 或 --patch overlay 中按 id 覆盖 config：
+#
+#   - id: worktree-mgr
+#     config:
+#       root: C:/dev/my-project
+#       vault: D:/wtm-vaults
+#
+- insert:
+    - id: worktree-mgr
+      name: worktree-mgr
+      config:
+        root: !!js process.cwd()

@@ -1,0 +1,14 @@
+# 用户 overlay 示例：覆盖 worktree-mgr 插件行的配置
+#
+# 使用方式（任选）：
+#   1. 追加到 profile 自己的 <DSH_HOME>/profiles/<name>/cordis.patch.yml
+#   2. 启动时作为 overlay：dsh --profile demo --patch ./overlay.yml
+#
+# 注意：patch 会整行替换 config，而不是合并各键——因此这里的 config 只
+# 列出你确实要覆盖的键即可，其余保持插件默认。
+- id: worktree-mgr
+  config:
+    # 主仓库路径：不写则取插件行默认（process.cwd()）
+    root: C:/dev/my-project
+    # 任务工作区与账本的存放目录（相对路径会按仓库路径解析）
+    vault: D:/wtm-vaults

@@ -1,0 +1,46 @@
+{
+  "name": "worktree-mgr",
+  "version": "0.1.0",
+  "description": "dsh 插件：为任务自动创建隔离的 git 工作区，管理 创建/同步/收尾 全生命周期",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "bin": {
+    "wtm": "./bin/wtm.js"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "bin/",
+    "cordis.patch.yml",
+    "examples/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=21"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "dsh",
+    "plugin",
+    "git",
+    "worktree",
+    "isolation",
+    "agent"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

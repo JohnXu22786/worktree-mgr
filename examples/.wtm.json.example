@@ -1,0 +1,20 @@
+{
+  "prefix": "wtm",
+  "vault": "D:/wtm-vaults",
+  "commitMessage": "chore(wtm): snapshot {task}",
+  "mergeMessage": "merge(wtm): fold {task} into {base}",
+  "seed": {
+    "files": [
+      "docs/AGENTS.md"
+    ]
+  },
+  "triggers": {
+    "on_begin": [
+      "pnpm install"
+    ],
+    "on_merge": [
+      "pnpm lint"
+    ],
+    "on_finish": []
+  }
+}
