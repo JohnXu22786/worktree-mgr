@@ -91,6 +91,7 @@ test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
     '.hidden',
     'a.',
     'a\u0007b',
+    '@',
     '',
   ]
   for (const name of bad) {
