@@ -54,6 +54,27 @@ test('parseWorktreeList：空输出返回空数组', () => {
   assert.deepEqual(parseWorktreeList(''), [])
 })
 
+test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留）', () => {
+  // git worktree list --porcelain 对已删除目录的工作区输出 prunable 行，
+  // 解析器必须保留该条目与其分支信息（ops.js 结合目录实存判定 stale）。
+  const text = [
+    'worktree C:/main',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/main',
+    '',
+    'worktree D:/wtm-vaults/gone',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/wtm/gone',
+    'prunable gitdir file points to non-existent location',
+    '',
+  ].join('\n')
+  const list = parseWorktreeList(text)
+  assert.equal(list.length, 2)
+  assert.equal(list[1].path, 'D:/wtm-vaults/gone')
+  assert.equal(list[1].branch, 'wtm/gone')
+  assert.equal(list[1].locked, false)
+})
+
 test('parseAheadBehind：解析 rev-list 计数', () => {
   assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 3, behind: 5 })
   assert.deepEqual(parseAheadBehind('0\t0'), { ahead: 0, behind: 0 })
