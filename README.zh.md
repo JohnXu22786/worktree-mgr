@@ -98,6 +98,21 @@ wtm purge --all                  # 全部任务
 
 所有命令支持 `--json` 输出结构化结果，便于脚本与 harness 消费。
 
+## CLI 参考
+
+`bin/wtm.js` 可独立使用（`npm link` 后为 `wtm`，或 `node bin/wtm.js`）；每个子命令都支持 `--json`，结构化结果输出到 stdout。
+
+| 命令 | 说明 | 退出码 |
+|------|------|------|
+| `wtm begin <task>` | 创建隔离工作区（`--base`、`--branch`、`--note`、`--root`） | 0 成功 / 1 失败 |
+| `wtm merge <task>` | 任务分支合并回基分支，工作区保留（`--mode`、`--message`） | 0 / 1 |
+| `wtm finish <task>` | 收尾并清理（`--mode`、`--message`） | 0 / 1 |
+| `wtm status` | 全部任务总览 | 0 / 1 |
+| `wtm purge [task...]` | 批量收尾；`--all` 表示全部 | 0，任一任务失败为 1 |
+| `wtm help` | 打印用法 | 0（裸 `wtm` 为 2） |
+
+退出码语义：`0` 成功；`1` 操作失败（`--json` 模式下失败信息在 JSON 载荷中，且 `purge` 任一子任务失败同样为 1）；`2` 用法错误（未知或缺失命令）。`WTM_*` 环境变量对 CLI 同样生效。
+
 ## 工具接口（模型可见）
 
 | 工具 | 作用 | 关键参数 |

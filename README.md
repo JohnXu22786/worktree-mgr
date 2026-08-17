@@ -96,6 +96,21 @@ wtm purge --all                  # all tasks
 
 All commands support `--json` for structured output, making them easy to consume from scripts and the harness.
 
+## CLI Reference
+
+`bin/wtm.js` runs standalone (`wtm` after `npm link`, or `node bin/wtm.js`); every subcommand accepts `--json` for structured output on stdout.
+
+| Command | Description | Exit code |
+|------|------|------|
+| `wtm begin <task>` | Create an isolated workspace (`--base`, `--branch`, `--note`, `--root`) | 0 success / 1 failure |
+| `wtm merge <task>` | Merge the task branch back to the base, keep the workspace (`--mode`, `--message`) | 0 / 1 |
+| `wtm finish <task>` | Finish and clean up (`--mode`, `--message`) | 0 / 1 |
+| `wtm status` | Overview of all tasks | 0 / 1 |
+| `wtm purge [task...]` | Batch finish; `--all` for everything | 0, or 1 when any task fails |
+| `wtm help` | Print usage | 0 (2 for a bare `wtm`) |
+
+Exit codes: `0` success; `1` operation failure (with `--json` the failure lives in the JSON payload, and any failed sub-result of `purge` also yields 1); `2` usage errors (unknown or missing command). The `WTM_*` environment variables apply to the CLI as well.
+
 ## Tool Interface (Model-Facing)
 
 | Tool | Purpose | Key parameters |
