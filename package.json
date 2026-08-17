@@ -16,7 +16,8 @@
     "bin/",
     "cordis.patch.yml",
     "examples/",
-    "README.md"
+    "README.md",
+    "README.zh.md"
   ],
   "engines": {
     "node": ">=21"
