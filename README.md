@@ -267,6 +267,9 @@ worktree-mgr/
 ├── cordis.patch.yml      # plugin configuration layer
 ├── index.js              # dsh plugin entry (name/inject/apply)
 ├── bin/wtm.js            # standalone CLI
+├── README.md             # documentation (EN)
+├── README.zh.md          # documentation (ZH)
+├── LICENSE               # MIT license
 ├── src/
 │   ├── naming.js         # task name → branch mapping and ref validation
 │   ├── config.js         # config merging and template rendering

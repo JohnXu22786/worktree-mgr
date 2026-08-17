@@ -269,6 +269,9 @@ worktree-mgr/
 ├── cordis.patch.yml      # 插件配置层
 ├── index.js              # dsh 插件入口（name/inject/apply）
 ├── bin/wtm.js            # 独立 CLI
+├── README.md             # 文档（EN）
+├── README.zh.md          # 文档（ZH）
+├── LICENSE               # MIT 许可
 ├── src/
 │   ├── naming.js         # 任务名→分支映射与 ref 校验
 │   ├── config.js         # 配置合并与模板渲染
