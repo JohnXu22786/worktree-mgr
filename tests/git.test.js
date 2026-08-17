@@ -76,7 +76,9 @@ test('GitRunner.run：真实 git 可用时返回结构 {ok, code, stdout, stderr
 
 test('GitRunner.run：命令失败时 ok=false 且保留 stderr', { skip: !GitRunner.probe() }, async () => {
   const git = new GitRunner()
-  const r = await git.run(['rev-parse', '--does-not-exist'], { cwd: process.cwd() })
+  // 注意：git ≥2.45 将 rev-parse 的未知 -- 选项当作待解析 ref 处理并返回 0，
+  // 因此用不存在的子命令制造确定的失败（任意 git 版本退出码均非 0）。
+  const r = await git.run(['does-not-exist-command'], { cwd: process.cwd() })
   assert.equal(r.ok, false)
   assert.ok(r.code !== 0)
 })
