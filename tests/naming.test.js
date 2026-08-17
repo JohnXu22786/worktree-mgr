@@ -58,6 +58,21 @@ test('slugifyTask：超长任务名被截断（含前缀仍不超 100 字符）'
   assert.ok(branch.length <= 100, `分支名长度 ${branch.length} 应 ≤ 100`)
 })
 
+test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
+  // 截断切在 . 上：段尾残留 '.'
+  assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)
+  // 截断恰好切出 .lock 段尾
+  assert.equal(validateBranch(deriveBranch('z'.repeat(55) + '.lock' + 'xy')).ok, true)
+  // 截断恰好切在 / 后：出现空段（段尾 /）
+  assert.equal(validateBranch(deriveBranch('x'.repeat(59) + '/hidden')).ok, true)
+  // 截断切在 - 上：段尾残留 '-'
+  assert.equal(validateBranch(deriveBranch('x'.repeat(59) + '-ab')).ok, true)
+  // 截断后重新剥掉段尾非法形态，长度仍不超上限
+  const slug = slugifyTask('y'.repeat(59) + '.tail')
+  assert.ok(slug.length <= 60)
+  assert.equal(slug.endsWith('.'), false)
+})
+
 test('deriveBranch：默认前缀 wtm，支持自定义前缀', () => {
   assert.equal(deriveBranch('Dark Mode'), 'wtm/dark-mode')
   assert.equal(deriveBranch('Dark Mode', 'sandbox'), 'sandbox/dark-mode')

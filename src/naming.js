@@ -39,7 +39,22 @@ export function slugifyTask(task) {
   let slug = segments.join('/')
   // 折叠连续连字符，剥掉首尾的 - 与 .
   slug = slug.replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '')
-  if (slug.length > MAX_SLUG_LENGTH) slug = slug.slice(0, MAX_SLUG_LENGTH)
+  if (slug.length > MAX_SLUG_LENGTH) {
+    // 截断可能把段尾切在 .lock / . / - 上，甚至切出一个空段（切在 / 后），
+    // 导致派生分支违反 ref 规则（与“slug 必通过 validateBranch”的契约冲突）。
+    // 对截断结果重新做一次段级修正。
+    slug = slug
+      .slice(0, MAX_SLUG_LENGTH)
+      .split('/')
+      .map((seg) => seg
+        .replace(/\.{2,}/g, '-')
+        .replace(/\.lock$/g, '-lock')
+        .replace(/^\.+/g, ''))
+      .filter((seg) => seg !== '')
+      .join('/')
+      .replace(/-+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '')
+  }
   if (slug === '' || slug === '.') return 'task'
   return slug
 }
