@@ -125,13 +125,14 @@ export function createToolSet(opts) {
         type: 'object',
         additionalProperties: true,
         properties: {
-          ok: { type: 'boolean', required: true },
+          ok: { type: 'boolean' },
           task: { type: 'string' },
           branch: { type: 'string' },
           base: { type: 'string' },
           path: { type: 'string' },
           warnings: { type: 'array' },
         },
+        required: ['ok'],
       },
       render: (_args, value) => {
         if (!value.ok) return textBlock(`❌ 创建失败：${value.error}`)
@@ -176,11 +177,12 @@ export function createToolSet(opts) {
         type: 'object',
         additionalProperties: true,
         properties: {
-          ok: { type: 'boolean', required: true },
+          ok: { type: 'boolean' },
           committed: { type: 'boolean' },
           merged: { type: 'boolean' },
           warnings: { type: 'array' },
         },
+        required: ['ok'],
       },
       render: (_args, value) => {
         if (!value.ok) return textBlock(`❌ 同步失败：${value.error}`)
@@ -222,7 +224,7 @@ export function createToolSet(opts) {
         type: 'object',
         additionalProperties: true,
         properties: {
-          ok: { type: 'boolean', required: true },
+          ok: { type: 'boolean' },
           committed: { type: 'boolean' },
           merged: { type: 'boolean' },
           removed: { type: 'boolean' },
@@ -230,6 +232,7 @@ export function createToolSet(opts) {
           note: { type: 'string' },
           warnings: { type: 'array' },
         },
+        required: ['ok'],
       },
       render: (_args, value) => {
         if (!value.ok) return textBlock(`❌ 收尾失败：${value.error}`)
@@ -269,10 +272,11 @@ export function createToolSet(opts) {
         type: 'object',
         additionalProperties: true,
         properties: {
-          ok: { type: 'boolean', required: true },
+          ok: { type: 'boolean' },
           rows: { type: 'array' },
           warnings: { type: 'array' },
         },
+        required: ['ok'],
       },
       render: (_args, value) => {
         if (!value.ok) return textBlock(`❌ 总览失败：${value.error}`)
@@ -325,9 +329,10 @@ export function createToolSet(opts) {
         type: 'object',
         additionalProperties: true,
         properties: {
-          ok: { type: 'boolean', required: true },
+          ok: { type: 'boolean' },
           results: { type: 'array' },
         },
+        required: ['ok'],
       },
       render: (_args, value) => {
         if (!value.ok) return textBlock(`❌ 批量清理失败：${value.error}`)
