@@ -43,7 +43,7 @@ function makeSignal() {
   return new AbortController().signal
 }
 
-test('createToolSet：注册 5 个工具，schema 完整且 render 返回 text', () => {
+test('createToolSet：注册 5 个工具，参数为对象 schema 且 render 返回 text', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: { root: 'C:/repo' }, git })
   assert.equal(tools.length, 5)
@@ -52,8 +52,9 @@ test('createToolSet：注册 5 个工具，schema 完整且 render 返回 text',
   for (const t of tools) {
     assert.equal(typeof t.description, 'string')
     assert.ok(t.description.length > 20, `${t.name} 描述过短`)
-    assert.equal(typeof t.parameters, 'object')
-    assert.ok(t.parameters.task || t.name === 'wtm_status' || t.name === 'wtm_purge')
+    assert.equal(t.parameters.type, 'object')
+    assert.equal(typeof t.parameters.properties, 'object')
+    assert.ok(t.parameters.properties.task || t.name === 'wtm_status' || t.name === 'wtm_purge')
     assert.equal(typeof t.output, 'object')
     assert.ok(t.output.schema)
     assert.equal(typeof t.output.render, 'function')
@@ -64,15 +65,15 @@ test('createToolSet：注册 5 个工具，schema 完整且 render 返回 text',
   }
 })
 
-test('createToolSet：必填参数声明 required: true', () => {
+test('createToolSet：必填参数声明在 schema.required 中', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })
   const begin = tools.find((t) => t.name === 'wtm_begin')
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(begin, '工具 begin 应存在')
   assert.ok(status, '工具 status 应存在')
-  assert.equal(/** @type {{required?: boolean}} */ (begin.parameters.task).required, true)
-  assert.equal(/** @type {{root?: {required?: boolean}}} */ (status.parameters).root?.required, undefined)
+  assert.deepEqual(begin.parameters.required, ['task'])
+  assert.deepEqual(status.parameters.required, undefined)
 })
 
 test('wtm_begin：经工具入口完成创建并落账本', async () => {
@@ -162,12 +163,11 @@ test('wtm_finish 必填参数与默认 mode', () => {
   const tools = createToolSet({ config: {}, git })
   const finish = tools.find((t) => t.name === 'wtm_finish')
   assert.ok(finish, '工具 finish 应存在')
-  const fp = /** @type {{task: {required?: boolean}, mode?: {required?: boolean, enum?: string[]}}} */ (finish.parameters)
-  assert.equal(fp.task.required, true)
-  assert.equal(fp.mode?.required, undefined) // 可选，默认 commit
-  assert.equal(fp.mode?.enum?.includes('commit'), true)
-  assert.equal(fp.mode?.enum?.includes('abandon'), true)
-  assert.equal(fp.mode?.enum?.includes('keep'), true)
+  const fp = /** @type {{properties: {task: object, mode?: {enum?: string[]}}, required?: string[]}} */ (finish.parameters)
+  assert.deepEqual(fp.required, ['task'])
+  assert.equal(fp.properties.mode?.enum?.includes('commit'), true)
+  assert.equal(fp.properties.mode?.enum?.includes('abandon'), true)
+  assert.equal(fp.properties.mode?.enum?.includes('keep'), true)
 })
 
 test('wtm_status：无任务时返回空总览', async () => {
@@ -184,6 +184,5 @@ test('wtm_status：无任务时返回空总览', async () => {
   assert.deepEqual(value.rows, [])
   rmSync(tmp, { recursive: true, force: true })
 })
-
 
 

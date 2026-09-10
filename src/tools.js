@@ -3,7 +3,7 @@
  *
  * 每个工具遵循 dsh 工具约定：
  *   { name, description, parameters, output: { schema, render }, execute(args, exec) }
- * - parameters 为扁平属性表，required: true 表示必填；
+ * - parameters 为 JSON Schema 对象，required 数组声明必填参数；
  * - output.schema 声明规范返回值，render 负责生成模型可见的文本；
  * - execute 返回规范 JSON 值，失败时返回 { ok: false, error } 而非抛异常。
  *
@@ -54,7 +54,7 @@ export function readRepoConfig(root) {
  * @typedef {object} ToolDef
  * @property {string} name
  * @property {string} description
- * @property {Record<string, object>} parameters
+ * @property {{type: 'object', properties: Record<string, object>, required?: string[]}} parameters
  * @property {{schema: object, render: (args: Record<string, unknown>, value: any) => Array<{type: string, text: string}>}} output
  * @property {(args: Record<string, unknown>, exec?: {signal?: AbortSignal}) => Promise<object>} execute
  */
@@ -114,11 +114,15 @@ export function createToolSet(opts) {
       '在独立的目录中检出代码，任务间的改动互不干扰。创建后可自由在任务工作区中修改代码。' +
       '任务名与分支的对应关系会被记录，后续可用 wtm_merge / wtm_finish / wtm_status 管理。',
     parameters: {
-      task: { type: 'string', required: true, description: '任务名，如 "add-search-box"。将据此自动生成分支名' },
-      base: { type: 'string', description: '基分支名，默认取主工作区当前分支' },
-      branch: { type: 'string', description: '显式指定分支名（默认由任务名派生）' },
-      note: { type: 'string', description: '任务备注，记录在账本中' },
-      root: { type: 'string', description: '仓库路径（默认取插件配置或当前目录）' },
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '任务名，如 "add-search-box"。将据此自动生成分支名' },
+        base: { type: 'string', description: '基分支名，默认取主工作区当前分支' },
+        branch: { type: 'string', description: '显式指定分支名（默认由任务名派生）' },
+        note: { type: 'string', description: '任务备注，记录在账本中' },
+        root: { type: 'string', description: '仓库路径（默认取插件配置或当前目录）' },
+      },
+      required: ['task'],
     },
     output: {
       schema: {
@@ -167,10 +171,14 @@ export function createToolSet(opts) {
       '防止改动落错目标）。任务工作区会保留，可继续修改；合并前若有未提交改动，默认自动快照提交。' +
       '若基分支存在未提交改动则拒绝合并，防止混入未完成的工作。',
     parameters: {
-      task: { type: 'string', required: true, description: '要同步的任务名' },
-      mode: { type: 'string', enum: ['commit', 'refuse'], description: '任务工作区有未提交改动时的处理：commit=自动快照提交（默认），refuse=拒绝' },
-      message: { type: 'string', description: '覆盖默认提交/合并消息（含 {task} {branch} {base} 占位符）' },
-      root: { type: 'string', description: '仓库路径' },
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '要同步的任务名' },
+        mode: { type: 'string', enum: ['commit', 'refuse'], description: '任务工作区有未提交改动时的处理：commit=自动快照提交（默认），refuse=拒绝' },
+        message: { type: 'string', description: '覆盖默认提交/合并消息（含 {task} {branch} {base} 占位符）' },
+        root: { type: 'string', description: '仓库路径' },
+      },
+      required: ['task'],
     },
     output: {
       schema: {
@@ -214,10 +222,14 @@ export function createToolSet(opts) {
       '然后移除任务工作区并删除任务分支。abandon 模式直接丢弃全部改动并强制清理；' +
       'keep 模式仅解除管理，保留工作区与分支。',
     parameters: {
-      task: { type: 'string', required: true, description: '要收尾的任务名' },
-      mode: { type: 'string', enum: ['commit', 'abandon', 'keep'], description: 'commit=提交并合并后清理（默认）；abandon=丢弃改动强制清理；keep=仅解除管理' },
-      message: { type: 'string', description: '覆盖默认提交/合并消息' },
-      root: { type: 'string', description: '仓库路径' },
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '要收尾的任务名' },
+        mode: { type: 'string', enum: ['commit', 'abandon', 'keep'], description: 'commit=提交并合并后清理（默认）；abandon=丢弃改动强制清理；keep=仅解除管理' },
+        message: { type: 'string', description: '覆盖默认提交/合并消息' },
+        root: { type: 'string', description: '仓库路径' },
+      },
+      required: ['task'],
     },
     output: {
       schema: {
@@ -265,7 +277,10 @@ export function createToolSet(opts) {
       '列出所有进行中的任务：每个任务的工作区是否存在、是否有未提交改动、' +
       '分支与基分支的领先/落后提交数。用于决定哪些任务可以合并或收尾。',
     parameters: {
-      root: { type: 'string', description: '仓库路径' },
+      type: 'object',
+      properties: {
+        root: { type: 'string', description: '仓库路径' },
+      },
     },
     output: {
       schema: {
@@ -318,11 +333,14 @@ export function createToolSet(opts) {
       '批量收尾多个任务（或全部任务）。逐个执行与 wtm_finish 相同的流程，' +
       '单个任务失败不会中断其余任务；每个任务的结果单独报告。',
     parameters: {
-      tasks: { type: 'array', items: { type: 'string' }, description: '要清理的任务名列表（与 all 二选一）' },
-      all: { type: 'boolean', description: 'true 表示清理全部任务' },
-      mode: { type: 'string', enum: ['commit', 'abandon', 'keep'], description: '同 wtm_finish 的 mode' },
-      message: { type: 'string', description: '覆盖默认提交/合并消息' },
-      root: { type: 'string', description: '仓库路径' },
+      type: 'object',
+      properties: {
+        tasks: { type: 'array', items: { type: 'string' }, description: '要清理的任务名列表（与 all 二选一）' },
+        all: { type: 'boolean', description: 'true 表示清理全部任务' },
+        mode: { type: 'string', enum: ['commit', 'abandon', 'keep'], description: '同 wtm_finish 的 mode' },
+        message: { type: 'string', description: '覆盖默认提交/合并消息' },
+        root: { type: 'string', description: '仓库路径' },
+      },
     },
     output: {
       schema: {
@@ -358,4 +376,3 @@ export function createToolSet(opts) {
 
   return tools
 }
-

@@ -190,8 +190,11 @@ export function apply(ctx, config = {}) {
 {
   name: 'wtm_status',
   description: '...',                        // 模型可见描述
-  parameters: {                              // 扁平属性表，required: true 为必填
-    root: { type: 'string', description: '仓库路径' }
+  parameters: {                              // JSON Schema 对象
+    type: 'object',
+    properties: {
+      root: { type: 'string', description: '仓库路径' }
+    }
   },
   output: {
     schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
