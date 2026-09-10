@@ -163,7 +163,9 @@ test('wtm_finish 必填参数与默认 mode', () => {
   const tools = createToolSet({ config: {}, git })
   const finish = tools.find((t) => t.name === 'wtm_finish')
   assert.ok(finish, '工具 finish 应存在')
-  const fp = /** @type {{properties: {task: object, mode?: {enum?: string[]}}, required?: string[]}} */ (finish.parameters)
+  const fp = /** @type {{type: 'object', properties: {task: object, mode?: {enum?: string[]}}, required?: string[]}} */ (
+    /** @type {unknown} */ (finish.parameters)
+  )
   assert.deepEqual(fp.required, ['task'])
   assert.equal(fp.properties.mode?.enum?.includes('commit'), true)
   assert.equal(fp.properties.mode?.enum?.includes('abandon'), true)
@@ -184,5 +186,4 @@ test('wtm_status：无任务时返回空总览', async () => {
   assert.deepEqual(value.rows, [])
   rmSync(tmp, { recursive: true, force: true })
 })
-
 
