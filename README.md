@@ -188,8 +188,11 @@ Loading order: profile assembly → this bundle's patch layer inserts the plugin
 {
   name: 'wtm_status',
   description: '...',                        // model-visible description
-  parameters: {                              // flat property table; required: true means mandatory
-    root: { type: 'string', description: 'repository path' }
+  parameters: {                              // JSON Schema object
+    type: 'object',
+    properties: {
+      root: { type: 'string', description: 'repository path' }
+    }
   },
   output: {
     schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
