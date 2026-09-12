@@ -30,9 +30,10 @@ test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () 
 })
 
 test('resolveVault：显式 vault 生效（相对路径以仓库路径解析）', () => {
+  const rootPath = process.platform === 'win32' ? 'C:/repo' : '/repo'
   assert.equal(resolveVault({ rootPath: 'C:/repo', vault: 'D:/v' }), 'D:/v')
-  assert.equal(resolveVault({ rootPath: 'C:/repo', vault: './v' }), join('C:/repo', 'v'))
-  assert.equal(resolveVault({ rootPath: 'C:/repo', vault: '' }), null) // 空串视为未设置
+  assert.equal(resolveVault({ rootPath, vault: './v' }), join(rootPath, 'v'))
+  assert.equal(resolveVault({ rootPath, vault: '' }), null) // 空串视为未设置
 })
 
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
