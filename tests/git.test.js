@@ -80,8 +80,9 @@ test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留
   assert.equal(list[1].locked, false)
 })
 
-test('parseAheadBehind：解析 rev-list 计数', () => {
-  assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 3, behind: 5 })
+test('parseAheadBehind：按 base...branch 语义映射 rev-list 计数', () => {
+  // rev-list 的第一个计数是基分支独有提交（任务落后），第二个是任务分支独有提交（任务领先）。
+  assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 5, behind: 3 })
   assert.deepEqual(parseAheadBehind('0\t0'), { ahead: 0, behind: 0 })
   assert.equal(parseAheadBehind('garbage'), null)
   assert.equal(parseAheadBehind(''), null)

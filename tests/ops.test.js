@@ -482,7 +482,7 @@ test('listStatus：计算存在性、脏状态与 ahead/behind', async () => {
   assert.ok(t2, '应有 T2')
   assert.equal(t1.exists, true)
   assert.equal(t1.dirty, true)
-  assert.deepEqual(t1.counts, { ahead: 1, behind: 2 })
+  assert.deepEqual(t1.counts, { ahead: 2, behind: 1 })
   assert.equal(t2.exists, false)
   assert.equal(t2.counts, null)
   rmSync(tmp, { recursive: true, force: true })
@@ -718,6 +718,5 @@ test('purge：all 与 tasks 同时指定时报错', async () => {
   assert.match(r.error ?? '', /二选一/)
   rmSync(tmp, { recursive: true, force: true })
 })
-
 
 
