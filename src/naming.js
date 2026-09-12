@@ -69,8 +69,8 @@ export function slugifyTask(task) {
       .replace(/^\.+/g, ''))
     .filter((seg) => seg !== '')
   let slug = segments.join('/')
-  // 折叠连续连字符，剥掉首尾的 - 与 .
-  slug = slug.replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '')
+  // 折叠连续连字符，剥掉首尾的 /、- 与 .
+  slug = slug.replace(/-+/g, '-').replace(/^[-./]+|[-./]+$/g, '')
   if (slug.length > MAX_SLUG_LENGTH) {
     // 按 Unicode code point 截断，避免切断非 BMP 字符；同时可能把段尾切在
     // .lock / . / - 上，甚至切出一个空段（切在 / 后），
