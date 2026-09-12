@@ -24,6 +24,14 @@ test('resolveToplevel：保留仓库路径末尾的空格', async () => {
   assert.deepEqual(result, { ok: true, root: '/tmp/repo ' })
 })
 
+test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
+  const git = {
+    run: async () => ({ ok: true, code: 0, stdout: '/tmp/repo\r\n', stderr: '', aborted: false }),
+  }
+  const result = await resolveToplevel(git, '/tmp/repo\r')
+  assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
+})
+
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
   const text = [
     'worktree C:/my repo/main',
