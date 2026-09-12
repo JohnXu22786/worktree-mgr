@@ -95,6 +95,43 @@ test('wtm_begin：经工具入口完成创建并落账本', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('wtm_begin：失败时合并并渲染操作警告', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  const root = join(tmp, 'repo')
+  const vault = join(tmp, 'vault')
+  mkdirSync(root)
+  const indexPath = join(vault, 'index.json')
+  const worktreePath = join(vault, 't')
+  const git = new FakeGit()
+  git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK())
+  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'main'], () => {
+    // 让 worktree 创建后账本写入失败，从而进入 begin() 的回滚路径。
+    mkdirSync(indexPath)
+    return OK()
+  })
+  git.on(['worktree', 'remove', '--force', worktreePath], FAIL('fatal: cannot remove worktree'))
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  const tools = createToolSet({ config: { root, vault, unknown: true }, git })
+  const begin = tools.find((t) => t.name === 'wtm_begin')
+  assert.ok(begin, '工具 begin 应存在')
+  const value = /** @type {{ok: boolean, error?: string, warnings?: string[]}} */ (
+    await begin.execute({ task: 'T' }, { signal: makeSignal() })
+  )
+  assert.equal(value.ok, false)
+  assert.ok(value.warnings?.some((w) => /未知或类型不符/.test(w)), JSON.stringify(value))
+  assert.ok(value.warnings?.some((w) => /cannot remove worktree/.test(w)), JSON.stringify(value))
+
+  const rendered = begin.output.render({}, value)
+  assert.match(rendered[0].text, /创建失败/)
+  assert.match(rendered[0].text, /cannot remove worktree/)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('wtm_begin：非 git 目录返回友好错误（不抛异常）', async () => {
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], FAIL('fatal: not a git repository'))

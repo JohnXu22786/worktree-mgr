@@ -285,6 +285,37 @@ test('begin：worktree add 失败透传 stderr', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：回滚命令返回失败对象时保留失败警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const worktreePath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'remove', '--force', worktreePath], FAIL('fatal: cannot remove worktree'))
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  const r = await begin({
+    root: 'C:/repo',
+    task: 'T',
+    cfg,
+    git,
+    repo: { triggers: { on_begin: ['broken-trigger'] } },
+    // 让 on_begin 在 worktree 创建后抛错，从而进入回滚路径。
+    triggerSpawn: () => ({}),
+  })
+
+  assert.equal(r.ok, false)
+  assert.ok((r.warnings ?? []).some((w) => /回滚失败/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).some((w) => /cannot remove worktree/.test(w)), JSON.stringify(r))
+  assert.ok(!(r.warnings ?? []).some((w) => /已回滚/.test(w)), JSON.stringify(r))
+  assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：执行 on_begin 触发器并附带警告', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)

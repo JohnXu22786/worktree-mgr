@@ -249,15 +249,22 @@ export async function begin(opts) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && typeof result === 'undefined') {
       try {
-        await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        await git.run(['branch', '-D', branchName], { cwd: root })
-        warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
+        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
+        const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+        if (remove.ok && branch.ok) {
+          warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
+        } else {
+          const failures = []
+          if (!remove.ok) failures.push(`worktree remove 失败：${remove.stderr.trim() || '命令返回失败'}`)
+          if (!branch.ok) failures.push(`branch -D 失败：${branch.stderr.trim() || '命令返回失败'}`)
+          warnings.push(`工作区创建未完成，且回滚失败：${failures.join('；')}；请手动执行 git worktree remove / branch -D`)
+        }
       } catch {
         warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
-    if (err instanceof VaultError) return { ok: false, error: err.message }
-    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
+    if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
+    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
   if (!result.ok) return result
   return {
