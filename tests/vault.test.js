@@ -1,6 +1,7 @@
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -90,6 +91,28 @@ test('withLock：串行执行并释放锁', async () => {
   await withLock(dir, async () => { order.push(1) })
   await withLock(dir, async () => { order.push(2) })
   assert.deepEqual(order, [1, 2])
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：写入 token 失败时清理文件描述符和锁文件', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const writeError = new Error('token write failed')
+  mock.method(fs, 'writeFileSync', () => { throw writeError })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}),
+      (error) => error === writeError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(lockPath), false)
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 200, staleMs: 60_000 })
+  assert.equal(acquired, true)
   rmSync(dir, { recursive: true, force: true })
 })
 

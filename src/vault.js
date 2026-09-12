@@ -240,6 +240,11 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       owned = true
       break
     } catch (err) {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* 忽略 */ }
+        try { unlinkSync(lockPath) } catch { /* 忽略 */ }
+        fd = null
+      }
       if (/** @type {any} */ (err).code !== 'EEXIST') throw err
       // 陈旧回收：mtime 超过 staleMs（持有者心跳已停止，视为进程死亡）
       try {
