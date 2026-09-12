@@ -45,7 +45,7 @@ function usage() {
  * @property {boolean} [merged]
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean, counts: {ahead: number, behind: number} | null}>} [rows]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null}>} [rows]
  * @property {Array<{task: string, ok: boolean, error?: string, note?: string}>} [results]
  * @property {string[]} [warnings]
  */
