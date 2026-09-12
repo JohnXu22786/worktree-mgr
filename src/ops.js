@@ -209,7 +209,14 @@ export async function begin(opts) {
 
       // 核心动作：创建 worktree
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      if (!add.ok) {
+        // git 可能在返回失败前已经创建了分支或工作区；取消时必须按部分成功处理并回滚。
+        if (add.aborted || isAborted(opts.signal)) {
+          createdWorktree = true
+          throw new OperationAborted()
+        }
+        return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      }
       createdWorktree = true
       throwIfAborted(opts.signal)
 
@@ -297,8 +304,8 @@ export async function begin(opts) {
       }
     }
     if (aborted) return abortResult(warnings)
-    if (err instanceof VaultError) return { ok: false, error: err.message }
-    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
+    if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
+    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
   if (!result.ok) return result
   return {

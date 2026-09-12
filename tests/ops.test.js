@@ -231,6 +231,32 @@ test('begin：worktree add 失败透传 stderr', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：worktree add 期间 abort 即使 git 返回失败也会回滚', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const ac = new AbortController()
+  const wtPath = join(tmp, 'vault', 't')
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], () => {
+    ac.abort()
+    return { ...FAIL(), aborted: true }
+  })
+  git.on(['worktree', 'remove', '--force', wtPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null, signal: ac.signal })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
+  assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：执行 on_begin 触发器并附带警告', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
@@ -266,6 +292,42 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
   })
   assert.equal(r.ok, true)
   assert.ok((r.warnings ?? []).some((w) => /boom/.test(w)), JSON.stringify(r.warnings))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：非 abort 异常回滚失败时返回 warnings', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const wtPath = join(tmp, 'vault', 't')
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'remove', '--force', wtPath], FAIL('remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('branch failed'))
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+
+  const r = await begin({
+    root: 'C:/repo', task: 'T', cfg, git,
+    repo: { triggers: { on_begin: ['make-ledger-invalid'] } },
+    triggerSpawn: () => {
+      mkdirSync(join(cfg.vault, 'index.json'))
+      queueMicrotask(() => {
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /创建失败|EISDIR|目录/i)
+  assert.ok((r.warnings ?? []).some((w) => /回滚失败/.test(w)), JSON.stringify(r.warnings))
+  assert.ok((r.warnings ?? []).some((w) => /remove failed/.test(w)), JSON.stringify(r.warnings))
+  assert.ok((r.warnings ?? []).some((w) => /branch failed/.test(w)), JSON.stringify(r.warnings))
   rmSync(tmp, { recursive: true, force: true })
 })
 
