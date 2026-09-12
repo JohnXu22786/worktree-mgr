@@ -226,7 +226,11 @@ export async function begin(opts) {
       if (add.aborted || isAborted(opts.signal)) {
         throw abortError()
       }
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      if (!add.ok) {
+        const err = new Error(`创建工作区失败：${add.stderr.trim() || 'git worktree add 失败'}`)
+        err.name = 'WorktreeCreateError'
+        throw err
+      }
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
       const seedFiles = repo?.seed?.files
@@ -308,6 +312,9 @@ export async function begin(opts) {
     }
     if (isAborted(opts.signal) || (err instanceof Error && err.name === 'AbortError')) {
       return withWarnings(abortResult())
+    }
+    if (err instanceof Error && err.name === 'WorktreeCreateError') {
+      return withWarnings({ ok: false, error: err.message })
     }
     if (err instanceof VaultError) return withWarnings({ ok: false, error: err.message })
     return withWarnings({ ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` })
@@ -477,14 +484,13 @@ export async function purge(opts) {
         : tasks.map((t) => ({ rec: findRecord(ledger, t), name: t }))
       const results = []
       for (const item of targets) {
-        if (isAborted(opts.signal)) return abortResult()
+        if (isAborted(opts.signal)) return { ...abortResult(), results: [...results] }
         if (!item.rec) {
           results.push({ task: item.name, ok: false, error: '任务不存在' })
           continue
         }
         const r = await finishCore(opts, { vault, ledger, rec: item.rec, mode })
-        if (isAborted(opts.signal) || r.aborted) return abortResult(r.warnings ?? [], { cleanupFailed: r.cleanupFailed })
-        results.push({
+        const itemResult = {
           task: item.rec.task,
           ok: r.ok,
           error: r.error,
@@ -492,7 +498,14 @@ export async function purge(opts) {
           merged: r.merged,
           committed: r.committed,
           warnings: r.warnings,
-        })
+        }
+        if (isAborted(opts.signal) || r.aborted) {
+          return {
+            ...abortResult(r.warnings ?? [], { cleanupFailed: r.cleanupFailed }),
+            results: [...results, itemResult],
+          }
+        }
+        results.push(itemResult)
       }
       return { ok: true, results }
     })

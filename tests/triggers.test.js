@@ -124,6 +124,7 @@ test('runTriggers：取消后停止后续触发器，并传递 AbortSignal', asy
   const child = /** @type {any} */ (new EventEmitter())
   child.stdout = new EventEmitter()
   child.stderr = new EventEmitter()
+  child.kill = () => true
   const result = await runTriggers(['abort-cmd', 'later-cmd'], {}, {
     signal: ac.signal,
     spawn: (/** @type {string} */ cmd, /** @type {string[]} */ args, /** @type {object} */ opts) => {
@@ -163,8 +164,50 @@ test('runTriggers：POSIX sleep 触发器取消后不应继续执行副作用', 
   }
 })
 
+test('runTriggers：shell 正常退出后不等待继承 stdout 的后台后代', { skip: process.platform === 'win32', timeout: 3000 }, async () => {
+  const startedAt = Date.now()
+  const result = await runTriggers(['sleep 0.8 &'], {}, { spawn: realSpawn })
+  assert.deepEqual(result, { warnings: [] })
+  assert.ok(Date.now() - startedAt < 500, `触发器不应等待后台 sleep，实际耗时 ${Date.now() - startedAt}ms`)
+})
+
+test('runTriggers：setsid 脱离进程组的后代取消后不应继续副作用', {
+  skip: process.platform === 'win32',
+  timeout: 5000,
+}, async () => {
+  const probe = realSpawn('sh', ['-c', 'command -v setsid'], { stdio: 'ignore' })
+  const probeCode = await new Promise((resolve) => probe.on('close', resolve))
+  if (probeCode !== 0) return
+
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-trigger-setsid-'))
+  const marker = join(tmp, 'completed')
+  const ac = new AbortController()
+  try {
+    const result = await runTriggers(
+      [`setsid sh -c "sleep 0.35; touch '${marker}'" & wait`],
+      {},
+      {
+        signal: ac.signal,
+        spawn: (/** @type {string} */ shell, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+          const child = realSpawn(shell, args, opts)
+          setTimeout(() => ac.abort(), 30)
+          return child
+        },
+      },
+    )
+    assert.equal(result.aborted, true)
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    assert.equal(existsSync(marker), false, '脱离进程组的触发器后代不应继续执行副作用')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('terminateProcessTree：Windows taskkill 未完成时等待，失败时回退终止子进程', async () => {
   const killer = new EventEmitter()
+  const descendantKiller = new EventEmitter()
+  /** @type {string[]} */
+  const spawned = []
   let killedWith
   const child = {
     pid: 123,
@@ -172,7 +215,10 @@ test('terminateProcessTree：Windows taskkill 未完成时等待，失败时回�
   }
   const cleanup = terminateProcessTree(child, {
     platform: 'win32',
-    spawnFn: () => killer,
+    spawnFn: (/** @type {string} */ command) => {
+      spawned.push(command)
+      return command === 'powershell.exe' ? descendantKiller : killer
+    },
   })
   let settled = false
   const pending = Promise.resolve(cleanup).then(() => { settled = true })
@@ -182,10 +228,27 @@ test('terminateProcessTree：Windows taskkill 未完成时等待，失败时回�
   await Promise.resolve()
   assert.equal(settled, false, 'taskkill close 前不应报告清理完成')
   killer.emit('close', 5, null)
+  descendantKiller.emit('exit', 0, null)
   const outcome = await cleanup
   await pending
   assert.equal(outcome.ok, false)
   assert.equal(killedWith, 'SIGKILL')
+  assert.deepEqual(spawned, ['taskkill', 'powershell.exe'])
+})
+
+test('terminateProcessTree：POSIX 进程组与直接 shell 终止失败时报告失败', async () => {
+  const child = {
+    pid: 123,
+    kill: () => false,
+  }
+  const outcome = await terminateProcessTree(child, {
+    platform: 'linux',
+    killFn: (pid) => {
+      if (pid === -123) throw new Error('process group unavailable')
+    },
+  })
+  assert.equal(outcome.ok, false)
+  assert.match(outcome.detail ?? '', /进程组终止失败|后代状态未知/)
 })
 
 test('runTriggers：Windows 进程树终止失败时报告清理警告', async () => {
