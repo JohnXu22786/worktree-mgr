@@ -252,7 +252,7 @@ test('begin：基分支有未提交改动时产生警告但不中断', async () 
   rmSync(tmp, { recursive: true, force: true })
 })
 
-test('begin：主工作区 git status 失败时返回状态检查告警', async () => {
+test('begin：主工作区 git status 失败时终止创建', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
   const git = new FakeGit()
@@ -263,8 +263,10 @@ test('begin：主工作区 git status 失败时返回状态检查告警', async 
   git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
 
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
-  assert.equal(r.ok, true)
-  assert.ok((r.warnings ?? []).some((w) => /主工作区/.test(w) && /状态失败/.test(w) && /index file smaller than expected/.test(w)), JSON.stringify(r.warnings))
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /主工作区.*状态失败/)
+  assert.match(r.error ?? '', /index file smaller than expected/)
+  assert.equal(git.count(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 

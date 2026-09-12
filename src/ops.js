@@ -170,11 +170,12 @@ export async function begin(opts) {
       const existsCheck = await git.run(['show-ref', '--verify', `refs/heads/${branchName}`], { cwd: root, signal: opts.signal })
       if (existsCheck.ok) return { ok: false, error: `分支已存在：${branchName}` }
 
-      // 安全提示：主工作区脏时新建工作区不会包含未提交改动
+      // 安全检查：主工作区状态不可读时不能继续；脏时新建工作区不会包含未提交改动
       const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
       if (!baseStatus.ok) {
-        warnings.push(`读取主工作区状态失败：${baseStatus.stderr.trim() || 'git status 失败'}`)
-      } else if (isDirty(baseStatus.stdout)) {
+        return { ok: false, error: `读取主工作区状态失败：${baseStatus.stderr.trim() || 'git status 失败'}` }
+      }
+      if (isDirty(baseStatus.stdout)) {
         warnings.push('主工作区存在未提交改动，新建的工作区不会包含这些改动，请留意')
       }
 
