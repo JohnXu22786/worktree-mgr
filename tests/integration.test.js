@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { GitRunner, resolveToplevel, samePath } from '../src/git.js'
 import { begin, mergeTask, finishTask, listStatus } from '../src/ops.js'
@@ -40,6 +41,25 @@ async function makeRepo() {
 function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
 }
+
+test('集成：非 Git 目录的未知命令先报用法错误', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-'))
+  const cli = fileURLToPath(new URL('../bin/wtm.js', import.meta.url))
+  const env = { ...process.env }
+  delete env.WTM_ROOT
+  try {
+    const result = spawnSync(process.execPath, [cli, 'unknown-command'], {
+      cwd,
+      encoding: 'utf8',
+      env,
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /未知命令：unknown-command/)
+    assert.doesNotMatch(result.stderr, /不是 git 仓库/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
 
 test('集成：base 只接受真实分支名，拒绝 revision expression', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()

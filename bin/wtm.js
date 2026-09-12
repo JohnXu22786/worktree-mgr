@@ -150,6 +150,10 @@ async function main() {
     return argv.length === 0 ? 2 : 0
   }
   const command = argv[0]
+  if (!['begin', 'merge', 'finish', 'status', 'purge'].includes(command)) {
+    process.stderr.write(`未知命令：${command}\n\n${usage()}\n`)
+    return 2
+  }
   const { positional, options, error } = parseArgs(argv.slice(1))
   if (error) {
     process.stderr.write(`错误：${error}\n`)
