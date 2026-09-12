@@ -16,8 +16,8 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   closeSync,
   existsSync,
-  fstatSync,
   futimesSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -214,6 +214,8 @@ export function saveLedger(vaultDir, ledger) {
  * 账本互斥锁。fn 执行期间持有锁，其他调用方自旋等待。
  *
  * 安全性设计（防止多进程并发写账本）：
+ * - token 先写入当前进程的临时文件，再通过硬链接原子地占用 .lock，
+ *   写入失败不会暴露未完成的锁文件；
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
  * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
@@ -231,30 +233,25 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
   mkdirSync(vaultDir, { recursive: true })
   const lockPath = join(vaultDir, '.lock')
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const tempLockPath = join(vaultDir, `.lock-${token}.tmp`)
   const deadline = Date.now() + timeoutMs
   let fd = null
   let owned = false
   for (;;) {
     try {
-      fd = openSync(lockPath, 'wx')
+      fd = openSync(tempLockPath, 'wx')
       writeFileSync(fd, token, 'utf8')
+      futimesSync(fd, new Date(), new Date())
+      linkSync(tempLockPath, lockPath)
       owned = true
+      try { unlinkSync(tempLockPath) } catch { /* 持锁期间保留，释放时再清理 */ }
       break
     } catch (err) {
       if (fd !== null) {
-        let fdStat
-        try { fdStat = fstatSync(fd) } catch { /* 忽略 */ }
         try { closeSync(fd) } catch { /* 忽略 */ }
-        if (fdStat) {
-          try {
-            const lockStat = statSync(lockPath)
-            if (lockStat.dev === fdStat.dev && lockStat.ino === fdStat.ino) {
-              unlinkSync(lockPath)
-            }
-          } catch { /* 锁可能已被回收，忽略 */ }
-        }
         fd = null
       }
+      try { unlinkSync(tempLockPath) } catch { /* 忽略 */ }
       if (/** @type {any} */ (err).code !== 'EEXIST') throw err
       // 陈旧回收：mtime 超过 staleMs（持有者心跳已停止，视为进程死亡）
       try {
@@ -290,6 +287,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       const content = readFileSync(lockPath, 'utf8')
       if (content === token) unlinkSync(lockPath)
     } catch { /* 已被回收或删除，忽略 */ }
+    try { unlinkSync(tempLockPath) } catch { /* 已清理或删除，忽略 */ }
   }
 }
 

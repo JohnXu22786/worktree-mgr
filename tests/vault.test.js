@@ -122,11 +122,28 @@ test('withLock：写入 token 失败时不删除后继锁', { skip: process.plat
   const successorToken = 'successor-process-token'
   const writeError = new Error('token write failed')
   const realWriteFileSync = fs.writeFileSync
+  const realStatSync = fs.statSync
+  /** @type {import('node:fs').Stats | undefined} */
+  let originalLockStat
+  let replacedAfterStat = false
   mock.method(fs, 'writeFileSync', (/** @type {string | number} */ target) => {
     if (typeof target !== 'number') throw new Error('unexpected path write')
-    unlinkSync(lockPath)
+    if (existsSync(lockPath)) {
+      originalLockStat = realStatSync(lockPath)
+      unlinkSync(lockPath)
+    }
     realWriteFileSync(lockPath, successorToken, 'utf8')
     throw writeError
+  })
+  mock.method(fs, 'statSync', (/** @type {string} */ path) => {
+    const currentStat = realStatSync(path)
+    if (path === lockPath && originalLockStat && !replacedAfterStat) {
+      replacedAfterStat = true
+      unlinkSync(lockPath)
+      realWriteFileSync(lockPath, successorToken, 'utf8')
+      return originalLockStat
+    }
+    return currentStat
   })
   syncBuiltinESMExports()
   try {
