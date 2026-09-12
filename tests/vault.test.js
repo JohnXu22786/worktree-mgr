@@ -206,6 +206,48 @@ test('withLock：超时抛出 VaultError', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  mkdirSync(reclaimPath)
+
+  let ran = false
+  await withLock(dir, async () => { ran = true }, { timeoutMs: 200, staleMs: 60_000 })
+  assert.equal(ran, true)
+  assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放清理失败时显式失败且不遗留锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const cleanupError = Object.assign(new Error('guard cleanup failed'), { code: 'EIO' })
+  const realMkdirSync = fs.mkdirSync
+  const realRenameSync = fs.renameSync
+  let failCleanup = false
+  mock.method(fs, 'mkdirSync', (/** @type {string} */ path, options) => {
+    if (failCleanup && path === reclaimPath) throw cleanupError
+    return realMkdirSync(path, options)
+  })
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (failCleanup && source === reclaimPath) throw cleanupError
+    return realRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => { failCleanup = true }),
+      (error) => error === cleanupError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(lockPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
@@ -237,7 +279,7 @@ test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', asy
       blockHeartbeat = true
       fs.writeFileSync(process.env.WTM_TEST_READY, '')
       while (!fs.existsSync(process.env.WTM_TEST_RELEASE)) await new Promise((resolve) => setTimeout(resolve, 5))
-    }, { heartbeatMs: 10, staleMs: 1000 })
+    }, { heartbeatMs: 10, staleMs: 50 })
     fs.writeFileSync(process.env.WTM_TEST_DONE, '')
   `
   const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
@@ -266,8 +308,9 @@ test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', asy
     await waitForFile(heartbeatPath)
     const past = new Date(Date.now() - 60_000)
     utimesSync(lockPath, past, past)
-    const contender = withLock(dir, async () => { contenderRan = true }, { timeoutMs: 250, staleMs: 1000 })
-    await new Promise((r) => setTimeout(r, 50))
+    utimesSync(join(dir, '.lock.reclaim'), past, past)
+    const contender = withLock(dir, async () => { contenderRan = true }, { timeoutMs: 150, staleMs: 50 })
+    await new Promise((r) => setTimeout(r, 100))
     assert.equal(contenderRan, false)
     writeFileSync(continuePath, '')
     await assert.rejects(contender, VaultError)
