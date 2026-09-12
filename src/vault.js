@@ -16,6 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   closeSync,
   existsSync,
+  fstatSync,
   futimesSync,
   mkdirSync,
   openSync,
@@ -241,8 +242,17 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       break
     } catch (err) {
       if (fd !== null) {
+        let fdStat
+        try { fdStat = fstatSync(fd) } catch { /* 忽略 */ }
         try { closeSync(fd) } catch { /* 忽略 */ }
-        try { unlinkSync(lockPath) } catch { /* 忽略 */ }
+        if (fdStat) {
+          try {
+            const lockStat = statSync(lockPath)
+            if (lockStat.dev === fdStat.dev && lockStat.ino === fdStat.ino) {
+              unlinkSync(lockPath)
+            }
+          } catch { /* 锁可能已被回收，忽略 */ }
+        }
         fd = null
       }
       if (/** @type {any} */ (err).code !== 'EEXIST') throw err

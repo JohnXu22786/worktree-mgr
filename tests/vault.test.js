@@ -116,6 +116,32 @@ test('withLock：写入 token 失败时清理文件描述符和锁文件', async
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：写入 token 失败时不删除后继锁', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const successorToken = 'successor-process-token'
+  const writeError = new Error('token write failed')
+  const realWriteFileSync = fs.writeFileSync
+  mock.method(fs, 'writeFileSync', (/** @type {string | number} */ target) => {
+    if (typeof target !== 'number') throw new Error('unexpected path write')
+    unlinkSync(lockPath)
+    realWriteFileSync(lockPath, successorToken, 'utf8')
+    throw writeError
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}),
+      (error) => error === writeError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(readFileSync(lockPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：竞争时等待对方释放（并发交错）', async () => {
   const dir = makeTmp()
   let firstInside = false
