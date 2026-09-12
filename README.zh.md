@@ -197,7 +197,7 @@ export function apply(ctx, config = {}) {
     }
   },
   output: {
-    schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
+    schema: { type: 'object', properties: { ok: { type: 'boolean' }, ... }, required: ['ok'] },
     render: (args, value) => [{ type: 'text', text: '...' }]   // 模型可见内容
   },
   async execute(args, exec) { ... }          // 返回规范 JSON；exec.signal 支持取消
