@@ -151,7 +151,8 @@ test('withLock：已有陈旧回收 claim 时不会重复回收', async () => {
   writeFileSync(lockPath, token)
   const past = new Date(Date.now() - 120_000)
   utimesSync(lockPath, past, past)
-  writeFileSync(reclaimPath, 'another-reclaimer')
+  mkdirSync(reclaimPath)
+  writeFileSync(join(reclaimPath, 'token'), 'another-reclaimer')
 
   let ran = false
   await assert.rejects(
@@ -160,6 +161,32 @@ test('withLock：已有陈旧回收 claim 时不会重复回收', async () => {
   )
   assert.equal(ran, false)
   assert.equal(readFileSync(lockPath, 'utf8'), token)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：没有锁的孤儿 guard 可立即回收', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  mkdirSync(reclaimPath)
+  writeFileSync(join(reclaimPath, 'token'), 'crashed-before-lock')
+
+  let ran = false
+  await withLock(dir, async () => { ran = true }, { timeoutMs: 200, staleMs: 60_000 })
+  assert.equal(ran, true)
+  assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放 guard 等待有界返回', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const started = Date.now()
+  await withLock(dir, async () => {
+    mkdirSync(reclaimPath)
+    writeFileSync(join(reclaimPath, 'token'), 'another-owner')
+  }, { timeoutMs: 50, staleMs: 60_000 })
+  assert.ok(Date.now() - started < 500, '释放不应无限等待 guard')
+  assert.equal(existsSync(join(dir, '.lock')), true)
   rmSync(dir, { recursive: true, force: true })
 })
 
