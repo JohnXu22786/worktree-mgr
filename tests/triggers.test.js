@@ -1,7 +1,11 @@
 ﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn as realSpawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { runTriggers } from '../src/triggers.js'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { runTriggers, terminateProcessTree } from '../src/triggers.js'
 
 // 可注入的假 spawn：捕获调用并模拟子进程输出与退出
 /**
@@ -18,7 +22,9 @@ function makeFakeSpawn(captured, behaviors = {}) {
     queueMicrotask(() => {
       if (b.stderr) child.stderr.emit('data', Buffer.from(b.stderr))
       if (b.stdout) child.stdout.emit('data', Buffer.from(b.stdout))
-      child.emit('exit', b.code ?? 0, null)
+      const code = b.code ?? 0
+      child.emit('exit', code, null)
+      child.emit('close', code, null)
     })
     return child
   }
@@ -86,7 +92,10 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   captured.push('x')
   const w1 = await runTriggers(['sig-cmd'], {}, {
     spawn: () => {
-      queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+      queueMicrotask(() => {
+        child.emit('error', new Error('spawn ENOENT'))
+        child.emit('close', -1, null)
+      })
       return child
     },
   })
@@ -97,7 +106,10 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   child2.stderr = new EventEmitter()
   const w2 = await runTriggers(['sig-cmd2'], {}, {
     spawn: () => {
-      queueMicrotask(() => child2.emit('exit', null, 'SIGKILL'))
+      queueMicrotask(() => {
+        child2.emit('exit', null, 'SIGKILL')
+        child2.emit('close', null, 'SIGKILL')
+      })
       return child2
     },
   })
@@ -105,4 +117,195 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   assert.match(w2.warnings[0], /SIGKILL/)
 })
 
+test('runTriggers：取消后停止后续触发器，并传递 AbortSignal', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  child.kill = () => true
+  const result = await runTriggers(['abort-cmd', 'later-cmd'], {}, {
+    signal: ac.signal,
+    spawn: (/** @type {string} */ cmd, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+      captured.push({ cmd, args, opts })
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(captured.length, 1, '取消后不应启动后续触发器')
+  assert.equal(/** @type {{signal?: AbortSignal}} */ (captured[0].opts).signal, ac.signal)
+  assert.equal(result.aborted, true)
+  assert.deepEqual(result.warnings, [])
+})
 
+test('runTriggers：POSIX sleep 触发器取消后不应继续执行副作用', { skip: process.platform === 'win32', timeout: 5000 }, async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-trigger-abort-'))
+  const marker = join(tmp, 'completed')
+  const ac = new AbortController()
+  try {
+    const result = await runTriggers([`trap '' TERM; sleep 0.25; touch '${marker}'`], {}, {
+      signal: ac.signal,
+      spawn: (/** @type {string} */ shell, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+        const child = realSpawn(shell, args, opts)
+        setTimeout(() => ac.abort(), 20)
+        return child
+      },
+    })
+    assert.equal(result.aborted, true)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(existsSync(marker), false, '取消后的触发器后代不应继续执行副作用')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('runTriggers：正常退出后等待 close 并收集延迟输出', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const pending = runTriggers(['delayed-failure'], {}, {
+    spawn: () => {
+      setTimeout(() => child.emit('exit', 2, null), 5)
+      setTimeout(() => {
+        child.stderr.emit('data', Buffer.from('late failure'))
+        child.emit('close', 2, null)
+      }, 40)
+      return child
+    },
+  })
+
+  const result = await pending
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /late failure/)
+})
+
+test('runTriggers：setsid 脱离进程组的后代取消后不应继续副作用', {
+  skip: process.platform === 'win32',
+  timeout: 5000,
+}, async () => {
+  const probe = realSpawn('sh', ['-c', 'command -v setsid'], { stdio: 'ignore' })
+  const probeCode = await new Promise((resolve) => probe.on('close', resolve))
+  if (probeCode !== 0) return
+
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-trigger-setsid-'))
+  const marker = join(tmp, 'completed')
+  const ac = new AbortController()
+  try {
+    const result = await runTriggers(
+      [`setsid sh -c "sleep 0.35; touch '${marker}'" & wait`],
+      {},
+      {
+        signal: ac.signal,
+        spawn: (/** @type {string} */ shell, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+          const child = realSpawn(shell, args, opts)
+          setTimeout(() => ac.abort(), 30)
+          return child
+        },
+      },
+    )
+    assert.equal(result.aborted, true)
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    assert.equal(existsSync(marker), false, '脱离进程组的触发器后代不应继续执行副作用')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('terminateProcessTree：Windows taskkill 未完成时等待，失败时回退终止子进程', async () => {
+  const killer = new EventEmitter()
+  const descendantKiller = new EventEmitter()
+  /** @type {string[]} */
+  const spawned = []
+  let killedWith
+  const child = {
+    pid: 123,
+    kill: (/** @type {string} */ signal) => { killedWith = signal },
+  }
+  const cleanup = terminateProcessTree(child, {
+    platform: 'win32',
+    spawnFn: (/** @type {string} */ command) => {
+      spawned.push(command)
+      return command === 'powershell.exe' ? descendantKiller : killer
+    },
+  })
+  let settled = false
+  const pending = Promise.resolve(cleanup).then(() => { settled = true })
+  await Promise.resolve()
+  assert.equal(settled, false, 'taskkill 完成前不应报告清理完成')
+  killer.emit('exit', 5, null)
+  await Promise.resolve()
+  assert.equal(settled, false, 'taskkill close 前不应报告清理完成')
+  killer.emit('close', 5, null)
+  descendantKiller.emit('exit', 0, null)
+  const outcome = await cleanup
+  await pending
+  assert.equal(outcome.ok, false)
+  assert.equal(killedWith, 'SIGKILL')
+  assert.deepEqual(spawned, ['taskkill', 'powershell.exe'])
+})
+
+test('terminateProcessTree：POSIX 进程组与直接 shell 终止失败时报告失败', async () => {
+  const child = {
+    pid: 123,
+    kill: () => false,
+  }
+  const outcome = await terminateProcessTree(child, {
+    platform: 'linux',
+    killFn: (pid) => {
+      if (pid === -123) throw new Error('process group unavailable')
+    },
+  })
+  assert.equal(outcome.ok, false)
+  assert.match(outcome.detail ?? '', /进程组终止失败|后代状态未知/)
+})
+
+test('runTriggers：Windows 进程树终止失败时报告清理警告', async () => {
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const result = await runTriggers(['abort-cmd'], {}, {
+    signal: ac.signal,
+    terminate: async () => ({ ok: false, detail: 'taskkill failed' }),
+    spawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(result.aborted, true)
+  assert.equal(result.cleanupFailed, true)
+  assert.ok(result.warnings.some((warning) => /终止失败|taskkill failed/.test(warning)), JSON.stringify(result))
+})
+
+test('runTriggers：取消后等待触发器 close 再返回', async () => {
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const pending = runTriggers(['abort-cmd'], {}, {
+    signal: ac.signal,
+    spawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+      })
+      return child
+    },
+  })
+  let settled = false
+  void pending.then(() => { settled = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false, '触发器 close 前不应返回')
+  child.emit('close', 0, null)
+  const result = await pending
+  assert.equal(result.aborted, true)
+})

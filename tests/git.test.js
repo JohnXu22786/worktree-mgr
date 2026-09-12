@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, GitRunner } from '../src/git.js'
+import { EventEmitter } from 'node:events'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runGit, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -133,4 +134,31 @@ test('GitRunner.run：尊重 signal 中止', { skip: !GitRunner.probe() }, async
   const r = await git.run(['--version'], { cwd: process.cwd(), signal: ac.signal })
   assert.equal(r.ok, false)
   assert.equal(r.aborted, true)
+})
+
+test('runGit：AbortError 后等待 close 再返回', async () => {
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const pending = runGit(['status'], {
+    signal: ac.signal,
+    spawnFn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        child.emit('error', err)
+      })
+      return child
+    },
+  })
+  let settled = false
+  void pending.then(() => { settled = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false, 'AbortError 后 close 前不应返回')
+  child.emit('close', null, 'SIGTERM')
+  const result = await pending
+  assert.equal(result.ok, false)
+  assert.equal(result.aborted, true)
 })

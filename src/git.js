@@ -11,12 +11,12 @@ import { spawn, spawnSync } from 'node:child_process'
 /**
  * 执行一条 git 命令。
  * @param {string[]} args
- * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>, spawnFn?: (command: string, args: string[], opts: object) => any}} [opts]
  * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
  */
-export function runGit(args, { cwd, signal, env } = {}) {
+export function runGit(args, { cwd, signal, env, spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(
+    const child = spawnFn(
       'git',
       ['--no-pager', '-c', 'core.quotepath=false', ...args],
       {
@@ -29,8 +29,9 @@ export function runGit(args, { cwd, signal, env } = {}) {
     )
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
+    let aborted = false
+    child.stdout.on('data', (/** @type {any} */ d) => { stdout += d })
+    child.stderr.on('data', (/** @type {any} */ d) => { stderr += d })
     let settled = false
     /**
      * @param {{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}} result
@@ -41,12 +42,16 @@ export function runGit(args, { cwd, signal, env } = {}) {
         resolve(result)
       }
     }
-    child.on('error', (err) => {
-      const aborted = err.name === 'AbortError'
-      done({ ok: false, code: -1, stdout, stderr: aborted ? '' : stderr || err.message, aborted })
+    child.on('error', (/** @type {any} */ err) => {
+      if (err.name === 'AbortError') {
+        aborted = true
+        return
+      }
+      done({ ok: false, code: -1, stdout, stderr: stderr || err.message, aborted: false })
     })
-    child.on('close', (code, codeSig) => {
-      done({ ok: code === 0, code, stdout, stderr, aborted: codeSig !== null })
+    child.on('close', (/** @type {number | null} */ code, /** @type {string | null} */ codeSig) => {
+      const wasAborted = aborted || signal?.aborted === true || codeSig !== null
+      done({ ok: !wasAborted && code === 0, code, stdout, stderr: wasAborted ? '' : stderr, aborted: wasAborted })
     })
   })
 }

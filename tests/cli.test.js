@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -52,5 +52,29 @@ test('CLI：begin 的 --root 缺少值时拒绝回退到当前目录', () => {
     assert.match(result.stderr, /--root.*缺少值/)
   } finally {
     rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：非 JSON 失败结果仍输出 warnings', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-warning-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-warning-vault-'))
+  try {
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd })
+    execFileSync('git', ['config', 'user.email', 'wtm-tests@example.invalid'], { cwd })
+    execFileSync('git', ['config', 'user.name', 'wtm tests'], { cwd })
+    writeFileSync(join(cwd, 'README'), 'test\n')
+    execFileSync('git', ['add', 'README'], { cwd })
+    execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd })
+    execFileSync('git', ['branch', 'wtm/existing'], { cwd })
+    writeFileSync(join(cwd, '.wtm.json'), JSON.stringify({ vault, unknown: true }))
+
+    const result = runCli(['begin', 'existing'], cwd)
+
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /错误：.*分支已存在/)
+    assert.match(result.stdout, /未知或类型不符的配置键/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
   }
 })
