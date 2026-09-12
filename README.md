@@ -195,7 +195,7 @@ Loading order: profile assembly → this bundle's patch layer inserts the plugin
     }
   },
   output: {
-    schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
+    schema: { type: 'object', properties: { ok: { type: 'boolean' }, ... }, required: ['ok'] },
     render: (args, value) => [{ type: 'text', text: '...' }]   // model-visible content
   },
   async execute(args, exec) { ... }          // returns canonical JSON; exec.signal supports cancellation
