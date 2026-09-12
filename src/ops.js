@@ -105,8 +105,15 @@ function isAborted(signal) {
   return signal?.aborted === true
 }
 
-function abortResult() {
-  return { ok: false, error: '操作已取消（aborted）' }
+/**
+ * @param {string[]} [warnings]
+ */
+function abortResult(warnings = []) {
+  return {
+    ok: false,
+    error: '操作已取消（aborted）',
+    ...(warnings.length > 0 ? { warnings } : {}),
+  }
 }
 
 class OperationAborted extends Error {
@@ -265,15 +272,31 @@ export async function begin(opts) {
     const aborted = err instanceof OperationAborted || isAborted(opts.signal)
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && (typeof result === 'undefined' || aborted)) {
+      /** @type {string[]} */
+      const rollbackFailures = []
       try {
-        await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        await git.run(['branch', '-D', branchName], { cwd: root })
+        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
+        if (!remove.ok) {
+          rollbackFailures.push(`worktree remove 失败：${remove.stderr.trim() || 'git 命令失败'}`)
+        }
+      } catch (rollbackErr) {
+        rollbackFailures.push(`worktree remove 异常：${/** @type {Error} */ (rollbackErr).message}`)
+      }
+      try {
+        const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+        if (!branch.ok) {
+          rollbackFailures.push(`branch -D 失败：${branch.stderr.trim() || 'git 命令失败'}`)
+        }
+      } catch (rollbackErr) {
+        rollbackFailures.push(`branch -D 异常：${/** @type {Error} */ (rollbackErr).message}`)
+      }
+      if (rollbackFailures.length === 0) {
         warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
-      } catch {
-        warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
+      } else {
+        warnings.push(`工作区创建未完成，且回滚失败：${rollbackFailures.join('；')}`)
       }
     }
-    if (aborted) return abortResult()
+    if (aborted) return abortResult(warnings)
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
   }

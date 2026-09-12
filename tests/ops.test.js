@@ -255,8 +255,10 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
         if (fail) {
           c.stderr.emit('data', Buffer.from('boom'))
           c.emit('exit', 3, null)
+          c.emit('close', 3, null)
         } else {
           c.emit('exit', 0, null)
+          c.emit('close', 0, null)
         }
       })
       return c
@@ -292,8 +294,8 @@ test('begin：种子阶段收到 abort 时回滚工作区与分支且不写账�
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
   git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
-  git.on(['worktree', 'remove', '--force', join(tmp, 'vault', 't')], OK())
-  git.on(['branch', '-D', 'wtm/t'], OK())
+  git.on(['worktree', 'remove', '--force', join(tmp, 'vault', 't')], FAIL('remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('branch failed'))
   const seedFiles = ['missing-a.txt', 'missing-b.txt']
   Object.defineProperty(seedFiles, Symbol.iterator, {
     value: function* () {
@@ -310,6 +312,9 @@ test('begin：种子阶段收到 abort 时回滚工作区与分支且不写账�
   assert.match(r.error ?? '', /取消|abort/i)
   assert.ok(git.called(['worktree', 'remove', '--force', join(tmp, 'vault', 't')]))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.ok((r.warnings ?? []).some((w) => /回滚失败/.test(w)), JSON.stringify(r.warnings))
+  assert.ok((r.warnings ?? []).some((w) => /remove failed/.test(w)), JSON.stringify(r.warnings))
+  assert.ok((r.warnings ?? []).some((w) => /branch failed/.test(w)), JSON.stringify(r.warnings))
   assert.equal(loadLedger(cfg.vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
 })
@@ -339,6 +344,7 @@ test('begin：on_begin 期间收到 abort 时回滚工作区与分支且不写�
       queueMicrotask(() => {
         ac.abort()
         child.emit('exit', 0, null)
+        child.emit('close', 0, null)
       })
       return child
     },
@@ -689,6 +695,7 @@ test('mergeTask：on_merge 期间收到 abort 时不更新账本', async () => {
       queueMicrotask(() => {
         ac.abort()
         child.emit('exit', 0, null)
+        child.emit('close', 0, null)
       })
       return child
     },
@@ -715,6 +722,7 @@ test('finishTask：on_finish 期间收到 abort 时不清理账本记录', async
       queueMicrotask(() => {
         ac.abort()
         child.emit('exit', 0, null)
+        child.emit('close', 0, null)
       })
       return child
     },

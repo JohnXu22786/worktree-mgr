@@ -67,34 +67,93 @@ function runOne(spawnFn, shell, args, opts) {
     /** @type {any} */
     let child
     try {
-      child = spawnFn(shell, args, { ...opts, windowsHide: true })
+      child = spawnFn(shell, args, {
+        ...opts,
+        windowsHide: true,
+        ...(process.platform === 'win32' ? {} : { detached: true }),
+      })
     } catch (err) {
       resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}` })
       return
     }
     let stdout = ''
     let stderr = ''
+    let errorDetail = ''
+    let aborted = false
+    let killRequested = false
     let settled = false
+    /** @type {() => void} */
+    let onAbort = () => {}
+
+    /** @param {NodeJS.Signals} signal */
+    const terminate = (signal) => {
+      const pid = child?.pid
+      if (Number.isInteger(pid) && pid > 0 && process.platform === 'win32') {
+        try {
+          const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          })
+          killer.unref()
+        } catch {
+          // fallback to child.kill below
+        }
+      } else if (Number.isInteger(pid) && pid > 0) {
+        try {
+          // POSIX detached children form their own process group; kill the group
+          // so shell descendants do not outlive the trigger operation.
+          process.kill(-pid, signal)
+        } catch {
+          // The group may have exited; child.kill below is still best effort.
+        }
+      }
+      try { child?.kill?.(signal) } catch { /* best effort */ }
+    }
+
+    const cleanup = () => {
+      opts.signal?.removeEventListener('abort', onAbort)
+    }
     /**
      * @param {{ok: boolean, detail: string}} result
      */
     const done = (result) => {
       if (!settled) {
         settled = true
+        cleanup()
         resolve(result)
       }
+    }
+    onAbort = () => {
+      if (killRequested || settled) return
+      killRequested = true
+      aborted = true
+      // Kill the detached process group immediately: descendants can inherit
+      // the shell's ignored SIGTERM disposition and otherwise outlive it.
+      terminate('SIGKILL')
     }
     child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
     child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
     child.on('error', (/** @type {any} */ err) => {
-      done({ ok: false, detail: `${stderr.trim() || err.message}` })
+      if (err.name === 'AbortError' || opts.signal?.aborted) {
+        aborted = true
+        return
+      }
+      errorDetail = stderr.trim() || err.message
     })
-    child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
+    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      if (aborted || opts.signal?.aborted) {
+        done({ ok: false, detail: '' })
+        return
+      }
       if (code === 0) {
         done({ ok: true, detail: '' })
       } else {
-        done({ ok: false, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` })
+        done({ ok: false, detail: `退出码 ${code ?? sig}: ${errorDetail || stderr.trim() || stdout.trim() || '无输出'}` })
       }
     })
+    if (opts.signal) {
+      opts.signal.addEventListener('abort', onAbort, { once: true })
+      if (opts.signal.aborted) onAbort()
+    }
   })
 }
