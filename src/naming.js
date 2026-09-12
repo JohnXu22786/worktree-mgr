@@ -9,7 +9,39 @@
 
 const MAX_BRANCH_LENGTH = 255
 const MAX_SLUG_LENGTH = 60
+const MIN_SLUG_UTF16_LENGTH = 2
 const MAX_TASK_LENGTH = 200
+
+/**
+ * @param {string} slug
+ * @returns {string}
+ */
+function normalizeTruncatedSlug(slug) {
+  return slug
+    .split('/')
+    .map((seg) => seg
+      .replace(/\.{2,}/g, '-')
+      .replace(/\.lock$/g, '-lock')
+      .replace(/^\.+/g, ''))
+    .filter((seg) => seg !== '')
+    .join('/')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+}
+
+/**
+ * @param {string} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function truncateByUtf16Length(value, maxLength) {
+  let result = ''
+  for (const ch of value) {
+    if (result.length + ch.length > maxLength) break
+    result += ch
+  }
+  return result
+}
 
 /**
  * 将任意任务名规范化为分支可用的 slug（全小写、非法字符转连字符）。
@@ -40,20 +72,11 @@ export function slugifyTask(task) {
   // 折叠连续连字符，剥掉首尾的 - 与 .
   slug = slug.replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '')
   if (slug.length > MAX_SLUG_LENGTH) {
-    // 截断可能把段尾切在 .lock / . / - 上，甚至切出一个空段（切在 / 后），
+    // 按 Unicode code point 截断，避免切断非 BMP 字符；同时可能把段尾切在
+    // .lock / . / - 上，甚至切出一个空段（切在 / 后），
     // 导致派生分支违反 ref 规则（与“slug 必通过 validateBranch”的契约冲突）。
     // 对截断结果重新做一次段级修正。
-    slug = slug
-      .slice(0, MAX_SLUG_LENGTH)
-      .split('/')
-      .map((seg) => seg
-        .replace(/\.{2,}/g, '-')
-        .replace(/\.lock$/g, '-lock')
-        .replace(/^\.+/g, ''))
-      .filter((seg) => seg !== '')
-      .join('/')
-      .replace(/-+/g, '-')
-      .replace(/^[-.]+|[-.]+$/g, '')
+    slug = normalizeTruncatedSlug(Array.from(slug).slice(0, MAX_SLUG_LENGTH).join(''))
   }
   if (slug === '' || slug === '.') return 'task'
   return slug
@@ -66,7 +89,12 @@ export function slugifyTask(task) {
  * @returns {string}
  */
 export function deriveBranch(task, prefix = 'wtm') {
-  return `${prefix}/${slugifyTask(task)}`
+  const slug = slugifyTask(task)
+  const maxSlugLength = MAX_BRANCH_LENGTH - prefix.length - 1
+  const boundedSlug = slug.length > maxSlugLength
+    ? normalizeTruncatedSlug(truncateByUtf16Length(slug, maxSlugLength))
+    : slug
+  return `${prefix}/${boundedSlug}`
 }
 
 /**
@@ -113,6 +141,9 @@ export function validatePrefix(prefix) {
   const r = validateBranch(prefix)
   if (!r.ok) return r
   if (prefix.includes('/')) return { ok: false, reason: '前缀必须是单段，不能包含 /' }
+  if (prefix.length > MAX_BRANCH_LENGTH - 1 - MIN_SLUG_UTF16_LENGTH) {
+    return { ok: false, reason: '前缀过长，无法为派生 slug 留出空间' }
+  }
   return { ok: true }
 }
 

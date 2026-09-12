@@ -58,6 +58,33 @@ test('slugifyTask：超长任务名被截断（含前缀仍不超 100 字符）'
   assert.ok(branch.length <= 100, `分支名长度 ${branch.length} 应 ≤ 100`)
 })
 
+test('slugifyTask：截断不切断非 BMP Unicode 字符', () => {
+  const task = 'a'.repeat(59) + '𐐀'
+  const normalized = task.normalize('NFKC').toLowerCase()
+  const slug = slugifyTask(task)
+
+  assert.equal(slug, normalized)
+  assert.equal(validateBranch(deriveBranch(task)).ok, true)
+})
+
+test('deriveBranch：前缀较长时仍限制分支总长度', () => {
+  const prefix = 'p'.repeat(190)
+  const task = '𐐀'.repeat(60)
+  const branch = deriveBranch(task, prefix)
+
+  assert.equal(branch.length, 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
+test('validatePrefix：为非 BMP slug 预留最小分支空间', () => {
+  assert.equal(validatePrefix('p'.repeat(253)).ok, false)
+
+  const prefix = 'p'.repeat(252)
+  const branch = deriveBranch('𐐀', prefix)
+  assert.equal(branch.length, 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
   // 截断切在 . 上：段尾残留 '.'
   assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)
