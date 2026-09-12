@@ -296,6 +296,7 @@ test('begin：worktree add 非零退出后回滚可能已创建的工作区与�
   git.on(['status', '--porcelain'], OK(''))
   // post-checkout hook 失败会让 git worktree add 返回非零，但资源可能已经落地。
   git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], FAIL('post-checkout hook failed'))
+  git.on(['worktree', 'list', '--porcelain'], OK(`worktree ${wtPath}\nbranch refs/heads/wtm/t\n`))
   git.on(['worktree', 'remove', '--force', wtPath], OK())
   git.on(['branch', '-D', 'wtm/t'], OK())
 
@@ -307,6 +308,27 @@ test('begin：worktree add 非零退出后回滚可能已创建的工作区与�
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   assert.ok((r.warnings ?? []).some((w) => /已回滚/.test(w)), JSON.stringify(r))
   assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：worktree add 失败且资源归属不匹配时不自动回滚', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], FAIL('worktree already exists'))
+  git.on(['worktree', 'list', '--porcelain'], OK(`worktree ${wtPath}\nbranch refs/heads/wtm/other\n`))
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  assert.ok((r.warnings ?? []).some((w) => /未确认|未自动回滚|手动清理/.test(w)), JSON.stringify(r))
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -473,6 +495,7 @@ test('begin：worktree add 报告取消时回滚部分创建资源', async () =>
     ac.abort()
     return { ok: false, code: -1, stdout: '', stderr: '', aborted: true }
   })
+  git.on(['worktree', 'list', '--porcelain'], OK(`worktree ${wtPath}\nbranch refs/heads/wtm/t\n`))
   git.on(['worktree', 'remove', '--force', wtPath], OK())
   git.on(['branch', '-D', 'wtm/t'], OK())
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null, signal: ac.signal })
@@ -604,6 +627,44 @@ test('mergeTask：干净任务直接合并并更新记录', async () => {
   assert.ok(git.called(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main'], 'C:/repo'))
   const ledger = loadLedger(vault)
   assert.equal(ledger.records[0].updatedAt !== 'u', true)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：merge-base 检查取消后不启动 merge', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const ac = new AbortController()
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], () => {
+    ac.abort()
+    return { ok: false, code: -1, stdout: '', stderr: '', aborted: true }
+  })
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null, signal: ac.signal })
+
+  assert.equal(r.ok, false)
+  assert.equal(r.aborted, true)
+  assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(loadLedger(vault).records[0].updatedAt, 'u')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：merge-base 检查取消后不继续收尾清理', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const ac = new AbortController()
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], () => {
+    ac.abort()
+    return { ok: false, code: -1, stdout: '', stderr: '', aborted: true }
+  })
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null, signal: ac.signal })
+
+  assert.equal(r.ok, false)
+  assert.equal(r.aborted, true)
+  assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['worktree', 'remove', join(vault, 't')]), 0)
+  assert.equal(git.count(['branch', '-d', 'wtm/t']), 0)
+  assert.equal(loadLedger(vault).records[0].updatedAt, 'u')
   rmSync(tmp, { recursive: true, force: true })
 })
 

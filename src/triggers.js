@@ -180,11 +180,6 @@ function runOne(spawnFn, shell, args, opts, terminate) {
       exitSignal = sig
       if (aborting || signal?.aborted) {
         finishAborted()
-      } else if (!settled) {
-        const detail = code === 0
-          ? ''
-          : `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}`
-        done({ ok: code === 0, detail })
       }
     })
     child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {

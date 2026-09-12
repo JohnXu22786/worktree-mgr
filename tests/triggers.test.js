@@ -164,11 +164,24 @@ test('runTriggers：POSIX sleep 触发器取消后不应继续执行副作用', 
   }
 })
 
-test('runTriggers：shell 正常退出后不等待继承 stdout 的后台后代', { skip: process.platform === 'win32', timeout: 3000 }, async () => {
-  const startedAt = Date.now()
-  const result = await runTriggers(['sleep 0.8 &'], {}, { spawn: realSpawn })
-  assert.deepEqual(result, { warnings: [] })
-  assert.ok(Date.now() - startedAt < 500, `触发器不应等待后台 sleep，实际耗时 ${Date.now() - startedAt}ms`)
+test('runTriggers：正常退出后等待 close 并收集延迟输出', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const pending = runTriggers(['delayed-failure'], {}, {
+    spawn: () => {
+      setTimeout(() => child.emit('exit', 2, null), 5)
+      setTimeout(() => {
+        child.stderr.emit('data', Buffer.from('late failure'))
+        child.emit('close', 2, null)
+      }, 40)
+      return child
+    },
+  })
+
+  const result = await pending
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /late failure/)
 })
 
 test('runTriggers：setsid 脱离进程组的后代取消后不应继续副作用', {

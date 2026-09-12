@@ -173,6 +173,8 @@ export async function begin(opts) {
     : value
   /** @type {OpResult | undefined} */
   let result
+  const wtPath = join(vault, slugifyTask(task))
+  let addAttempted = false
   let createdWorktree = false
   try {
     result = await withLock(vault, async () => {
@@ -209,7 +211,6 @@ export async function begin(opts) {
         warnings.push('主工作区存在未提交改动，新建的工作区不会包含这些改动，请留意')
       }
 
-      const wtPath = join(vault, slugifyTask(task))
       // 防碰撞：不同任务名可能派生同一 slug（如 "a b" 与 "a-b"），
       // 账本中已有记录指向同一工作区路径时拒绝
       if (ledger.records.some((rec) => samePath(rec.path, wtPath))) {
@@ -219,9 +220,10 @@ export async function begin(opts) {
         return { ok: false, error: `工作区目录已存在：${wtPath}` }
       }
 
-      // 核心动作：创建 worktree。取消可能发生在 git 已经创建资源、但命令尚未返回期间，
-      // 因此从启动命令起就按“可能已创建”处理；GitRunner 必须等待 close 后才返回。
-      createdWorktree = true
+      // 核心动作：创建 worktree。只有命令成功返回后才能确认资源归本次调用所有。
+      // add 失败/取消时，catch 会再次检查 worktree list；若路径与分支同时匹配，
+      // 才允许回滚可能已经部分创建的资源，否则必须保留资源并提示手动确认。
+      addAttempted = true
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
       if (add.aborted || isAborted(opts.signal)) {
         throw abortError()
@@ -231,6 +233,7 @@ export async function begin(opts) {
         err.name = 'WorktreeCreateError'
         throw err
       }
+      createdWorktree = true
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
       const seedFiles = repo?.seed?.files
@@ -290,6 +293,20 @@ export async function begin(opts) {
     })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
+    if (!createdWorktree && addAttempted && typeof result === 'undefined') {
+      try {
+        const state = await git.run(['worktree', 'list', '--porcelain'], { cwd: root })
+        const owned = state.ok && !state.aborted && parseWorktreeList(state.stdout).some((worktree) =>
+          samePath(worktree.path, wtPath) && worktree.branch === branchName)
+        if (owned) {
+          createdWorktree = true
+        } else {
+          warnings.push(`工作区创建失败，未确认路径 ${wtPath} 与分支 ${branchName} 由本次操作创建；未自动回滚，请确认后手动清理`)
+        }
+      } catch (inspectErr) {
+        warnings.push(`工作区创建失败，无法确认路径 ${wtPath} 与分支 ${branchName} 的归属：${inspectErr instanceof Error ? inspectErr.message : String(inspectErr)}；未自动回滚，请手动清理`)
+      }
+    }
     if (createdWorktree && typeof result === 'undefined') {
       const rollbackFailures = []
       try {
@@ -584,6 +601,9 @@ async function mergeIntoBase(opts, rec, task) {
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', rec.branch, 'HEAD'], { cwd: root, signal: opts.signal })
+  if (ancestor.aborted || isAborted(opts.signal)) {
+    return { ...abortResult(), merged: false, warnings: [] }
+  }
   if (ancestor.ok) {
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
@@ -643,7 +663,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
 
   // 2) 合并回基分支
   const merged = await mergeIntoBase(opts, rec, task)
-  if (!merged.ok) return { ok: false, error: merged.error }
+  if (!merged.ok) return merged
   warnings.push(...merged.warnings)
 
   // 3) on_merge 触发器（工作目录 = 主仓库）
@@ -732,7 +752,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     if (!snap.ok) return { ok: false, error: snap.error }
     committed = snap.committed
     const m = await mergeIntoBase(opts, rec, task)
-    if (!m.ok) return { ok: false, error: m.error }
+    if (!m.ok) return m
     merged = m.merged
     warnings.push(...m.warnings)
     const mergeTriggerWarnings = await runTriggers(
