@@ -352,6 +352,47 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：on_begin 触发器取消时回滚工作区与分支且不落账本', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'remove', '--force', wtPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  /** @type {object | undefined} */
+  let spawnOptions
+  const r = await begin({
+    root: 'C:/repo', task: 'T', cfg, git,
+    repo: { triggers: { on_begin: ['sleep-cmd'] } },
+    signal: ac.signal,
+    triggerSpawn: (_shell, _args, opts) => {
+      spawnOptions = opts
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(/** @type {{signal?: AbortSignal}} */ (spawnOptions).signal, ac.signal)
+  assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
+  assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：seed 文件从主仓库复制到新工作区', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
@@ -410,6 +451,32 @@ test('mergeTask：干净任务直接合并并更新记录', async () => {
   assert.ok(git.called(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main'], 'C:/repo'))
   const ledger = loadLedger(vault)
   assert.equal(ledger.records[0].updatedAt !== 'u', true)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：on_merge 触发器取消时不更新账本', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const r = await mergeTask({
+    root: 'C:/repo', task: 'T', mode: 'commit', cfg, git,
+    repo: { triggers: { on_merge: ['sleep-cmd'] } },
+    signal: ac.signal,
+    triggerSpawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(loadLedger(vault).records[0].updatedAt, 'u')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -494,8 +561,10 @@ test('finishTask：commit 模式执行 on_merge 触发器', async () => {
   /** @type {Array<{shell: string, args: string[], opts: object}>} */
   const triggerCalls = []
   const repo = { triggers: { on_merge: ['mark-merge'] } }
+  const ac = new AbortController()
   const r = await finishTask({
     root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo,
+    signal: ac.signal,
     triggerSpawn: (shell, args, opts) => {
       triggerCalls.push({ shell, args, opts })
       const child = /** @type {any} */ (new EventEmitter())
@@ -509,6 +578,7 @@ test('finishTask：commit 模式执行 on_merge 触发器', async () => {
   assert.equal(triggerCalls.length, 1)
   assert.equal(/** @type {any} */ (triggerCalls[0].opts).cwd, 'C:/repo')
   assert.equal(/** @type {any} */ (triggerCalls[0].opts).env.WTM_TASK, 'T')
+  assert.equal(/** @type {any} */ (triggerCalls[0].opts).signal, ac.signal)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -526,6 +596,22 @@ test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 
   assert.ok(git.called(['worktree', 'remove', join(vault, 't')]))
   assert.ok(git.called(['branch', '-d', 'wtm/t']))
   assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：分支删除因取消失败时保留账本记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  const ac = new AbortController()
+  git.on(['branch', '-d', 'wtm/t'], () => {
+    ac.abort()
+    return FAIL('aborted')
+  })
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null, signal: ac.signal })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(loadLedger(vault).records.length, 1)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -672,6 +758,34 @@ test('purge：commit 模式执行 on_merge 触发器', async () => {
   assert.equal(triggerCalls.length, 1)
   assert.equal(/** @type {any} */ (triggerCalls[0].opts).cwd, 'C:/repo')
   assert.equal(/** @type {any} */ (triggerCalls[0].opts).env.WTM_TASK, 'T')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('purge：触发器取消时返回取消且保留账本记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', '--force', join(vault, 't')], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const r = await purge({
+    root: 'C:/repo', tasks: ['T'], mode: 'abandon', cfg, git,
+    repo: { triggers: { on_finish: ['sleep-cmd'] } },
+    signal: ac.signal,
+    triggerSpawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(loadLedger(vault).records.length, 1)
   rmSync(tmp, { recursive: true, force: true })
 })
 

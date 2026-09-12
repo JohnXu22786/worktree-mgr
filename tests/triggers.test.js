@@ -1,6 +1,10 @@
 ﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn as realSpawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runTriggers } from '../src/triggers.js'
 
 // 可注入的假 spawn：捕获调用并模拟子进程输出与退出
@@ -105,4 +109,48 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   assert.match(w2.warnings[0], /SIGKILL/)
 })
 
+test('runTriggers：取消后停止后续触发器，并传递 AbortSignal', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const result = await runTriggers(['abort-cmd', 'later-cmd'], {}, {
+    signal: ac.signal,
+    spawn: (/** @type {string} */ cmd, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+      captured.push({ cmd, args, opts })
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(captured.length, 1, '取消后不应启动后续触发器')
+  assert.equal(/** @type {{signal?: AbortSignal}} */ (captured[0].opts).signal, ac.signal)
+  assert.equal(result.aborted, true)
+  assert.deepEqual(result.warnings, [])
+})
 
+test('runTriggers：POSIX sleep 触发器取消后不应继续执行副作用', { skip: process.platform === 'win32', timeout: 5000 }, async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-trigger-abort-'))
+  const marker = join(tmp, 'completed')
+  const ac = new AbortController()
+  try {
+    const result = await runTriggers([`trap '' TERM; sleep 0.25; touch '${marker}'`], {}, {
+      signal: ac.signal,
+      spawn: (/** @type {string} */ shell, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+        const child = realSpawn(shell, args, opts)
+        setTimeout(() => ac.abort(), 20)
+        return child
+      },
+    })
+    assert.equal(result.aborted, true)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(existsSync(marker), false, '取消后的触发器后代不应继续执行副作用')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
