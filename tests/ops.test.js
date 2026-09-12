@@ -315,6 +315,20 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false } = {}) {
   return { cfg, git, vault }
 }
 
+/**
+ * @param {Array<{shell: string, args: string[], opts: object}>} captured
+ */
+function makeSuccessfulTriggerSpawn(captured) {
+  return (/** @type {string} */ shell, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+    captured.push({ shell, args, opts })
+    const child = /** @type {any} */ (new EventEmitter())
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    queueMicrotask(() => child.emit('exit', 0, null))
+    return child
+  }
+}
+
 test('mergeTask：干净任务直接合并并更新记录', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp)
@@ -392,6 +406,28 @@ test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 
   assert.ok(git.called(['worktree', 'remove', join(vault, 't')]))
   assert.ok(git.called(['branch', '-d', 'wtm/t']))
   assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：commit 模式合并后执行 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  /** @type {Array<{shell: string, args: string[], opts: object}>} */
+  const captured = []
+  const r = await finishTask({
+    root: 'C:/repo',
+    task: 'T',
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['check-merge'] } },
+    triggerSpawn: makeSuccessfulTriggerSpawn(captured),
+  })
+  assert.equal(r.ok, true, r.error ?? '')
+  assert.equal(captured.length, 1, 'finish 合并后应执行一次 on_merge 触发器')
+  assert.equal((/** @type {{cwd?: string}} */ (captured[0].opts)).cwd, 'C:/repo')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -529,6 +565,29 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   assert.match(t2.error ?? '', /conflict/)
   assert.equal(loadLedger(cfg.vault).records.length, 1)
   assert.equal(loadLedger(cfg.vault).records[0].task, 'T2')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('purge：commit 模式合并后执行 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  /** @type {Array<{shell: string, args: string[], opts: object}>} */
+  const captured = []
+  const r = await purge({
+    root: 'C:/repo',
+    tasks: ['T'],
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['check-merge'] } },
+    triggerSpawn: makeSuccessfulTriggerSpawn(captured),
+  })
+  assert.equal(r.ok, true)
+  assert.equal(r.results?.[0]?.ok, true)
+  assert.equal(captured.length, 1, 'purge 合并后应执行一次 on_merge 触发器')
+  assert.equal((/** @type {{cwd?: string}} */ (captured[0].opts)).cwd, 'C:/repo')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -718,5 +777,3 @@ test('purge：all 与 tasks 同时指定时报错', async () => {
   assert.match(r.error ?? '', /二选一/)
   rmSync(tmp, { recursive: true, force: true })
 })
-
-
