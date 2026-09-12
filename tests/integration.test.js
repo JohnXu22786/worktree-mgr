@@ -41,6 +41,32 @@ function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
 }
 
+test('集成：base 只接受真实分支名，拒绝 revision expression', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  try {
+    writeFileSync(join(root, 'second.txt'), 'second\n')
+    assert.equal(gitOk(['add', 'second.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'second'], root).status, 0)
+
+    const b = await begin({ root, task: 'Revision Base', base: 'main^', cfg, git, repo: null })
+    assert.equal(b.ok, false)
+    assert.match(b.error ?? '', /基分支不存在：main\^/)
+    assert.equal(existsSync(join(vault, 'revision-base')), false)
+    assert.equal(loadLedger(vault).records.length, 0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
 test('集成：完整生命周期 begin → 修改 → status → finish(commit)', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()
@@ -169,4 +195,3 @@ test('集成：resolveToplevel 真实解析子目录', { skip: !HAS_GIT, timeout
     rmSync(root, { recursive: true, force: true })
   }
 })
-

@@ -158,9 +158,9 @@ export async function begin(opts) {
       if (!baseName) {
         return { ok: false, error: '主工作区处于 detached HEAD 状态，请显式指定 base 分支' }
       }
-      const baseCheck = await git.run(['rev-parse', '--verify', `refs/heads/${baseName}`], { cwd: root, signal: opts.signal })
+      const baseCheck = await git.run(['show-ref', '--verify', `refs/heads/${baseName}`], { cwd: root, signal: opts.signal })
       if (!baseCheck.ok) {
-        // 空仓库（无任何提交）时分支尚未诞生，rev-parse 会失败——给出明确提示
+        // 空仓库（无任何提交）时分支尚未诞生，show-ref 会失败——给出明确提示
         const headCheck = await git.run(['rev-parse', '--verify', 'HEAD'], { cwd: root, signal: opts.signal })
         const hint = headCheck.ok ? '' : '（仓库尚无任何提交，请先创建首个提交）'
         return { ok: false, error: `基分支不存在：${baseName}${hint}` }
@@ -669,7 +669,4 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     warnings,
   }
 }
-
-
-
 
