@@ -285,6 +285,34 @@ test('begin：worktree add 失败透传 stderr', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：worktree add 创建后被中止时回滚工作区与分支', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  // 模拟 git 已创建工作区和分支后才被 AbortSignal 中止。
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], {
+    ok: false,
+    code: -1,
+    stdout: '',
+    stderr: '',
+    aborted: true,
+  })
+  git.on(['worktree', 'remove', '--force', wtPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
+  assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：执行 on_begin 触发器并附带警告', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)

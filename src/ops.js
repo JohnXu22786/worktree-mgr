@@ -144,6 +144,7 @@ export async function begin(opts) {
   const warnings = []
   let result
   let createdWorktree = false
+  let addError = null
   try {
     result = await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -190,9 +191,14 @@ export async function begin(opts) {
       }
 
       // 核心动作：创建 worktree
-      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      // git 可能在 AbortSignal 触发前已经创建工作区和分支，随后才返回失败；
+      // 因此必须在启动命令前标记，以便失败路径进入统一回滚。
       createdWorktree = true
+      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
+      if (!add.ok) {
+        addError = `创建工作区失败：${add.stderr.trim()}`
+        throw new Error(addError)
+      }
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
       const seedFiles = repo?.seed?.files
@@ -257,6 +263,7 @@ export async function begin(opts) {
       }
     }
     if (err instanceof VaultError) return { ok: false, error: err.message }
+    if (addError) return { ok: false, error: addError }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
   }
   if (!result.ok) return result
