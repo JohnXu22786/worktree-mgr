@@ -83,7 +83,7 @@ export async function resolveToplevel(git, candidate, signal) {
   if (!r.ok) {
     return { ok: false, error: `“${candidate}”不是 git 仓库：${r.stderr.trim() || 'rev-parse 失败'}` }
   }
-  return { ok: true, root: r.stdout.trim() }
+  return { ok: true, root: r.stdout.replace(/\n$/, '') }
 }
 
 /**

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, GitRunner } from '../src/git.js'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -14,6 +14,22 @@ test('samePath：POSIX 下保留路径分隔符语义', { skip: process.platform
 
 test('samePath：Windows 下忽略大小写', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/T1', 'c:\\wtm\\vault\\t1'), true)
+})
+
+test('resolveToplevel：保留仓库路径末尾的空格', async () => {
+  const git = {
+    run: async () => ({ ok: true, code: 0, stdout: '/tmp/repo \n', stderr: '', aborted: false }),
+  }
+  const result = await resolveToplevel(git, '/tmp/repo ')
+  assert.deepEqual(result, { ok: true, root: '/tmp/repo ' })
+})
+
+test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
+  const git = {
+    run: async () => ({ ok: true, code: 0, stdout: '/tmp/repo\r\n', stderr: '', aborted: false }),
+  }
+  const result = await resolveToplevel(git, '/tmp/repo\r')
+  assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
 })
 
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
