@@ -1,6 +1,7 @@
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -90,6 +91,68 @@ test('withLock：串行执行并释放锁', async () => {
   await withLock(dir, async () => { order.push(1) })
   await withLock(dir, async () => { order.push(2) })
   assert.deepEqual(order, [1, 2])
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：写入 token 失败时清理文件描述符和锁文件', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const writeError = new Error('token write failed')
+  mock.method(fs, 'writeFileSync', () => { throw writeError })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}),
+      (error) => error === writeError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(lockPath), false)
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 200, staleMs: 60_000 })
+  assert.equal(acquired, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：写入 token 失败时不暴露锁，也不删除后继锁', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const successorToken = 'successor-process-token'
+  const writeError = new Error('token write failed')
+  const realWriteFileSync = fs.writeFileSync
+  const realStatSync = fs.statSync
+  let lockExistedDuringWrite = false
+  let statCalls = 0
+  mock.method(fs, 'writeFileSync', (/** @type {string | number} */ target) => {
+    if (typeof target !== 'number') throw new Error('unexpected path write')
+    lockExistedDuringWrite = existsSync(lockPath)
+    realWriteFileSync(lockPath, successorToken, 'utf8')
+    throw writeError
+  })
+  mock.method(fs, 'statSync', (/** @type {string} */ path) => {
+    const currentStat = realStatSync(path)
+    if (path === lockPath) {
+      statCalls += 1
+      unlinkSync(lockPath)
+      realWriteFileSync(lockPath, successorToken, 'utf8')
+    }
+    return currentStat
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}),
+      (error) => error === writeError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(lockExistedDuringWrite, false)
+  assert.equal(statCalls, 0)
+  assert.equal(readFileSync(lockPath, 'utf8'), successorToken)
   rmSync(dir, { recursive: true, force: true })
 })
 
