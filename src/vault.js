@@ -210,52 +210,52 @@ export function saveLedger(vaultDir, ledger) {
 }
 
 /**
- * 尝试独占陈旧回收权，再删除仍然陈旧的锁。
+ * 尝试取得锁操作的互斥 guard。
+ * @param {string} reclaimPath
  * @param {string} lockPath
+ * @param {string} token
  * @param {number} staleMs
- * @returns {boolean} 是否已回收锁
+ * @returns {number | null}
  */
-function reclaimStaleLock(lockPath, staleMs) {
-  const reclaimPath = `${lockPath}.reclaim`
-  const claimToken = `${process.pid}-${randomBytes(8).toString('hex')}`
-  let reclaimFd = null
+function acquireLeaseGuard(reclaimPath, lockPath, token, staleMs) {
+  let fd = null
   try {
-    reclaimFd = openSync(reclaimPath, 'wx')
-    writeFileSync(reclaimFd, claimToken, 'utf8')
+    fd = openSync(reclaimPath, 'wx')
+    writeFileSync(fd, token, 'utf8')
+    return fd
   } catch (err) {
-    if (reclaimFd !== null) {
-      try { closeSync(reclaimFd) } catch { /* 忽略 */ }
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* 忽略 */ }
     }
     if (/** @type {any} */ (err).code !== 'EEXIST') throw err
-    // 回收者可能在持有 claim 时崩溃；只清理已经陈旧的 claim。
+    // guard 只在一次锁操作期间持有；陈旧 guard 只能来自已崩溃的操作。
     try {
-      const st = statSync(reclaimPath)
-      if (Date.now() - st.mtimeMs > staleMs) unlinkSync(reclaimPath)
-    } catch { /* 对方刚好完成或 claim 已被清理，忽略 */ }
-    return false
+      const guardStat = statSync(reclaimPath)
+      if (Date.now() - guardStat.mtimeMs <= staleMs) return null
+      // 读取 lockPath 使参数保持与锁的生命周期绑定：锁路径消失时，
+      // 陈旧 guard 也可以安全回收；若锁仍在，则仍只删除已陈旧的 guard。
+      try { statSync(lockPath) } catch (lockErr) {
+        if (/** @type {any} */ (lockErr).code !== 'ENOENT') throw lockErr
+      }
+      try { unlinkSync(reclaimPath) } catch { /* 对方刚好完成或 guard 已被清理 */ }
+    } catch { /* 对方刚好完成或 guard 已被清理，忽略 */ }
+    return null
   }
+}
 
-  try {
-    const st = statSync(lockPath)
-    if (Date.now() - st.mtimeMs <= staleMs) return false
-    try {
-      unlinkSync(lockPath)
-      return true
-    } catch (err) {
-      if (/** @type {any} */ (err).code === 'ENOENT') return false
-      throw err
-    }
-  } catch (err) {
-    if (/** @type {any} */ (err).code === 'ENOENT') return false
-    throw err
-  } finally {
-    if (reclaimFd !== null) {
-      try { closeSync(reclaimFd) } catch { /* 忽略 */ }
-    }
-    try {
-      if (readFileSync(reclaimPath, 'utf8') === claimToken) unlinkSync(reclaimPath)
-    } catch { /* claim 可能已被清理或已交给后继回收者，忽略 */ }
+/**
+ * 释放自己持有的操作 guard。
+ * @param {string} reclaimPath
+ * @param {string} token
+ * @param {number | null} fd
+ */
+function releaseLeaseGuard(reclaimPath, token, fd) {
+  if (fd !== null) {
+    try { closeSync(fd) } catch { /* 忽略 */ }
   }
+  try {
+    if (readFileSync(reclaimPath, 'utf8') === token) unlinkSync(reclaimPath)
+  } catch { /* guard 可能已被回收或删除，忽略 */ }
 }
 
 /**
@@ -264,9 +264,9 @@ function reclaimStaleLock(lockPath, staleMs) {
  * 安全性设计（防止多进程并发写账本）：
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
- * - 陈旧回收先以 wx 独占 .reclaim claim，并在 claim 内重新检查 mtime，
- *   防止多个竞争者交叉删除锁或误删后继锁；
- * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
+ * - 锁的创建、回收、心跳和释放都先取得 wx 独占的 .reclaim guard，
+ *   回收者无法在持有者更新或释放锁的临界区内删除锁；
+ * - 持锁期间每心跳间隔在 guard 内刷新锁文件 mtime，长任务（如触发器）不会因
  *   陈旧判定被其他进程窃取锁；
  * - 进程崩溃时心跳停止，锁文件超过 staleMs 判定陈旧并回收。
  *
@@ -280,51 +280,110 @@ function reclaimStaleLock(lockPath, staleMs) {
 export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_000, heartbeatMs = 30_000 } = {}) {
   mkdirSync(vaultDir, { recursive: true })
   const lockPath = join(vaultDir, '.lock')
+  const reclaimPath = `${lockPath}.reclaim`
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
   const deadline = Date.now() + timeoutMs
   let fd = null
   let owned = false
   for (;;) {
-    try {
-      fd = openSync(lockPath, 'wx')
-      writeFileSync(fd, token, 'utf8')
-      owned = true
-      break
-    } catch (err) {
-      if (/** @type {any} */ (err).code !== 'EEXIST') throw err
-      // 陈旧回收：mtime 超过 staleMs（持有者心跳已停止，视为进程死亡）
-      try {
-        const st = statSync(lockPath)
-        if (Date.now() - st.mtimeMs > staleMs) {
-          if (reclaimStaleLock(lockPath, staleMs)) continue
-        }
-      } catch {
-        continue // 对方刚好释放，重试
-      }
+    const reclaimFd = acquireLeaseGuard(reclaimPath, lockPath, token, staleMs)
+    if (reclaimFd === null) {
       if (Date.now() >= deadline) {
         throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
       }
       await new Promise((r) => setTimeout(r, 100))
+      continue
     }
+
+    let acquired = false
+    try {
+      try {
+        fd = openSync(lockPath, 'wx')
+        writeFileSync(fd, token, 'utf8')
+        acquired = true
+      } catch (err) {
+        if (fd !== null) {
+          try { closeSync(fd) } catch { /* 忽略 */ }
+          fd = null
+        }
+        if (/** @type {any} */ (err).code !== 'EEXIST') throw err
+        let stale = false
+        try {
+          const st = statSync(lockPath)
+          stale = Date.now() - st.mtimeMs > staleMs
+        } catch (statErr) {
+          if (/** @type {any} */ (statErr).code !== 'ENOENT') throw statErr
+          stale = true
+        }
+        if (stale) {
+          try { unlinkSync(lockPath) } catch (unlinkErr) {
+            if (/** @type {any} */ (unlinkErr).code !== 'ENOENT') throw unlinkErr
+          }
+          try {
+            fd = openSync(lockPath, 'wx')
+            writeFileSync(fd, token, 'utf8')
+            acquired = true
+          } catch (retryErr) {
+            if (fd !== null) {
+              try { closeSync(fd) } catch { /* 忽略 */ }
+              fd = null
+            }
+            if (/** @type {any} */ (retryErr).code !== 'EEXIST') throw retryErr
+          }
+        }
+      }
+    } catch (err) {
+      releaseLeaseGuard(reclaimPath, token, reclaimFd)
+      throw err
+    }
+    releaseLeaseGuard(reclaimPath, token, reclaimFd)
+    if (acquired && fd !== null) {
+      owned = true
+      break
+    }
+
+    if (Date.now() >= deadline) {
+      throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
+    }
+    await new Promise((r) => setTimeout(r, 100))
   }
   // 心跳：定期刷新 mtime，防止长任务期间被误判陈旧
   const heartbeat = setInterval(() => {
-    if (owned && fd !== null) {
-      try { futimesSync(fd, new Date(), new Date()) } catch { /* 锁可能已被回收，忽略 */ }
-    }
+    if (!owned || fd === null) return
+    const heartbeatToken = `${token}-heartbeat`
+    const guardFd = acquireLeaseGuard(reclaimPath, lockPath, heartbeatToken, staleMs)
+    if (guardFd === null) return
+    try {
+      if (readFileSync(lockPath, 'utf8') !== token) {
+        owned = false
+        return
+      }
+      const now = new Date()
+      futimesSync(fd, now, now)
+    } catch { /* 锁可能已被回收，忽略 */ }
+    finally { releaseLeaseGuard(reclaimPath, heartbeatToken, guardFd) }
   }, heartbeatMs)
   try {
     return await fn()
   } finally {
     clearInterval(heartbeat)
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* 忽略 */ }
+    let releaseFd = null
+    while (releaseFd === null) {
+      releaseFd = acquireLeaseGuard(reclaimPath, lockPath, `${token}-release`, staleMs)
+      if (releaseFd === null) await new Promise((r) => setTimeout(r, 10))
     }
-    // 只删除属于自己的锁：先读内容比对 token，防止误删后继持有者的锁
     try {
-      const content = readFileSync(lockPath, 'utf8')
-      if (content === token) unlinkSync(lockPath)
-    } catch { /* 已被回收或删除，忽略 */ }
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* 忽略 */ }
+      }
+      // 只删除属于自己的锁：先读内容比对 token，防止误删后继持有者的锁
+      try {
+        const content = readFileSync(lockPath, 'utf8')
+        if (content === token) unlinkSync(lockPath)
+      } catch { /* 已被回收或删除，忽略 */ }
+    } finally {
+      releaseLeaseGuard(reclaimPath, `${token}-release`, releaseFd)
+    }
   }
 }
 
