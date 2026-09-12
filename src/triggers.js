@@ -22,11 +22,11 @@ import { StringDecoder } from 'node:string_decoder'
  * 顺序执行一组触发器命令。
  * @param {unknown[] | undefined} commands
  * @param {TriggerContext} ctx
- * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string}} [opts]
+ * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal}} [opts]
  *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）
  * @returns {Promise<{warnings: string[]}>}
  */
-export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd } = {}) {
+export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal } = {}) {
   /** @type {string[]} */
   const warnings = []
   if (commands === undefined) return { warnings }
@@ -36,6 +36,7 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
   }
   const isWin = process.platform === 'win32'
   for (const [index, cmd] of commands.entries()) {
+    if (signal?.aborted) return { warnings }
     if (typeof cmd !== 'string') {
       warnings.push(`触发器配置项无效（索引 ${index}），必须是字符串，已忽略`)
       continue
@@ -51,7 +52,12 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
       WTM_PATH: ctx.path ?? '',
       WTM_ROOT: ctx.root ?? '',
     }
-    const { ok, detail } = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}) })
+    const { ok, detail } = await runOne(spawnFn, shell, args, {
+      env,
+      ...(cwd ? { cwd } : {}),
+      ...(signal ? { signal } : {}),
+    })
+    if (signal?.aborted) return { warnings }
     if (!ok) warnings.push(`触发器失败 [${cmd}]: ${detail}`)
   }
   return { warnings }
@@ -62,7 +68,7 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
  * @param {(shell: string, args: string[], opts: object) => object} spawnFn
  * @param {string} shell
  * @param {string[]} args
- * @param {{env: Record<string, string>, cwd?: string}} opts
+ * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal}} opts
  * @returns {Promise<{ok: boolean, detail: string}>}
  */
 function runOne(spawnFn, shell, args, opts) {

@@ -109,6 +109,20 @@ function abortResult() {
   return { ok: false, error: '操作已取消（aborted）' }
 }
 
+class OperationAborted extends Error {
+  constructor() {
+    super('操作已取消（aborted）')
+    this.name = 'OperationAborted'
+  }
+}
+
+/**
+ * @param {AbortSignal | undefined} signal
+ */
+function throwIfAborted(signal) {
+  if (isAborted(signal)) throw new OperationAborted()
+}
+
 /**
  * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
  * @param {string} path
@@ -212,11 +226,13 @@ export async function begin(opts) {
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseRef], { cwd: root, signal: opts.signal })
       if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
       createdWorktree = true
+      throwIfAborted(opts.signal)
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
       const seedFiles = repo?.seed?.files
       if (Array.isArray(seedFiles)) {
         for (const f of seedFiles) {
+          throwIfAborted(opts.signal)
           if (typeof f !== 'string' || f.trim() === '') continue
           // 用 resolve 而非 join：绝对路径输入（/abs/x）会被解析到仓库外，随后的越界检查会拦截
           const src = resolve(root, f)
@@ -239,16 +255,19 @@ export async function begin(opts) {
           } catch (err) {
             warnings.push(`种子文件复制失败（${f}）：${/** @type {Error} */ (err).message}`)
           }
+          throwIfAborted(opts.signal)
         }
       }
+      throwIfAborted(opts.signal)
 
       // on_begin 触发器（工作目录 = 新工作区）
       const triggerWarnings = await runTriggers(
         repo?.triggers?.on_begin,
         { task, branch: branchName, base: baseName, path: wtPath, root },
-        { spawn: opts.triggerSpawn, cwd: wtPath },
+        { spawn: opts.triggerSpawn, cwd: wtPath, signal: opts.signal },
       )
       warnings.push(...triggerWarnings.warnings)
+      throwIfAborted(opts.signal)
 
       /** @type {LedgerRecord} */
       const record = {
@@ -265,8 +284,9 @@ export async function begin(opts) {
       return { ok: true, base: baseName, path: wtPath }
     }, { signal: opts.signal })
   } catch (err) {
+    const aborted = err instanceof OperationAborted || isAborted(opts.signal)
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
-    if (createdWorktree && typeof result === 'undefined') {
+    if (createdWorktree && (typeof result === 'undefined' || aborted)) {
       try {
         const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
         const branch = await git.run(['branch', '-D', branchName], { cwd: root })
@@ -282,9 +302,9 @@ export async function begin(opts) {
         warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
-    if (isAborted(opts.signal)) return { ok: false, error: '操作已取消（aborted）', warnings }
-    if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
-    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
+    if (aborted) return abortResult()
+    if (err instanceof VaultError) return { ok: false, error: err.message }
+    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
   }
   if (!result.ok) return result
   return {
@@ -466,11 +486,13 @@ export async function purge(opts) {
         : tasks.map((t) => ({ rec: findRecord(ledger, t), name: t }))
       const results = []
       for (const item of targets) {
+        if (isAborted(opts.signal)) return abortResult()
         if (!item.rec) {
           results.push({ task: item.name, ok: false, error: '任务不存在' })
           continue
         }
         const r = await finishCore(opts, { vault, ledger, rec: item.rec, mode })
+        if (isAborted(opts.signal)) return abortResult()
         results.push({
           task: item.rec.task,
           ok: r.ok,
@@ -641,10 +663,11 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
     const triggerWarnings = await runTriggers(
       repo?.triggers?.on_merge,
       { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-      { spawn: opts.triggerSpawn, cwd: root },
+      { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
     )
     warnings.push(...triggerWarnings.warnings)
   }
+  if (isAborted(opts.signal)) return abortResult()
 
   // 4) 更新账本时间戳
   rec.updatedAt = nowIso()
@@ -760,14 +783,16 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   const del = await git.run(delArgs, { cwd: root, signal: opts.signal })
   let branchDeleted = del.ok
   if (!del.ok) warnings.push(`分支删除失败（${rec.branch}）：${del.stderr.trim()}`)
+  if (isAborted(opts.signal)) return abortResult()
 
   // on_finish 触发器（工作目录 = 主仓库；注意此时任务工作区已移除）
   const triggerWarnings = await runTriggers(
     repo?.triggers?.on_finish,
     { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
+    { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
+  if (isAborted(opts.signal)) return abortResult()
 
   removeRecord(ledger, task)
   saveLedger(vault, ledger)
