@@ -122,14 +122,14 @@ export function parseWorktreeList(text) {
 }
 
 /**
- * 解析 `git rev-list --left-right --count a...b` 的输出（a 领先数、b 领先数）。
+ * 解析 `git rev-list --left-right --count base...branch` 的输出（base 独有数、branch 独有数）。
  * @param {string} text
  * @returns {{ahead: number, behind: number} | null}
  */
 export function parseAheadBehind(text) {
   const m = text.trim().match(/^(\d+)\s+(\d+)$/)
   if (!m) return null
-  return { ahead: Number(m[1]), behind: Number(m[2]) }
+  return { ahead: Number(m[2]), behind: Number(m[1]) }
 }
 
 /**
