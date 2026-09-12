@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, GitRunner } from '../src/git.js'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runWorktreeList, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -32,6 +32,69 @@ test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
   assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
 })
 
+test('runWorktreeList：Git 不支持 -z 时回退到换行 porcelain', async () => {
+  /** @type {Array<{args: string[], opts: object | undefined}>} */
+  const calls = []
+  const git = {
+    run: async (/** @type {string[]} */ args, /** @type {object | undefined} */ opts) => {
+      calls.push({ args, opts })
+      if (args.includes('-z')) {
+        return { ok: false, code: 129, stdout: '', stderr: "error: unknown switch 'z'", aborted: false }
+      }
+      return {
+        ok: true,
+        code: 0,
+        stdout: 'worktree /tmp/worktree  \nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task\n',
+        stderr: '',
+        aborted: false,
+      }
+    },
+  }
+  const result = await runWorktreeList(git, { cwd: '/tmp/repo' })
+  assert.equal(result.ok, true)
+  assert.equal(parseWorktreeList(result.stdout)[0].path, '/tmp/worktree  ')
+  assert.deepEqual(calls.map(({ args }) => args), [
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '--porcelain'],
+  ])
+})
+
+test('runWorktreeList：根据退出码识别本地化的 -z 不支持错误', async () => {
+  /** @type {string[][]} */
+  const calls = []
+  const git = {
+    run: async (/** @type {string[]} */ args) => {
+      calls.push(args)
+      if (args.includes('-z')) {
+        return { ok: false, code: 129, stdout: '', stderr: '错误：未知选项 z', aborted: false }
+      }
+      return { ok: true, code: 0, stdout: 'legacy porcelain', stderr: '', aborted: false }
+    },
+  }
+  const result = await runWorktreeList(git)
+  assert.equal(result.ok, true)
+  assert.equal(result.stdout, 'legacy porcelain')
+  assert.deepEqual(calls, [
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '--porcelain'],
+  ])
+})
+
+test('runWorktreeList：非选项错误不回退重试', async () => {
+  /** @type {string[][]} */
+  const calls = []
+  const failure = { ok: false, code: 128, stdout: '', stderr: 'fatal: not a git repository', aborted: false }
+  const git = {
+    run: async (/** @type {string[]} */ args) => {
+      calls.push(args)
+      return failure
+    },
+  }
+  const result = await runWorktreeList(git, { cwd: '/tmp/not-a-repo' })
+  assert.deepEqual(result, failure)
+  assert.deepEqual(calls, [['worktree', 'list', '--porcelain', '-z']])
+})
+
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
   const text = [
     'worktree C:/my repo/main',
@@ -52,6 +115,58 @@ test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标�
   assert.equal(list[1].path, 'D:/wtm-vaults/task-one')
   assert.equal(list[1].branch, 'wtm/task-one')
   assert.equal(list[1].locked, true)
+})
+
+test('parseWorktreeList：保留 NUL porcelain 路径末尾的空格', () => {
+  const text = [
+    'worktree /tmp/worktree  ',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/task',
+    '',
+  ].join('\0')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree  ',
+    branch: 'task',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：将 NUL porcelain 中含换行的路径保留为一个记录', () => {
+  const text = [
+    'worktree /tmp/worktree\nwith-newline',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\0')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：兼容旧版 porcelain 中含换行的路径', () => {
+  const text = [
+    'worktree /tmp/worktree',
+    'with-newline',
+    'HEAD 3333333333333333333333333333333333333333',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\n')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
 })
 
 test('parseWorktreeList：detached 与 bare 工作区', () => {

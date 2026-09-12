@@ -87,7 +87,24 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
- * 解析 `git worktree list --porcelain` 输出。
+ * 读取 `git worktree list` 的机器可读输出。
+ * Git 2.36 之前不支持 `-z`，遇到该选项错误时回退到换行分隔格式。
+ * @param {{run: Function}} git
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
+ */
+export async function runWorktreeList(git, opts) {
+  const nul = await git.run(['worktree', 'list', '--porcelain', '-z'], opts)
+  // Git uses exit status 129 for command-line option errors, independent of locale.
+  if (nul.ok || nul.code !== 129) {
+    return nul
+  }
+  return git.run(['worktree', 'list', '--porcelain'], opts)
+}
+
+/**
+ * 解析 `git worktree list --porcelain -z` 输出。
+ * 兼容不带 `-z` 的换行分隔输出，以便处理旧的调用方。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}
  */
@@ -96,10 +113,10 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith('worktree ')) {
+  const consume = (/** @type {string} */ field) => {
+    if (field.startsWith('worktree ')) {
       current = {
-        path: line.slice('worktree '.length).trim(),
+        path: field.slice('worktree '.length),
         branch: null,
         detached: false,
         bare: false,
@@ -107,16 +124,35 @@ export function parseWorktreeList(text) {
       }
       out.push(current)
     } else if (current) {
-      if (line.startsWith('branch refs/heads/')) {
-        current.branch = line.slice('branch refs/heads/'.length).trim()
-      } else if (line === 'detached') {
+      if (field.startsWith('branch refs/heads/')) {
+        current.branch = field.slice('branch refs/heads/'.length).trim()
+      } else if (field === 'detached') {
         current.detached = true
-      } else if (line === 'bare') {
+      } else if (field === 'bare') {
         current.bare = true
-      } else if (line.startsWith('locked')) {
+      } else if (field.startsWith('locked')) {
         current.locked = true
       }
     }
+  }
+
+  if (text.includes('\0')) {
+    for (const field of text.split('\0')) consume(field)
+    return out
+  }
+
+  // Legacy porcelain has no record delimiter. The stable HEAD line lets us
+  // keep newlines that belong to the path before parsing the record fields.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\nHEAD [0-9a-f]+(?:\r?\n|$)/gm)]
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]
+    consume(`worktree ${record[1]}`)
+    const start = (record.index ?? 0) + record[0].length
+    const end = records[i + 1]?.index ?? text.length
+    for (const field of text.slice(start, end).split(/\r?\n/)) consume(field)
+  }
+  if (records.length === 0) {
+    for (const field of text.split(/\r?\n/)) consume(field)
   }
   return out
 }

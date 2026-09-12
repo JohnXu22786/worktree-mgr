@@ -336,7 +336,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false } = {}) {
   })
   saveLedger(vault, ledger)
   mkdirSync(join(vault, 't'), { recursive: true })
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD 1'.padEnd(40, '1') + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD 2'.padEnd(40, '2') + '\nbranch refs/heads/wtm/t\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD 1'.padEnd(40, '1') + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD 2'.padEnd(40, '2') + '\nbranch refs/heads/wtm/t\n'))
   // status 答案按 cwd 区分：任务工作区脏与否 / 基工作区脏与否
   git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
     if (ctx.cwd === join(vault, 't')) return taskDirty ? OK(' M f.txt\n') : OK('')
@@ -405,7 +405,7 @@ test('mergeTask：记录不存在报错；工作区已消失报错并提示 purg
     const ledger = structuredClone(EMPTY_LEDGER)
   upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: 'P', createdAt: 'c', updatedAt: 'u' })
   saveLedger(cfg.vault, ledger)
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const r2 = await mergeTask({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r2.ok, false)
   assert.match(r2.error ?? '', /工作区|purge/i)
@@ -465,7 +465,7 @@ test('finishTask：工作区已不存在时清记录并提示（stale 清理）'
     const ledger = structuredClone(EMPTY_LEDGER)
   upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: 'P', createdAt: 'c', updatedAt: 'u' })
   saveLedger(cfg.vault, ledger)
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.equal(loadLedger(cfg.vault).records.length, 0)
@@ -482,7 +482,7 @@ test('finishTask：记录不存在报错；非法 mode 报错', async () => {
     const ledger = structuredClone(EMPTY_LEDGER)
   upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: 'P', createdAt: 'c', updatedAt: 'u' })
   saveLedger(cfg.vault, ledger)
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree P\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree P\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n'))
   const r2 = await finishTask({ root: 'C:/repo', task: 'T', mode: 'bogus', cfg, git, repo: null })
   assert.equal(r2.ok, false)
   assert.match(r2.error ?? '', /mode/i)
@@ -501,7 +501,7 @@ test('listStatus：计算存在性、脏状态与 ahead/behind', async () => {
   saveLedger(cfg.vault, ledger)
   mkdirSync(join(cfg.vault, 't1'), { recursive: true })
 
-  git.on(['worktree', 'list', '--porcelain'], OK(
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK(
     'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
     'worktree ' + join(cfg.vault, 't1') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t1\n',
   ))
@@ -533,7 +533,7 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
   saveLedger(cfg.vault, ledger)
   mkdirSync(join(cfg.vault, 't'), { recursive: true })
 
-  git.on(['worktree', 'list', '--porcelain'], OK(
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK(
     'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
     'worktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
   ))
@@ -563,7 +563,7 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   const wt = 'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
     'worktree ' + join(cfg.vault, 't1') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t1\n\n' +
     'worktree ' + join(cfg.vault, 't2') + '\nHEAD ' + '3'.repeat(40) + '\nbranch refs/heads/wtm/t2\n'
-  git.on(['worktree', 'list', '--porcelain'], OK(wt))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK(wt))
   // T1 正常，T2 的 merge 失败
   git.on(['branch', '--show-current'], OK('main\n'))
   git.on(['merge-base', '--is-ancestor', 'wtm/t1', 'HEAD'], FAIL())
@@ -613,7 +613,7 @@ test('purge：all 模式处理全部记录', async () => {
   upsertRecord(ledger, { task: 'T1', branch: 'wtm/t1', base: 'main', path: 'P1', createdAt: 'c', updatedAt: 'u' })
   saveLedger(cfg.vault, ledger)
   // 工作区已消失 → stale 清理分支
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const r = await purge({ root: 'C:/repo', all: true, cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.ok(r.results, '应有 results')
@@ -633,7 +633,7 @@ test('mergeTask：工作区分支与账本不一致时拒绝（防静默错分�
   saveLedger(cfg.vault, ledger)
   mkdirSync(join(cfg.vault, 't'), { recursive: true })
   // 工作区在别的分支上
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n'))
   const r = await mergeTask({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /不一致/)
@@ -718,7 +718,7 @@ test('finishTask：commit 模式工作区分支不一致时拒绝（收尾路径
   const tmp = makeTmp()
   const { cfg, git } = mergeFixture(tmp, { taskDirty: true })
   // 工作区被切到其他分支
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n'))
   const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /不一致/)
@@ -760,7 +760,7 @@ test('listStatus：工作区目录被外部删除时 exists=false（不谎报健
   upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: join(cfg.vault, 't'), createdAt: 'c', updatedAt: 'u' })
   saveLedger(cfg.vault, ledger)
   // 注册表仍列出（prunable），但目录不存在
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n'))
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.ok(r.rows, '应有 rows')
