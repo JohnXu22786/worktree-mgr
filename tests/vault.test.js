@@ -1,6 +1,5 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,13 +19,6 @@ import {
 function makeTmp() {
   const dir = mkdtempSync(join(tmpdir(), 'wtm-vault-test-'))
   return dir
-}
-
-function exitedPid() {
-  const child = spawnSync(process.execPath, ['-e', ''])
-  assert.equal(child.status, 0)
-  assert.ok(child.pid)
-  return child.pid
 }
 
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
@@ -137,17 +129,19 @@ test('withLock：超时抛出 VaultError', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('withLock：活跃持有者即使锁已过期也不会被回收', async () => {
+test('withLock：已有陈旧回收 claim 时不会重复回收', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
-  const token = `${process.pid}-active-owner`
+  const reclaimPath = `${lockPath}.reclaim`
+  const token = 'crashed-owner'
   writeFileSync(lockPath, token)
-  const past = new Date(Date.now() - 60_000)
+  const past = new Date(Date.now() - 120_000)
   utimesSync(lockPath, past, past)
+  writeFileSync(reclaimPath, 'another-reclaimer')
 
   let ran = false
   await assert.rejects(
-    withLock(dir, async () => { ran = true }, { timeoutMs: 100, staleMs: 10 }),
+    withLock(dir, async () => { ran = true }, { timeoutMs: 100, staleMs: 60_000 }),
     VaultError,
   )
   assert.equal(ran, false)
@@ -158,13 +152,27 @@ test('withLock：活跃持有者即使锁已过期也不会被回收', async () 
 test('withLock：过期锁被回收（stale）', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
-  writeFileSync(lockPath, `${exitedPid()}-crashed-owner`)
+  writeFileSync(lockPath, 'crashed-owner')
   const past = new Date(Date.now() - 60_000)
   utimesSync(lockPath, past, past) // 锁文件时间戳拨回 1 分钟前
   let ran = false
   await withLock(dir, async () => { ran = true }, { timeoutMs: 2000, staleMs: 10_000 })
   assert.equal(ran, true)
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：空或损坏的过期锁可被回收', async () => {
+  for (const token of ['', 'malformed-lock-token']) {
+    const dir = makeTmp()
+    const lockPath = join(dir, '.lock')
+    writeFileSync(lockPath, token)
+    const past = new Date(Date.now() - 60_000)
+    utimesSync(lockPath, past, past)
+    let ran = false
+    await withLock(dir, async () => { ran = true }, { timeoutMs: 2000, staleMs: 10_000 })
+    assert.equal(ran, true, `应回收内容为 ${JSON.stringify(token)} 的过期锁`)
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('withLock：锁被其他进程回收后，释放时不删除后继锁（token 校验）', async () => {

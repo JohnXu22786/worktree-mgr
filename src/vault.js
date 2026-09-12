@@ -210,26 +210,51 @@ export function saveLedger(vaultDir, ledger) {
 }
 
 /**
- * 只有确认锁的持有进程已退出时才允许回收。
+ * 尝试独占陈旧回收权，再删除仍然陈旧的锁。
  * @param {string} lockPath
- * @returns {boolean}
+ * @param {number} staleMs
+ * @returns {boolean} 是否已回收锁
  */
-function isLockOwnerAlive(lockPath) {
-  let content
+function reclaimStaleLock(lockPath, staleMs) {
+  const reclaimPath = `${lockPath}.reclaim`
+  const claimToken = `${process.pid}-${randomBytes(8).toString('hex')}`
+  let reclaimFd = null
   try {
-    content = readFileSync(lockPath, 'utf8')
-  } catch {
-    return true
-  }
-  const match = /^(\d+)-/.exec(content)
-  if (!match) return true
-  const pid = Number(match[1])
-  if (!Number.isSafeInteger(pid) || pid <= 0) return true
-  try {
-    process.kill(pid, 0)
-    return true
+    reclaimFd = openSync(reclaimPath, 'wx')
+    writeFileSync(reclaimFd, claimToken, 'utf8')
   } catch (err) {
-    return /** @type {NodeJS.ErrnoException} */ (err).code !== 'ESRCH'
+    if (reclaimFd !== null) {
+      try { closeSync(reclaimFd) } catch { /* 忽略 */ }
+    }
+    if (/** @type {any} */ (err).code !== 'EEXIST') throw err
+    // 回收者可能在持有 claim 时崩溃；只清理已经陈旧的 claim。
+    try {
+      const st = statSync(reclaimPath)
+      if (Date.now() - st.mtimeMs > staleMs) unlinkSync(reclaimPath)
+    } catch { /* 对方刚好完成或 claim 已被清理，忽略 */ }
+    return false
+  }
+
+  try {
+    const st = statSync(lockPath)
+    if (Date.now() - st.mtimeMs <= staleMs) return false
+    try {
+      unlinkSync(lockPath)
+      return true
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') return false
+      throw err
+    }
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return false
+    throw err
+  } finally {
+    if (reclaimFd !== null) {
+      try { closeSync(reclaimFd) } catch { /* 忽略 */ }
+    }
+    try {
+      if (readFileSync(reclaimPath, 'utf8') === claimToken) unlinkSync(reclaimPath)
+    } catch { /* claim 可能已被清理或已交给后继回收者，忽略 */ }
   }
 }
 
@@ -239,7 +264,8 @@ function isLockOwnerAlive(lockPath) {
  * 安全性设计（防止多进程并发写账本）：
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
- * - 回收前确认 token 中的持有者进程已退出，避免心跳刷新与陈旧检查竞争；
+ * - 陈旧回收先以 wx 独占 .reclaim claim，并在 claim 内重新检查 mtime，
+ *   防止多个竞争者交叉删除锁或误删后继锁；
  * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
  *   陈旧判定被其他进程窃取锁；
  * - 进程崩溃时心跳停止，锁文件超过 staleMs 判定陈旧并回收。
@@ -270,12 +296,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       try {
         const st = statSync(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
-          // mtime 的检查与心跳刷新之间不是原子的；只有持有者进程已退出时
-          // 才能删除锁，避免活跃持有者在检查后刷新心跳却被误回收。
-          if (!isLockOwnerAlive(lockPath)) {
-            unlinkSync(lockPath)
-            continue
-          }
+          if (reclaimStaleLock(lockPath, staleMs)) continue
         }
       } catch {
         continue // 对方刚好释放，重试
