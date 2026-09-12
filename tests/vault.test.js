@@ -41,6 +41,8 @@ function runLockChild(dir, mode) {
     const sourcePath = process.env.WTM_TEST_VAULT_SOURCE
     const originalStatSync = fs.statSync
     const originalUnlinkSync = fs.unlinkSync
+    const originalWriteFileSync = fs.writeFileSync
+    const originalUtimesSync = fs.utimesSync
 
     if (process.env.WTM_TEST_LOCK_MODE === 'stat') {
       fs.statSync = (target, ...args) => {
@@ -60,6 +62,17 @@ function runLockChild(dir, mode) {
           throw error
         }
         return originalUnlinkSync(target, ...args)
+      }
+    }
+    if (process.env.WTM_TEST_LOCK_MODE === 'recreate') {
+      fs.unlinkSync = (target, ...args) => {
+        const result = originalUnlinkSync(target, ...args)
+        if (target === lockPath) {
+          const staleTime = new Date(Date.now() - 60_000)
+          originalWriteFileSync(lockPath, 'recreated stale lock', 'utf8')
+          originalUtimesSync(lockPath, staleTime, staleTime)
+        }
+        return result
       }
     }
     syncBuiltinESMExports()
@@ -296,6 +309,18 @@ test('withLock：回收锁删除失败时仍遵守 timeout', async () => {
   const past = new Date(Date.now() - 60_000)
   utimesSync(lockPath, past, past)
   const result = await runLockChild(dir, 'unlink')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：stale 锁持续被重新创建时仍遵守 timeout', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  writeFileSync(lockPath, String(process.pid))
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(lockPath, past, past)
+  const result = await runLockChild(dir, 'recreate')
   assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
   assert.equal(result.code, 0, result.stderr)
   rmSync(dir, { recursive: true, force: true })

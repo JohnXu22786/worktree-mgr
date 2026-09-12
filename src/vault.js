@@ -258,7 +258,6 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
         const st = statSync(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
           unlinkSync(lockPath)
-          continue
         }
       } catch {
         // 对方可能刚好释放，也可能是持久的 I/O、权限错误或悬空符号链接；统一走超时检查。
