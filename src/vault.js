@@ -20,13 +20,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 export class VaultError extends Error {
   /**
@@ -114,17 +115,41 @@ export function computeVault(rootPath, vault) {
 }
 
 /**
+ * 解析路径中的别名和已存在路径段中的符号链接。
+ * 目标目录可能尚未创建，因此从最近的已存在父目录开始解析，再拼回尾部。
+ * @param {string} path
+ * @returns {string}
+ */
+function canonicalPath(path) {
+  const absolute = resolve(path)
+  let existing = absolute
+  /** @type {string[]} */
+  const suffix = []
+  while (!existsSync(existing)) {
+    const parent = dirname(existing)
+    if (parent === existing) return absolute
+    suffix.unshift(basename(existing))
+    existing = parent
+  }
+  try {
+    return join(realpathSync(existing), ...suffix)
+  } catch {
+    return absolute
+  }
+}
+
+/**
  * 判断 target 是否位于 parent 之内（或等于 parent）。
- * 路径分隔符先归一化；Windows 下同时忽略大小写（与 samePath 语义一致），
- * 防止大小写变体绕过防护。
+ * 比较前解析路径别名和符号链接；路径分隔符先归一化，Windows 下同时忽略大小写
+ * （与 samePath 语义一致），防止路径变体绕过防护。
  * @param {string} parent
  * @param {string} target
  * @returns {boolean}
  */
 export function isWithin(parent, target) {
   const norm = (/** @type {string} */ p) => p.replace(/\\/g, '/').replace(/\/+$/, '')
-  let p = norm(parent)
-  let t = norm(target)
+  let p = norm(canonicalPath(parent))
+  let t = norm(canonicalPath(target))
   if (process.platform === 'win32') {
     p = p.toLowerCase()
     t = t.toLowerCase()

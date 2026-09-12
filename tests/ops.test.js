@@ -1,6 +1,6 @@
 ﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
@@ -128,6 +128,42 @@ test('begin：vault 位于仓库工作树内时拒绝（防主工作区被弄脏
   assert.match(r.error ?? '', /vault/)
   assert.equal(git.calls.length, 0)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：vault 的 .. 路径别名解析到仓库内时拒绝', async () => {
+  const tmp = makeTmp()
+  const root = join(tmp, 'repo')
+  const alias = join(tmp, 'repo-alias')
+  mkdirSync(root, { recursive: true })
+  mkdirSync(alias, { recursive: true })
+  const git = new FakeGit()
+  const cfg = { ...baseCfg(tmp), vault: `${alias}/../repo/.wtm-vault` }
+  try {
+    const r = await begin({ root, task: 'T', cfg, git, repo: null })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /vault/)
+    assert.equal(git.calls.length, 0)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('begin：指向仓库内目录的 vault 符号链接时拒绝', async () => {
+  const tmp = makeTmp()
+  const root = join(tmp, 'repo')
+  const link = join(tmp, 'vault-link')
+  mkdirSync(root, { recursive: true })
+  symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir')
+  const git = new FakeGit()
+  const cfg = { ...baseCfg(tmp), vault: join(link, '.wtm-vault') }
+  try {
+    const r = await begin({ root, task: 'T', cfg, git, repo: null })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /vault/)
+    assert.equal(git.calls.length, 0)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('begin：任务名非法直接报错，不执行任何 git 写操作', async () => {
