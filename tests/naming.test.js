@@ -76,6 +76,15 @@ test('deriveBranch：前缀较长时仍限制分支总长度', () => {
   assert.equal(validateBranch(branch).ok, true)
 })
 
+test('validatePrefix：为非 BMP slug 预留最小分支空间', () => {
+  assert.equal(validatePrefix('p'.repeat(253)).ok, false)
+
+  const prefix = 'p'.repeat(252)
+  const branch = deriveBranch('𐐀', prefix)
+  assert.equal(branch.length, 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
   // 截断切在 . 上：段尾残留 '.'
   assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)

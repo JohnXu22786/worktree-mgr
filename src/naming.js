@@ -9,6 +9,7 @@
 
 const MAX_BRANCH_LENGTH = 255
 const MAX_SLUG_LENGTH = 60
+const MIN_SLUG_UTF16_LENGTH = 2
 const MAX_TASK_LENGTH = 200
 
 /**
@@ -140,6 +141,9 @@ export function validatePrefix(prefix) {
   const r = validateBranch(prefix)
   if (!r.ok) return r
   if (prefix.includes('/')) return { ok: false, reason: '前缀必须是单段，不能包含 /' }
+  if (prefix.length > MAX_BRANCH_LENGTH - 1 - MIN_SLUG_UTF16_LENGTH) {
+    return { ok: false, reason: '前缀过长，无法为派生 slug 留出空间' }
+  }
   return { ok: true }
 }
 
