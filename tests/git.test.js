@@ -2,9 +2,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseWorktreeList, parseAheadBehind, isDirty, samePath, GitRunner } from '../src/git.js'
 
-test('samePath：Windows 风格分隔符差异不影响匹配', () => {
+test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
   assert.equal(samePath('C:/a', 'C:/b'), false)
+})
+
+test('samePath：POSIX 下保留路径分隔符语义', { skip: process.platform === 'win32' }, () => {
+  assert.equal(samePath('/wtm/vault/t1', '/wtm/vault/t1'), true)
+  assert.equal(samePath('/wtm/vault/t1', '\\wtm\\vault\\t1'), false)
 })
 
 test('samePath：Windows 下忽略大小写', { skip: process.platform !== 'win32' }, () => {
