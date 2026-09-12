@@ -329,6 +329,7 @@ test('begin：on_begin 取消时回滚工作区与分支且不落账本', async 
         const error = new Error('The operation was aborted')
         error.name = 'AbortError'
         child.emit('error', error)
+        child.emit('close', null, 'SIGKILL')
       })
       return child
     },
@@ -337,6 +338,50 @@ test('begin：on_begin 取消时回滚工作区与分支且不落账本', async 
   assert.match(r.error ?? '', /取消|abort/i)
   assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：worktree add 取消时回滚部分创建资源', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], {
+    ok: false, code: -1, stdout: '', stderr: 'aborted', aborted: true,
+  })
+  git.on(['worktree', 'remove', '--force', wtPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
+  assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：回滚 git 清理失败时报告失败而非成功', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], {
+    ok: false, code: -1, stdout: '', stderr: 'aborted', aborted: true,
+  })
+  git.on(['worktree', 'remove', '--force', wtPath], FAIL('remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('branch failed'))
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.ok((r.warnings ?? []).some((w) => /回滚失败|remove failed|branch failed/.test(w)), JSON.stringify(r))
   assert.equal(loadLedger(cfg.vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
 })
@@ -419,6 +464,7 @@ test('mergeTask：on_merge 取消时返回失败且不更新账本', async () =>
         const error = new Error('The operation was aborted')
         error.name = 'AbortError'
         child.emit('error', error)
+        child.emit('close', null, 'SIGKILL')
       })
       return child
     },
@@ -531,6 +577,7 @@ test('finishTask：on_finish 取消时返回失败且保留账本记录', async 
         const error = new Error('The operation was aborted')
         error.name = 'AbortError'
         child.emit('error', error)
+        child.emit('close', null, 'SIGKILL')
       })
       return child
     },
@@ -705,6 +752,7 @@ test('purge：on_finish 取消时返回失败且停止批量清理', async () =>
         const error = new Error('The operation was aborted')
         error.name = 'AbortError'
         child.emit('error', error)
+        child.emit('close', null, 'SIGKILL')
       })
       return child
     },

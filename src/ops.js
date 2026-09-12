@@ -109,6 +109,12 @@ function abortResult() {
   return { ok: false, error: '操作已取消（aborted）' }
 }
 
+function abortError() {
+  const err = new Error('操作已取消（aborted）')
+  err.name = 'AbortError'
+  return err
+}
+
 /**
  * 创建任务工作区：派生分支 → 校验 → git worktree add → 种子文件 → 触发器 → 落账本。
  * @param {{root: string, task?: string, base?: string, branch?: string, note?: string,
@@ -188,8 +194,16 @@ export async function begin(opts) {
 
       // 核心动作：创建 worktree
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      if (!add.ok) {
+        if (add.aborted || isAborted(opts.signal)) {
+          // git worktree add 可能已创建部分资源，必须进入统一回滚路径。
+          createdWorktree = true
+          throw abortError()
+        }
+        return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      }
       createdWorktree = true
+      if (isAborted(opts.signal)) throw abortError()
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
       const seedFiles = repo?.seed?.files
@@ -227,7 +241,7 @@ export async function begin(opts) {
         { spawn: opts.triggerSpawn, cwd: wtPath, signal: opts.signal },
       )
       warnings.push(...triggerWarnings.warnings)
-      if (triggerWarnings.aborted || isAborted(opts.signal)) throw new Error('操作已取消（aborted）')
+      if (triggerWarnings.aborted || isAborted(opts.signal)) throw abortError()
 
       /** @type {LedgerRecord} */
       const record = {
@@ -246,15 +260,29 @@ export async function begin(opts) {
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && typeof result === 'undefined') {
+      /** @type {string[]} */
+      const rollbackFailures = []
       try {
-        await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        await git.run(['branch', '-D', branchName], { cwd: root })
+        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
+        if (!remove.ok) rollbackFailures.push(`worktree remove 失败：${remove.stderr.trim() || '命令失败'}`)
+      } catch (rollbackErr) {
+        rollbackFailures.push(`worktree remove 失败：${/** @type {Error} */ (rollbackErr).message}`)
+      }
+      try {
+        const del = await git.run(['branch', '-D', branchName], { cwd: root })
+        if (!del.ok) rollbackFailures.push(`branch -D 失败：${del.stderr.trim() || '命令失败'}`)
+      } catch (rollbackErr) {
+        rollbackFailures.push(`branch -D 失败：${/** @type {Error} */ (rollbackErr).message}`)
+      }
+      if (rollbackFailures.length === 0) {
         warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
-      } catch {
-        warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
+      } else {
+        warnings.push(`工作区创建未完成，且回滚失败：${rollbackFailures.join('；')}`)
       }
     }
-    if (isAborted(opts.signal)) return { ...abortResult(), ...(warnings.length > 0 ? { warnings } : {}) }
+    if (isAborted(opts.signal) || (err instanceof Error && err.name === 'AbortError')) {
+      return { ...abortResult(), ...(warnings.length > 0 ? { warnings } : {}) }
+    }
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
   }

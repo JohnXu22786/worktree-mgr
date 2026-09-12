@@ -70,7 +70,11 @@ function runOne(spawnFn, shell, args, opts) {
     /** @type {any} */
     let child
     try {
-      child = spawnFn(shell, args, { ...opts, windowsHide: true })
+      child = spawnFn(shell, args, {
+        ...opts,
+        windowsHide: true,
+        ...(process.platform === 'win32' ? {} : { detached: true }),
+      })
     } catch (err) {
       const aborted = /** @type {Error} */ (err).name === 'AbortError'
       resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}`, aborted })
@@ -79,26 +83,77 @@ function runOne(spawnFn, shell, args, opts) {
     let stdout = ''
     let stderr = ''
     let settled = false
+    let aborting = false
+    let abortDetail = '操作已取消（aborted）'
+    const signal = /** @type {{signal?: AbortSignal}} */ (opts).signal
+    const onAbort = () => {
+      aborting = true
+      terminateProcessTree(child)
+    }
     /**
      * @param {{ok: boolean, detail: string, aborted?: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
         settled = true
+        signal?.removeEventListener('abort', onAbort)
         resolve(result)
       }
     }
     child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
     child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
     child.on('error', (/** @type {any} */ err) => {
-      done({ ok: false, detail: `${stderr.trim() || err.message}`, aborted: err.name === 'AbortError' })
+      if (err.name === 'AbortError' || aborting || signal?.aborted) {
+        aborting = true
+        abortDetail = `${stderr.trim() || err.message}`
+        terminateProcessTree(child)
+        return
+      }
+      done({ ok: false, detail: `${stderr.trim() || err.message}` })
     })
     child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      if (aborting || signal?.aborted) return
       if (code === 0) {
         done({ ok: true, detail: '' })
       } else {
         done({ ok: false, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` })
       }
     })
+    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      if (aborting || signal?.aborted) {
+        done({ ok: false, detail: abortDetail, aborted: true })
+      }
+    })
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
   })
+}
+
+/**
+ * 终止触发器的进程组，避免 shell 的后代在取消后继续执行。
+ * @param {any} child
+ */
+function terminateProcessTree(child) {
+  const pid = child?.pid
+  if (typeof pid === 'number') {
+    if (process.platform === 'win32') {
+      try {
+        const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+        killer.on('error', () => {
+          try { child.kill?.('SIGKILL') } catch { /* 已结束 */ }
+        })
+        killer.unref?.()
+        return
+      } catch { /* 回退到 child.kill */ }
+    } else {
+      try {
+        process.kill(-pid, 'SIGKILL')
+        return
+      } catch { /* 进程组可能已经结束 */ }
+    }
+  }
+  try { child?.kill?.('SIGKILL') } catch { /* 进程可能已经结束 */ }
 }
