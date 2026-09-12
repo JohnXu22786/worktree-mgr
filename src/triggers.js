@@ -85,10 +85,23 @@ function runOne(spawnFn, shell, args, opts) {
     let settled = false
     let aborting = false
     let abortDetail = '操作已取消（aborted）'
+    /** @type {{ok: boolean, detail: string, aborted?: boolean} | undefined} */
+    let exitResult
+    let termination = Promise.resolve()
+    let terminationRequested = false
     const signal = /** @type {{signal?: AbortSignal}} */ (opts).signal
+    const requestTermination = () => {
+      if (terminationRequested) return
+      terminationRequested = true
+      try {
+        termination = Promise.resolve(terminateProcessTree(child))
+      } catch {
+        termination = Promise.resolve()
+      }
+    }
     const onAbort = () => {
       aborting = true
-      terminateProcessTree(child)
+      requestTermination()
     }
     /**
      * @param {{ok: boolean, detail: string, aborted?: boolean}} result
@@ -106,7 +119,7 @@ function runOne(spawnFn, shell, args, opts) {
       if (err.name === 'AbortError' || aborting || signal?.aborted) {
         aborting = true
         abortDetail = `${stderr.trim() || err.message}`
-        terminateProcessTree(child)
+        requestTermination()
         return
       }
       done({ ok: false, detail: `${stderr.trim() || err.message}` })
@@ -114,14 +127,25 @@ function runOne(spawnFn, shell, args, opts) {
     child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
       if (aborting || signal?.aborted) return
       if (code === 0) {
-        done({ ok: true, detail: '' })
+        exitResult = { ok: true, detail: '' }
       } else {
-        done({ ok: false, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` })
+        exitResult = { ok: false, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` }
       }
     })
     child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
       if (aborting || signal?.aborted) {
-        done({ ok: false, detail: abortDetail, aborted: true })
+        termination.then(
+          () => done({ ok: false, detail: abortDetail, aborted: true }),
+          () => done({ ok: false, detail: abortDetail, aborted: true }),
+        )
+        return
+      }
+      if (exitResult) {
+        done(exitResult)
+      } else if (code === 0) {
+        done({ ok: true, detail: '' })
+      } else {
+        done({ ok: false, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` })
       }
     })
     signal?.addEventListener('abort', onAbort, { once: true })
@@ -132,22 +156,50 @@ function runOne(spawnFn, shell, args, opts) {
 /**
  * 终止触发器的进程组，避免 shell 的后代在取消后继续执行。
  * @param {any} child
+ * @param {{platform?: NodeJS.Platform, spawnFn?: (command: string, args: string[], opts: object) => any}} [deps]
  */
-function terminateProcessTree(child) {
+export function terminateProcessTree(child, { platform = process.platform, spawnFn = spawn } = {}) {
   const pid = child?.pid
   if (typeof pid === 'number') {
-    if (process.platform === 'win32') {
+    if (platform === 'win32') {
+      let fallbackUsed = false
+      const fallback = () => {
+        if (fallbackUsed) return
+        fallbackUsed = true
+        try { child.kill?.('SIGKILL') } catch { /* 已结束 */ }
+      }
       try {
-        const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+        const killer = spawnFn('taskkill', ['/pid', String(pid), '/t', '/f'], {
           windowsHide: true,
           stdio: 'ignore',
         })
-        killer.on('error', () => {
-          try { child.kill?.('SIGKILL') } catch { /* 已结束 */ }
+        /** @type {Promise<void>} */
+        const cleanup = new Promise((resolve) => {
+          let settled = false
+          const finish = () => {
+            if (settled) return
+            settled = true
+            resolve()
+          }
+          killer.on('error', () => {
+            fallback()
+            finish()
+          })
+          killer.on('exit', (/** @type {number | null} */ code) => {
+            if (code !== 0) fallback()
+            finish()
+          })
+          killer.on('close', (/** @type {number | null} */ code) => {
+            if (code !== 0) fallback()
+            finish()
+          })
+          killer.unref?.()
         })
-        killer.unref?.()
+        return cleanup
+      } catch { /* 回退到 child.kill */
+        fallback()
         return
-      } catch { /* 回退到 child.kill */ }
+      }
     } else {
       try {
         process.kill(-pid, 'SIGKILL')

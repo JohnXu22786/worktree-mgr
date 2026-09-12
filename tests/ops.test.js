@@ -291,8 +291,10 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
         if (fail) {
           c.stderr.emit('data', Buffer.from('boom'))
           c.emit('exit', 3, null)
+          c.emit('close', 3, null)
         } else {
           c.emit('exit', 0, null)
+          c.emit('close', 0, null)
         }
       })
       return c

@@ -5,7 +5,7 @@ import { spawn as realSpawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runTriggers } from '../src/triggers.js'
+import { runTriggers, terminateProcessTree } from '../src/triggers.js'
 
 // 可注入的假 spawn：捕获调用并模拟子进程输出与退出
 /**
@@ -23,6 +23,7 @@ function makeFakeSpawn(captured, behaviors = {}) {
       if (b.stderr) child.stderr.emit('data', Buffer.from(b.stderr))
       if (b.stdout) child.stdout.emit('data', Buffer.from(b.stdout))
       child.emit('exit', b.code ?? 0, null)
+      child.emit('close', b.code ?? 0, null)
     })
     return child
   }
@@ -102,6 +103,7 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   const w2 = await runTriggers(['sig-cmd2'], {}, {
     spawn: () => {
       queueMicrotask(() => child2.emit('exit', null, 'SIGKILL'))
+      queueMicrotask(() => child2.emit('close', null, 'SIGKILL'))
       return child2
     },
   })
@@ -138,6 +140,42 @@ test('runTriggers：取消后停止后续触发器，并传递 AbortSignal', asy
   assert.deepEqual(warnings, [])
 })
 
+test('runTriggers：正常 exit 后 close 前取消仍终止该触发器', async () => {
+  const ac = new AbortController()
+  /** @type {any[]} */
+  const started = []
+  /** @type {any[]} */
+  const killed = []
+  const result = await runTriggers(['first-cmd', 'second-cmd'], {}, {
+    signal: ac.signal,
+    spawn: () => {
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      child.kill = () => {
+        killed.push(child)
+        queueMicrotask(() => child.emit('close', null, 'SIGKILL'))
+      }
+      started.push(child)
+      if (started.length === 1) {
+        queueMicrotask(() => {
+          child.emit('exit', 0, null)
+          setTimeout(() => ac.abort(), 10)
+        })
+      } else {
+        queueMicrotask(() => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        })
+      }
+      return child
+    },
+  })
+  assert.equal(result.aborted, true)
+  assert.equal(started.length, 1, 'close 前取消不应启动后续触发器')
+  assert.deepEqual(killed, [started[0]])
+})
+
 test('runTriggers：AbortError 需等待 close 后才返回', async () => {
   const ac = new AbortController()
   let closed = false
@@ -164,6 +202,22 @@ test('runTriggers：AbortError 需等待 close 后才返回', async () => {
   assert.equal(result.aborted, true)
   assert.equal(closed, true)
   assert.ok(Date.now() - startedAt >= 25)
+})
+
+test('terminateProcessTree：Windows taskkill 非零退出时回退终止子进程', async () => {
+  const killer = new EventEmitter()
+  let killedWith = null
+  const child = {
+    pid: 123,
+    kill: (/** @type {string} */ signal) => { killedWith = signal },
+  }
+  const cleanup = terminateProcessTree(child, {
+    platform: 'win32',
+    spawnFn: () => killer,
+  })
+  killer.emit('exit', 5, null)
+  await cleanup
+  assert.equal(killedWith, 'SIGKILL')
 })
 
 test('runTriggers：取消时终止触发器进程组中的后代', { skip: process.platform === 'win32' }, async () => {
