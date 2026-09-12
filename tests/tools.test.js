@@ -81,7 +81,7 @@ test('wtm_begin：经工具入口完成创建并落账本', async () => {
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK('C:/repo\n'))
   git.on(['branch', '--show-current'], OK('main\n'))
-  git.on(['rev-parse', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/new-task'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
   git.on(['worktree', 'add', join(tmp, 'new-task'), '-b', 'wtm/new-task', 'main'], OK())
@@ -112,7 +112,7 @@ test('wtm_begin：显式 root 参数优先于配置', async () => {
   try {
     git.on(['rev-parse', '--show-toplevel'], OK('D:/explicit\n'))
     git.on(['branch', '--show-current'], OK('main\n'))
-    git.on(['rev-parse', '--verify', 'refs/heads/main'], OK())
+    git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
     git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
     git.on(['status', '--porcelain'], OK(''))
     git.on(['worktree', 'add', join(tmp, 't'), '-b', 'wtm/t', 'main'], OK())
@@ -186,4 +186,3 @@ test('wtm_status：无任务时返回空总览', async () => {
   assert.deepEqual(value.rows, [])
   rmSync(tmp, { recursive: true, force: true })
 })
-
