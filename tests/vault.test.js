@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -19,6 +20,13 @@ import {
 function makeTmp() {
   const dir = mkdtempSync(join(tmpdir(), 'wtm-vault-test-'))
   return dir
+}
+
+function exitedPid() {
+  const child = spawnSync(process.execPath, ['-e', ''])
+  assert.equal(child.status, 0)
+  assert.ok(child.pid)
+  return child.pid
 }
 
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
@@ -129,10 +137,28 @@ test('withLock：超时抛出 VaultError', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：活跃持有者即使锁已过期也不会被回收', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const token = `${process.pid}-active-owner`
+  writeFileSync(lockPath, token)
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(lockPath, past, past)
+
+  let ran = false
+  await assert.rejects(
+    withLock(dir, async () => { ran = true }, { timeoutMs: 100, staleMs: 10 }),
+    VaultError,
+  )
+  assert.equal(ran, false)
+  assert.equal(readFileSync(lockPath, 'utf8'), token)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：过期锁被回收（stale）', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
-  writeFileSync(lockPath, String(process.pid))
+  writeFileSync(lockPath, `${exitedPid()}-crashed-owner`)
   const past = new Date(Date.now() - 60_000)
   utimesSync(lockPath, past, past) // 锁文件时间戳拨回 1 分钟前
   let ran = false

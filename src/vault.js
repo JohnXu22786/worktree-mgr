@@ -210,11 +210,36 @@ export function saveLedger(vaultDir, ledger) {
 }
 
 /**
+ * 只有确认锁的持有进程已退出时才允许回收。
+ * @param {string} lockPath
+ * @returns {boolean}
+ */
+function isLockOwnerAlive(lockPath) {
+  let content
+  try {
+    content = readFileSync(lockPath, 'utf8')
+  } catch {
+    return true
+  }
+  const match = /^(\d+)-/.exec(content)
+  if (!match) return true
+  const pid = Number(match[1])
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return /** @type {NodeJS.ErrnoException} */ (err).code !== 'ESRCH'
+  }
+}
+
+/**
  * 账本互斥锁。fn 执行期间持有锁，其他调用方自旋等待。
  *
  * 安全性设计（防止多进程并发写账本）：
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
+ * - 回收前确认 token 中的持有者进程已退出，避免心跳刷新与陈旧检查竞争；
  * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
  *   陈旧判定被其他进程窃取锁；
  * - 进程崩溃时心跳停止，锁文件超过 staleMs 判定陈旧并回收。
@@ -245,8 +270,12 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       try {
         const st = statSync(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
-          unlinkSync(lockPath)
-          continue
+          // mtime 的检查与心跳刷新之间不是原子的；只有持有者进程已退出时
+          // 才能删除锁，避免活跃持有者在检查后刷新心跳却被误回收。
+          if (!isLockOwnerAlive(lockPath)) {
+            unlinkSync(lockPath)
+            continue
+          }
         }
       } catch {
         continue // 对方刚好释放，重试
