@@ -163,10 +163,27 @@ export function terminateProcessTree(child, { platform = process.platform, spawn
   if (typeof pid === 'number') {
     if (platform === 'win32') {
       let fallbackUsed = false
+      /** @type {Promise<void> | undefined} */
+      let fallbackCleanup
       const fallback = () => {
-        if (fallbackUsed) return
+        if (fallbackUsed) return fallbackCleanup
         fallbackUsed = true
         try { child.kill?.('SIGKILL') } catch { /* 已结束 */ }
+        fallbackCleanup = terminateWindowsDescendants(pid, spawnFn)
+        return fallbackCleanup
+      }
+      /**
+       * @param {() => void | Promise<void> | undefined} action
+       * @param {() => void} finish
+       */
+      const finishAfter = (action, finish) => {
+        let result
+        try {
+          result = action()
+        } catch {
+          result = undefined
+        }
+        Promise.resolve(result).then(finish, finish)
       }
       try {
         const killer = spawnFn('taskkill', ['/pid', String(pid), '/t', '/f'], {
@@ -182,23 +199,27 @@ export function terminateProcessTree(child, { platform = process.platform, spawn
             resolve()
           }
           killer.on('error', () => {
-            fallback()
-            finish()
+            finishAfter(fallback, finish)
           })
           killer.on('exit', (/** @type {number | null} */ code) => {
-            if (code !== 0) fallback()
-            finish()
+            if (code !== 0) {
+              finishAfter(fallback, finish)
+            } else {
+              finish()
+            }
           })
           killer.on('close', (/** @type {number | null} */ code) => {
-            if (code !== 0) fallback()
-            finish()
+            if (code !== 0) {
+              finishAfter(fallback, finish)
+            } else {
+              finish()
+            }
           })
           killer.unref?.()
         })
         return cleanup
       } catch { /* 回退到 child.kill */
-        fallback()
-        return
+        return fallback()
       }
     } else {
       try {
@@ -208,4 +229,59 @@ export function terminateProcessTree(child, { platform = process.platform, spawn
     }
   }
   try { child?.kill?.('SIGKILL') } catch { /* 进程可能已经结束 */ }
+}
+
+/**
+ * Windows taskkill 失败后，按父进程关系枚举并终止整个后代树。
+ * 即使根 shell 已经退出，仍可通过 ParentProcessId 找到遗留后代。
+ * @param {number} pid
+ * @param {(command: string, args: string[], opts: object) => any} spawnFn
+ * @returns {Promise<void> | undefined}
+ */
+function terminateWindowsDescendants(pid, spawnFn) {
+  const script = [
+    `$root = ${pid}`,
+    '$processes = @(Get-CimInstance Win32_Process)',
+    '$ids = [System.Collections.Generic.HashSet[int]]::new()',
+    '$queue = [System.Collections.Generic.Queue[int]]::new()',
+    '$ids.Add($root) > $null',
+    '$queue.Enqueue($root)',
+    'while ($queue.Count -gt 0) {',
+    '  $parent = $queue.Dequeue()',
+    '  foreach ($process in $processes) {',
+    '    $processId = [int]$process.ProcessId',
+    '    if ([int]$process.ParentProcessId -eq $parent -and $ids.Add($processId)) {',
+    '      $queue.Enqueue($processId)',
+    '    }',
+    '  }',
+    '}',
+    '$ids | Sort-Object -Descending | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }',
+  ].join('; ')
+  try {
+    const cleaner = spawnFn('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      script,
+    ], {
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    /** @type {Promise<void>} */
+    const cleanup = new Promise((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      cleaner.on('error', finish)
+      cleaner.on('exit', finish)
+      cleaner.on('close', finish)
+      cleaner.unref?.()
+    })
+    return cleanup
+  } catch {
+    return undefined
+  }
 }

@@ -204,8 +204,11 @@ test('runTriggers：AbortError 需等待 close 后才返回', async () => {
   assert.ok(Date.now() - startedAt >= 25)
 })
 
-test('terminateProcessTree：Windows taskkill 非零退出时回退终止子进程', async () => {
+test('terminateProcessTree：Windows taskkill 非零退出时回退终止整个后代树', async () => {
   const killer = new EventEmitter()
+  const descendantCleaner = new EventEmitter()
+  /** @type {Array<{command: string, args: string[]}>} */
+  const spawned = []
   let killedWith = null
   const child = {
     pid: 123,
@@ -213,11 +216,21 @@ test('terminateProcessTree：Windows taskkill 非零退出时回退终止子进�
   }
   const cleanup = terminateProcessTree(child, {
     platform: 'win32',
-    spawnFn: () => killer,
+    spawnFn: (/** @type {string} */ command, /** @type {string[]} */ args) => {
+      spawned.push({ command, args })
+      if (command === 'powershell.exe') {
+        queueMicrotask(() => descendantCleaner.emit('exit', 0, null))
+        return descendantCleaner
+      }
+      return killer
+    },
   })
   killer.emit('exit', 5, null)
   await cleanup
   assert.equal(killedWith, 'SIGKILL')
+  assert.deepEqual(spawned.map(({ command }) => command), ['taskkill', 'powershell.exe'])
+  assert.match(spawned[1].args[3], /Get-CimInstance/)
+  assert.match(spawned[1].args[3], /123/)
 })
 
 test('runTriggers：取消时终止触发器进程组中的后代', { skip: process.platform === 'win32' }, async () => {
