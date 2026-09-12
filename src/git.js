@@ -87,7 +87,7 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
- * 解析 `git worktree list --porcelain` 输出。
+ * 解析 `git worktree list --porcelain -z` 输出（兼容原有换行分隔格式）。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}
  */
@@ -96,10 +96,11 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  for (const line of text.split(/\r?\n/)) {
+  const fields = text.includes('\0') ? text.split('\0') : text.split(/\r?\n/)
+  for (const line of fields) {
     if (line.startsWith('worktree ')) {
       current = {
-        path: line.slice('worktree '.length).trim(),
+        path: line.slice('worktree '.length),
         branch: null,
         detached: false,
         bare: false,

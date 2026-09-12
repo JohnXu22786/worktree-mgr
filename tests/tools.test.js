@@ -37,6 +37,7 @@ class FakeGit {
 }
 
 const OK = (stdout = '') => ({ ok: true, code: 0, stdout, stderr: '' })
+const WORKTREES = (text = '') => OK(text.replaceAll('\n', '\0'))
 const FAIL = (stderr = 'nope') => ({ ok: false, code: 128, stdout: '', stderr })
 
 function makeSignal() {
@@ -146,7 +147,7 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   writeFileSync(join(tmp, '.wtm.json'), '{broken')
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: {}, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')
@@ -177,7 +178,7 @@ test('wtm_status：无任务时返回空总览', async () => {
   mkdirSync(join(tmp, 'vault'))
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: { root: tmp, vault: join(tmp, 'vault') }, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')

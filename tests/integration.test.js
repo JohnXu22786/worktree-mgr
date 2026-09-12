@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process'
 import { GitRunner, resolveToplevel, samePath } from '../src/git.js'
 import { begin, mergeTask, finishTask, listStatus } from '../src/ops.js'
 import { loadLedger } from '../src/vault.js'
+import { apply } from '../index.js'
 
 const HAS_GIT = (() => {
   try {
@@ -39,6 +40,62 @@ async function makeRepo() {
 /** 集成测试的 vault 必须放在仓库之外（否则主工作区会被 vault 目录弄脏） */
 function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
+}
+
+for (const directory of ['vault with spaces', 'vault "quoted"', 'vault\nwith newline']) {
+  test(`集成：插件入口保留工作区路径 ${JSON.stringify(directory)}`, {
+    skip: !HAS_GIT || (process.platform === 'win32' && /["\n]/.test(directory)),
+    timeout: 120000,
+  }, async () => {
+    const root = await makeRepo()
+    const vaultParent = makeVault()
+    const vault = join(vaultParent, directory)
+    /** @type {Map<string, import('../src/tools.js').ToolDef>} */
+    const tools = new Map()
+    apply({ tools: { register: (tool) => {
+      const definition = /** @type {import('../src/tools.js').ToolDef} */ (tool)
+      tools.set(definition.name, definition)
+    } } }, { root, vault })
+    const call = async (/** @type {string} */ name, /** @type {Record<string, unknown>} */ args = {}) => {
+      const tool = tools.get(name)
+      assert.ok(tool)
+      return /** @type {any} */ (await tool.execute(args))
+    }
+    try {
+      const b = await call('wtm_begin', { task: 'Path Handling' })
+      assert.equal(b.ok, true, b.error ?? '')
+      const taskPath = join(vault, 'path-handling')
+      assert.equal(b.path, taskPath)
+      writeFileSync(join(taskPath, 'a.txt'), 'base\n+first change\n')
+
+      const status = await call('wtm_status')
+      assert.equal(status.ok, true, status.error ?? '')
+      assert.equal(status.rows[0].path, taskPath)
+      assert.equal(status.rows[0].exists, true, '已创建的工作区应仍被识别')
+      assert.equal(status.rows[0].dirty, true, '未提交改动应被识别')
+
+      const merge = await call('wtm_merge', { task: 'Path Handling' })
+      assert.equal(merge.ok, true, merge.error ?? '')
+      assert.equal(merge.merged, true)
+      assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'base\n+first change\n')
+      assert.equal(existsSync(taskPath), true)
+
+      writeFileSync(join(taskPath, 'a.txt'), 'base\n+first change\n+second change\n')
+      const finish = await call('wtm_finish', { task: 'Path Handling' })
+      assert.equal(finish.ok, true, finish.error ?? '')
+      assert.equal(finish.committed, true)
+      assert.equal(finish.merged, true)
+      assert.equal(finish.removed, true)
+      assert.equal(finish.branchDeleted, true)
+      assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'base\n+first change\n+second change\n')
+      assert.equal(existsSync(taskPath), false)
+      assert.notEqual(gitOk(['show-ref', '--verify', 'refs/heads/wtm/path-handling'], root).status, 0)
+      assert.equal(loadLedger(vault).records.length, 0)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(vaultParent, { recursive: true, force: true })
+    }
+  })
 }
 
 test('集成：完整生命周期 begin → 修改 → status → finish(commit)', { skip: !HAS_GIT, timeout: 120000 }, async () => {

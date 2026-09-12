@@ -59,6 +59,21 @@ test('parseWorktreeList：空输出返回空数组', () => {
   assert.deepEqual(parseWorktreeList(''), [])
 })
 
+test('parseWorktreeList：NUL 分隔保留换行、引号与末尾空白路径', () => {
+  const paths = ['/vault\nreview/task', '/vault "quoted"/task', '/vault/space \t\r']
+  const text = paths.map((path) => [
+    `worktree ${path}`,
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/wtm/task',
+    'locked reason\nwith newline',
+    '',
+    '',
+  ].join('\0')).join('')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list.map((entry) => entry.path), paths)
+  assert.ok(list.every((entry) => entry.branch === 'wtm/task' && entry.locked))
+})
+
 test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留）', () => {
   // git worktree list --porcelain 对已删除目录的工作区输出 prunable 行，
   // 解析器必须保留该条目与其分支信息（ops.js 结合目录实存判定 stale）。
