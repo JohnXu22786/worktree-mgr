@@ -403,6 +403,29 @@ test('mergeTask：refuse 模式下脏任务拒绝合并', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('mergeTask：refuse 模式第二次状态检查发现改动时拒绝快照提交', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  let taskStatusChecks = 0
+  git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === taskPath) {
+      taskStatusChecks += 1
+      return taskStatusChecks === 1 ? OK('') : OK(' M race.txt\n')
+    }
+    return OK('')
+  })
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'refuse', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /未提交/)
+  assert.equal(git.count(['add', '-A']), 0)
+  assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
+  assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('mergeTask：基分支有未提交改动时拒绝（未提交改动检测）', async () => {
   const tmp = makeTmp()
   const { cfg, git } = mergeFixture(tmp, { baseDirty: true })
