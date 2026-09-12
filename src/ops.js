@@ -224,7 +224,7 @@ export async function begin(opts) {
       const triggerWarnings = await runTriggers(
         repo?.triggers?.on_begin,
         { task, branch: branchName, base: baseName, path: wtPath, root },
-        { spawn: opts.triggerSpawn, cwd: wtPath },
+        { spawn: opts.triggerSpawn, cwd: wtPath, signal: opts.signal },
       )
       warnings.push(...triggerWarnings.warnings)
 
@@ -561,7 +561,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   const triggerWarnings = await runTriggers(
     repo?.triggers?.on_merge,
     { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
+    { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
 
@@ -661,7 +661,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   const triggerWarnings = await runTriggers(
     repo?.triggers?.on_finish,
     { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
+    { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
 

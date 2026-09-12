@@ -105,4 +105,30 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   assert.match(w2.warnings[0], /SIGKILL/)
 })
 
+test('runTriggers：将 AbortSignal 传递给触发器进程', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const ac = new AbortController()
+  const { warnings } = await runTriggers(['sleep-cmd'], {}, {
+    signal: ac.signal,
+    spawn: (/** @type {string} */ cmd, /** @type {string[]} */ args, /** @type {object} */ opts) => {
+      captured.push({ cmd, args, opts })
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      const fallback = setTimeout(() => child.emit('exit', 0, null), 25)
+      const signal = /** @type {{signal?: AbortSignal}} */ (opts).signal
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        const error = new Error('The operation was aborted')
+        error.name = 'AbortError'
+        child.emit('error', error)
+      }, { once: true })
+      queueMicrotask(() => ac.abort())
+      return child
+    },
+  })
+  assert.equal((/** @type {{signal?: AbortSignal}} */ (captured[0].opts)).signal, ac.signal)
+  assert.equal(warnings.length, 1)
+})
 

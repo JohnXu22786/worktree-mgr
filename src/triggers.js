@@ -21,11 +21,11 @@ import { spawn } from 'node:child_process'
  * 顺序执行一组触发器命令。
  * @param {string[] | undefined} commands
  * @param {TriggerContext} ctx
- * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string}} [opts]
- *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）
+ * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal}} [opts]
+ *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）；signal 用于中止触发器进程
  * @returns {Promise<{warnings: string[]}>}
  */
-export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd } = {}) {
+export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal } = {}) {
   /** @type {string[]} */
   const warnings = []
   if (!Array.isArray(commands)) return { warnings }
@@ -42,7 +42,7 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
       WTM_PATH: ctx.path ?? '',
       WTM_ROOT: ctx.root ?? '',
     }
-    const { ok, detail } = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}) })
+    const { ok, detail } = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal })
     if (!ok) warnings.push(`触发器失败 [${cmd}]: ${detail}`)
   }
   return { warnings }
@@ -53,7 +53,7 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
  * @param {(shell: string, args: string[], opts: object) => object} spawnFn
  * @param {string} shell
  * @param {string[]} args
- * @param {{env: Record<string, string>, cwd?: string}} opts
+ * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal}} opts
  * @returns {Promise<{ok: boolean, detail: string}>}
  */
 function runOne(spawnFn, shell, args, opts) {
