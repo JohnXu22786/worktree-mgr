@@ -50,10 +50,12 @@ function usage() {
  * @property {string[]} [warnings]
  */
 
+const OPTIONS_REQUIRING_VALUES = new Set(['base', 'branch', 'note', 'mode', 'message', 'root'])
+
 /**
  * 简单参数解析：支持 --key value 与 --flag（布尔）。
  * @param {string[]} argv
- * @returns {{positional: string[], options: Record<string, string | boolean>}}
+ * @returns {{positional: string[], options: Record<string, string | boolean>, error?: string}}
  */
 function parseArgs(argv) {
   const positional = []
@@ -67,6 +69,8 @@ function parseArgs(argv) {
       if (next !== undefined && !next.startsWith('--')) {
         options[key] = next
         i++
+      } else if (OPTIONS_REQUIRING_VALUES.has(key)) {
+        return { positional, options, error: `选项 --${key} 缺少值` }
       } else {
         options[key] = true
       }
@@ -146,7 +150,11 @@ async function main() {
     return argv.length === 0 ? 2 : 0
   }
   const command = argv[0]
-  const { positional, options } = parseArgs(argv.slice(1))
+  const { positional, options, error } = parseArgs(argv.slice(1))
+  if (error) {
+    process.stderr.write(`错误：${error}\n`)
+    return 2
+  }
   const json = options.json === true
   const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
 
