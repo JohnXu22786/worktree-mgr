@@ -23,7 +23,7 @@
     "node": ">=21"
   },
   "scripts": {
-    "test": "node --test tests/",
+    "test": "node --test",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
