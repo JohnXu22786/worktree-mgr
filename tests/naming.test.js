@@ -31,6 +31,12 @@ test('slugifyTask：保留多级斜杠分段，剔除空段与 . 和 .. 段', ()
   assert.equal(slugifyTask('/leading-slash'), 'leading-slash')
 })
 
+test('slugifyTask：斜杠前的标点段被剔除，不产生双斜杠', () => {
+  assert.equal(slugifyTask('!/foo'), 'foo')
+  assert.equal(deriveBranch('!/foo'), 'wtm/foo')
+  assert.equal(validateBranch(deriveBranch('!/foo')).ok, true)
+})
+
 test('slugifyTask：空输入与纯非法输入回退为 task', () => {
   assert.equal(slugifyTask(''), 'task')
   assert.equal(slugifyTask('   '), 'task')
