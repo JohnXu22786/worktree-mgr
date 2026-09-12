@@ -197,6 +197,11 @@ export async function begin(opts) {
 
       // 核心动作：创建 worktree
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
+      if (add.aborted || isAborted(opts.signal)) {
+        // Git may have created the worktree/branch before cancellation was observed.
+        createdWorktree = true
+        throw abortError()
+      }
       if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
       createdWorktree = true
 
@@ -254,20 +259,25 @@ export async function begin(opts) {
     })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
-    if (createdWorktree && typeof result === 'undefined') {
-      try {
-        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        const branch = await git.run(['branch', '-D', branchName], { cwd: root })
-        if (remove.ok && branch.ok) {
+      if (createdWorktree && typeof result === 'undefined') {
+        const rollbackFailures = []
+        try {
+          const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
+          if (!remove.ok) rollbackFailures.push(`worktree remove 失败：${remove.stderr.trim() || 'git worktree remove 失败'}`)
+        } catch (rollbackErr) {
+          rollbackFailures.push(`worktree remove 异常：${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`)
+        }
+        try {
+          const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+          if (!branch.ok) rollbackFailures.push(`branch -D 失败：${branch.stderr.trim() || 'git branch -D 失败'}`)
+        } catch (rollbackErr) {
+          rollbackFailures.push(`branch -D 异常：${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`)
+        }
+        if (rollbackFailures.length === 0) {
           warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
         } else {
-          const failures = []
-          if (!remove.ok) failures.push(`worktree remove 失败：${remove.stderr.trim() || '命令返回失败'}`)
-          if (!branch.ok) failures.push(`branch -D 失败：${branch.stderr.trim() || '命令返回失败'}`)
-          warnings.push(`工作区创建未完成，且回滚失败：${failures.join('；')}；请手动执行 git worktree remove / branch -D`)
+          warnings.push(`工作区创建未完成，且回滚失败：${rollbackFailures.join('；')}。请手动执行 git worktree remove / branch -D`)
         }
-      } catch {
-        warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
     if (isAborted(opts.signal) || (err instanceof Error && err.name === 'AbortError')) {
