@@ -414,6 +414,32 @@ test('mergeTask：记录不存在报错；工作区已消失报错并提示 purg
 
 // ---- finishTask ------------------------------------------------------------
 
+test('finishTask：commit 模式执行 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  /** @type {Array<{shell: string, args: string[], opts: object}>} */
+  const triggerCalls = []
+  const repo = { triggers: { on_merge: ['mark-merge'] } }
+  const r = await finishTask({
+    root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo,
+    triggerSpawn: (shell, args, opts) => {
+      triggerCalls.push({ shell, args, opts })
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => child.emit('exit', 0, null))
+      return child
+    },
+  })
+  assert.equal(r.ok, true)
+  assert.equal(triggerCalls.length, 1)
+  assert.equal(/** @type {any} */ (triggerCalls[0].opts).cwd, 'C:/repo')
+  assert.equal(/** @type {any} */ (triggerCalls[0].opts).env.WTM_TASK, 'T')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 清记录', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
@@ -549,6 +575,33 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
 })
 
 // ---- purge -----------------------------------------------------------------
+
+test('purge：commit 模式执行 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  /** @type {Array<{shell: string, args: string[], opts: object}>} */
+  const triggerCalls = []
+  const repo = { triggers: { on_merge: ['mark-merge'] } }
+  const r = await purge({
+    root: 'C:/repo', tasks: ['T'], mode: 'commit', cfg, git, repo,
+    triggerSpawn: (shell, args, opts) => {
+      triggerCalls.push({ shell, args, opts })
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => child.emit('exit', 0, null))
+      return child
+    },
+  })
+  assert.equal(r.ok, true)
+  assert.equal(r.results?.[0].ok, true)
+  assert.equal(triggerCalls.length, 1)
+  assert.equal(/** @type {any} */ (triggerCalls[0].opts).cwd, 'C:/repo')
+  assert.equal(/** @type {any} */ (triggerCalls[0].opts).env.WTM_TASK, 'T')
+  rmSync(tmp, { recursive: true, force: true })
+})
 
 test('purge：批量清理，逐任务报告，单个失败不中断', async () => {
   const tmp = makeTmp()

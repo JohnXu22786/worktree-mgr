@@ -637,6 +637,12 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
     warnings.push(...m.warnings)
+    const mergeTriggerWarnings = await runTriggers(
+      repo?.triggers?.on_merge,
+      { task, branch: rec.branch, base: rec.base, path: rec.path, root },
+      { spawn: opts.triggerSpawn, cwd: root },
+    )
+    warnings.push(...mergeTriggerWarnings.warnings)
   }
 
   // 移除工作区：commit 用安全移除，abandon 用 --force
