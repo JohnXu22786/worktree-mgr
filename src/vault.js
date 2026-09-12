@@ -29,6 +29,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
+import { Worker } from 'node:worker_threads'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 export class VaultError extends Error {
@@ -212,40 +213,102 @@ export function saveLedger(vaultDir, ledger) {
 }
 
 /**
- * 解析 guard token 中的持有者 PID。
- * @param {string} token
- * @returns {number | null}
+ * 独立 heartbeat worker。主线程可能正在执行阻塞的同步文件操作，
+ * 因此不能用主线程的 setInterval 作为 guard 的存活证明。
  */
-function guardOwnerPid(token) {
-  const match = /^(\d+)-/.exec(token)
-  if (!match) return null
-  const pid = Number(match[1])
-  return Number.isSafeInteger(pid) && pid > 0 ? pid : null
+const LEASE_HEARTBEAT_SOURCE = `
+  const { workerData } = require('node:worker_threads')
+  const { utimesSync } = require('node:fs')
+  const beat = () => {
+    try {
+      const now = new Date()
+      utimesSync(workerData.path, now, now)
+    } catch { /* 所有者正在释放或 guard 已被回收 */ }
+  }
+  beat()
+  const timer = setInterval(beat, workerData.intervalMs)
+`
+
+/**
+ * @param {string} path
+ * @param {number} staleMs
+ * @param {number} heartbeatMs
+ * @returns {{worker: Worker, ready: Promise<void>}}
+ */
+function startLeaseHeartbeat(path, staleMs, heartbeatMs) {
+  const intervalMs = Math.max(1, Math.min(
+    heartbeatMs,
+    Math.max(1, Math.floor(staleMs / 3)),
+  ))
+  const worker = new Worker(LEASE_HEARTBEAT_SOURCE, {
+    eval: true,
+    workerData: { path, intervalMs },
+  })
+  // The worker must be started before the following synchronous operation:
+  // that operation may block the main thread for longer than staleMs.
+  // Keep an error listener attached so a failed heartbeat cannot become an
+  // unhandled worker error during cleanup.
+  worker.on('error', () => {})
+  let readyState = false
+  const ready = new Promise((resolve, reject) => {
+    worker.once('online', () => {
+      readyState = true
+      resolve()
+    })
+    worker.once('error', (err) => {
+      if (!readyState) reject(err)
+    })
+    worker.once('exit', (code) => {
+      if (!readyState && code !== 0) reject(new Error(`guard heartbeat worker exited (${code})`))
+    })
+  })
+  return { worker, ready }
+}
+
+/** @param {Worker | null} worker */
+async function stopLeaseHeartbeat(worker) {
+  if (worker === null) return
+  await worker.terminate()
+}
+
+/** @param {number} ms */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
- * 判断 guard 的持有进程是否仍存在。无法确认时保守地视为仍存在，
- * 避免回收活动进程的临界区。
- * @param {string} token
- * @returns {boolean | null}
+ * 清理操作允许少量瞬态 I/O 失败后重试。若仍然失败，调用方会把错误
+ * 返回给用户；guard 的 heartbeat 已停止后，后续调用仍可按 mtime 回收它。
+ * @template T
+ * @param {() => Promise<T>} action
+ * @returns {Promise<T>}
  */
-function isGuardOwnerAlive(token) {
-  const pid = guardOwnerPid(token)
-  if (pid === null) return null
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (err) {
-    return /** @type {NodeJS.ErrnoException} */ (err).code === 'ESRCH' ? false : true
+async function retryCleanup(action) {
+  let lastError
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await action()
+    } catch (err) {
+      lastError = err
+      if (attempt < 2) await delay(10)
+    }
   }
+  throw lastError
 }
 
 /**
  * 删除已从 guard 路径移走的旧 guard 文件或兼容旧版本的目录。
+ * 只清理 vault 自己创建过的 legacy 子项，避免扩大删除范围。
  * @param {string} path
  */
 function removeGuardArtifact(path) {
-  const st = statSync(path)
+  let st
+  try {
+    st = statSync(path)
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return
+    throw err
+  }
   if (!st.isDirectory()) {
     unlinkSync(path)
     return
@@ -259,105 +322,264 @@ function removeGuardArtifact(path) {
 }
 
 /**
- * 将旧 guard 原子地移出固定路径，再清理 tombstone；不会触碰后继 guard。
- * @param {string} reclaimPath
+ * 当回收标记本身过期时，把它移到私有 tombstone 后再判断实际内容。
+ * 这避免了“读取旧 mtime 后，rename 到了新回收者标记”的竞态；
+ * 如果 tombstone 实际上是新鲜标记，会用硬链接安全地放回固定路径。
+ * @param {string} markerPath
  * @param {string} token
- * @returns {boolean} 是否成功移走 guard
+ * @param {number} staleMs
+ * @param {string} [protectedPath]
+ * @returns {boolean} 是否可以再次尝试创建回收标记
  */
-function moveStaleGuard(reclaimPath, token) {
-  const tombstonePath = `${reclaimPath}.reclaimed-${token}`
+function reclaimStaleMarker(markerPath, token, staleMs, protectedPath) {
+  let markerStat
   try {
-    renameSync(reclaimPath, tombstonePath)
+    markerStat = statSync(markerPath)
   } catch (err) {
-    if (/** @type {any} */ (err).code === 'ENOENT') return false
+    if (/** @type {any} */ (err).code === 'ENOENT') return true
     throw err
+  }
+  if (Date.now() - markerStat.mtimeMs <= staleMs) return false
+  if (protectedPath !== undefined) {
+    try {
+      const protectedStat = statSync(protectedPath)
+      if (Date.now() - protectedStat.mtimeMs <= staleMs) return false
+    } catch (err) {
+      if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+    }
+  }
+
+  const tombstonePath = `${markerPath}.stale-${token}`
+  try {
+    renameSync(markerPath, tombstonePath)
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return true
+    throw err
+  }
+
+  let tombstoneStat
+  try {
+    tombstoneStat = statSync(tombstonePath)
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return true
+    throw err
+  }
+  if (Date.now() - tombstoneStat.mtimeMs <= staleMs) {
+    try {
+      linkSync(tombstonePath, markerPath)
+    } catch (err) {
+      const code = /** @type {any} */ (err).code
+      if (code !== 'EEXIST' && code !== 'ENOENT') throw err
+    }
+    try { unlinkSync(tombstonePath) } catch (err) {
+      if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+    }
+    return false
   }
   removeGuardArtifact(tombstonePath)
   return true
 }
 
 /**
- * 尝试取得整个锁生命周期使用的互斥 guard。
- * guard 先写入临时文件，再通过硬链接原子发布；只要 token 对应进程仍活着，
- * guard 永不过期。进程崩溃后，回收者用 rename 将旧 guard 移到独立 tombstone，
- * 因此不会误删随后发布的新 guard。
+ * @typedef {object} LeaseMarker
+ * @property {string} path
+ * @property {string} token
+ * @property {Worker} heartbeat
+ */
+
+/**
+ * 取得固定的 stale-reclamation 标记。所有新 guard 的发布都检查这个标记，
+ * 所以持有标记的回收者可以在 guard 路径上安全地完成一次完整判断和清理。
  * @param {string} reclaimPath
  * @param {string} token
  * @param {number} staleMs
- * @returns {string | null}
+ * @param {number} heartbeatMs
+ * @returns {Promise<LeaseMarker | null>}
  */
-function acquireLeaseGuard(reclaimPath, token, staleMs) {
-  const tempPath = `${reclaimPath}-${token}.tmp`
-  let fd = null
-  try {
-    fd = openSync(tempPath, 'wx')
-    writeFileSync(fd, token, 'utf8')
-    futimesSync(fd, new Date(), new Date())
-    closeSync(fd)
-    fd = null
-    linkSync(tempPath, reclaimPath)
-  } catch (err) {
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* 忽略 */ }
-    }
-    try { unlinkSync(tempPath) } catch { /* 忽略 */ }
-    const code = /** @type {any} */ (err).code
-    if (code !== 'EEXIST' && code !== 'EISDIR') throw err
-    let existingStat
+async function acquireReclaimMarker(reclaimPath, token, staleMs, heartbeatMs) {
+  const markerPath = `${reclaimPath}.reclaiming`
+  for (;;) {
+    let fd = null
+    let heartbeat = null
+    let markerCreated = false
     try {
-      existingStat = statSync(reclaimPath)
-    } catch (statErr) {
-      if (/** @type {any} */ (statErr).code === 'ENOENT') return null
-      throw statErr
-    }
-    let existingToken = null
-    if (existingStat.isDirectory()) {
-      try {
-        existingToken = readFileSync(join(reclaimPath, 'token'), 'utf8')
-      } catch (readErr) {
-        if (/** @type {any} */ (readErr).code === 'ENOENT') {
-          // 旧版本在 mkdir 后崩溃留下的空目录没有发布任何 owner token。
-          try { rmdirSync(reclaimPath) } catch { /* 另一个进程正在填充它 */ }
-          return null
+      fd = openSync(markerPath, 'wx')
+      markerCreated = true
+      const started = startLeaseHeartbeat(markerPath, staleMs, heartbeatMs)
+      heartbeat = started.worker
+      await started.ready
+      writeFileSync(fd, token, 'utf8')
+      closeSync(fd)
+      fd = null
+      return { path: markerPath, token, heartbeat }
+    } catch (err) {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+      }
+      try { await stopLeaseHeartbeat(heartbeat) } catch { /* 继续报告原始错误 */ }
+      if (markerCreated) {
+        try { unlinkSync(markerPath) } catch (cleanupErr) {
+          if (/** @type {any} */ (cleanupErr).code !== 'ENOENT') throw cleanupErr
         }
-        throw readErr
       }
-    } else {
-      try {
-        existingToken = readFileSync(reclaimPath, 'utf8')
-      } catch (readErr) {
-        if (/** @type {any} */ (readErr).code !== 'ENOENT') throw readErr
-        return null
-      }
+      if (/** @type {any} */ (err).code !== 'EEXIST') throw err
+      if (!reclaimStaleMarker(markerPath, token, staleMs, reclaimPath)) return null
     }
-    const ownerAlive = isGuardOwnerAlive(existingToken)
-    if (ownerAlive === true) return null
-    if (ownerAlive === null && Date.now() - existingStat.mtimeMs <= staleMs) return null
-    moveStaleGuard(reclaimPath, token)
-    return null
   }
-  try { unlinkSync(tempPath) } catch { /* 临时硬链接可由后续清理 */ }
-  return token
 }
 
 /**
- * 原子释放自己持有的 guard。先 rename 离开固定路径，再清理独立 tombstone，
- * 这样释放失败也不会把后继 guard 当成自己的 guard 删除。
+ * 若已有回收标记，只有在确认它已过期并完成安全回收后才允许发布 guard。
+ * @returns {boolean} 是否可以继续尝试发布 guard
+ */
+function canPublishGuard(reclaimPath, token, staleMs) {
+  return reclaimStaleMarker(`${reclaimPath}.reclaiming`, token, staleMs, reclaimPath)
+}
+
+/**
+ * 释放回收标记。只删除仍包含自己 token 的文件，避免触碰后继标记。
+ * @param {LeaseMarker} marker
+ */
+async function releaseReclaimMarker(marker) {
+  let stopped = false
+  await retryCleanup(async () => {
+    if (!stopped) {
+      await stopLeaseHeartbeat(marker.heartbeat)
+      stopped = true
+    }
+    let content
+    try {
+      content = readFileSync(marker.path, 'utf8')
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') return
+      throw err
+    }
+    if (content !== marker.token) return
+    try { unlinkSync(marker.path) } catch (err) {
+      if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+    }
+  })
+}
+
+/**
+ * 释放已取得的 guard。heartbeat 直到最后一次删除前都保持运行，
+ * 这样阻塞的 close/unlink 也不会把仍在清理中的 guard 判为 stale。
+ * @param {{path: string, token: string, heartbeat: Worker}} lease
+ */
+async function releaseLeaseGuard(lease) {
+  let stopped = false
+  await retryCleanup(async () => {
+    if (!stopped) {
+      await stopLeaseHeartbeat(lease.heartbeat)
+      stopped = true
+    }
+    let content
+    try {
+      content = readFileSync(lease.path, 'utf8')
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') return
+      throw err
+    }
+    if (content !== lease.token) return
+    try { unlinkSync(lease.path) } catch (err) {
+      if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+    }
+  })
+}
+
+/**
+ * 尝试取得整个锁生命周期使用的互斥 guard。
+ * guard 是先创建再由独立 worker 续租的 regular file；因此主线程在
+ * 创建、心跳或释放中的同步 I/O 阻塞时，其他进程不会误判它已过期。
  * @param {string} reclaimPath
  * @param {string} token
+ * @param {number} staleMs
+ * @param {number} heartbeatMs
+ * @returns {Promise<{path: string, token: string, heartbeat: Worker} | null>}
  */
-function releaseLeaseGuard(reclaimPath, token) {
-  let content
+async function acquireLeaseGuard(reclaimPath, token, staleMs, heartbeatMs) {
+  if (!canPublishGuard(reclaimPath, token, staleMs)) return null
+
+  let fd = null
+  let heartbeat = null
+  let guardCreated = false
   try {
-    content = readFileSync(reclaimPath, 'utf8')
+    fd = openSync(reclaimPath, 'wx')
+    guardCreated = true
+    const started = startLeaseHeartbeat(reclaimPath, staleMs, heartbeatMs)
+    heartbeat = started.worker
+    await started.ready
+    writeFileSync(fd, token, 'utf8')
+    closeSync(fd)
+    fd = null
+
+    // 回收者可能在 openSync 与 token 发布之间取得了标记。此 guard
+    // 不得越过它进入临界区，清掉自己后让下一轮重新判断。
+    if (!canPublishGuard(reclaimPath, token, staleMs)) {
+      await releaseLeaseGuard({ path: reclaimPath, token, heartbeat })
+      return null
+    }
+    return { path: reclaimPath, token, heartbeat }
   } catch (err) {
-    if (/** @type {any} */ (err).code === 'ENOENT') return
-    throw err
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+    }
+    try { await stopLeaseHeartbeat(heartbeat) } catch { /* 继续报告原始错误 */ }
+    if (guardCreated) {
+      try {
+        const content = readFileSync(reclaimPath, 'utf8')
+        // A failed first write leaves our just-created guard empty. No other
+        // publisher can own this path while it exists, so it is safe to
+        // remove both the empty and the fully written form here.
+        if (content === '' || content === token) unlinkSync(reclaimPath)
+      } catch (cleanupErr) {
+        if (/** @type {any} */ (cleanupErr).code !== 'ENOENT') throw cleanupErr
+      }
+    }
+    const code = /** @type {any} */ (err).code
+    if (code !== 'EEXIST' && code !== 'EISDIR') throw err
   }
-  if (content !== token) return
-  const tombstonePath = `${reclaimPath}.released-${token}`
-  renameSync(reclaimPath, tombstonePath)
-  unlinkSync(tombstonePath)
+
+  const marker = await acquireReclaimMarker(reclaimPath, token, staleMs, heartbeatMs)
+  if (marker === null) return null
+  let actionError
+  try {
+    let existingStat
+    try {
+      existingStat = statSync(reclaimPath)
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') existingStat = null
+      else throw err
+    }
+    if (existingStat !== null) {
+      let legacyOrphan = false
+      if (existingStat.isDirectory()) {
+        try {
+          readFileSync(join(reclaimPath, 'token'), 'utf8')
+        } catch (err) {
+          if (/** @type {any} */ (err).code === 'ENOENT') legacyOrphan = true
+          else throw err
+        }
+      }
+      if (legacyOrphan || Date.now() - existingStat.mtimeMs > staleMs) {
+        removeGuardArtifact(reclaimPath)
+      }
+    }
+  } catch (err) {
+    actionError = err
+  }
+  let releaseError
+  try {
+    await releaseReclaimMarker(marker)
+  } catch (err) {
+    releaseError = err
+  }
+  if (actionError !== undefined && releaseError !== undefined) {
+    throw new AggregateError([actionError, releaseError], 'guard reclaim cleanup failed')
+  }
+  if (actionError !== undefined) throw actionError
+  if (releaseError !== undefined) throw releaseError
+  return null
 }
 
 /**
@@ -368,8 +590,8 @@ function releaseLeaseGuard(reclaimPath, token) {
  *   写入失败不会暴露未完成的锁文件；
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
- * - .reclaim guard 覆盖整个 fn 生命周期，且只在确认持有进程已退出后回收，
- *   回收者无法在持有者更新或释放锁的临界区内删除锁；
+ * - .reclaim guard 覆盖整个 fn 生命周期，并由独立 worker 续租；只有 guard
+ *   和当前回收标记都停止续租后才回收，主线程阻塞时也不会删除活动锁；
  * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
  *   陈旧判定被其他进程窃取锁；
  * - 进程崩溃时心跳停止，锁文件超过 staleMs 判定陈旧并回收。
@@ -390,9 +612,9 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
   const deadline = Date.now() + timeoutMs
   let fd = null
   let owned = false
-  let guardToken = null
+  let guardLease = null
   for (;;) {
-    const candidateGuard = acquireLeaseGuard(reclaimPath, token, staleMs)
+    const candidateGuard = await acquireLeaseGuard(reclaimPath, token, staleMs, heartbeatMs)
     if (candidateGuard === null) {
       if (Date.now() >= deadline) {
         throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
@@ -435,16 +657,20 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
         }
       }
     } catch (err) {
-      try { releaseLeaseGuard(reclaimPath, candidateGuard) } catch (cleanupError) { throw cleanupError }
+      try {
+        await releaseLeaseGuard(candidateGuard)
+      } catch (cleanupError) {
+        throw new AggregateError([err, cleanupError], 'lock acquisition cleanup failed')
+      }
       throw err
     }
     if (acquired && fd !== null) {
-      guardToken = candidateGuard
+      guardLease = candidateGuard
       owned = true
       break
     }
 
-    releaseLeaseGuard(reclaimPath, candidateGuard)
+    await releaseLeaseGuard(candidateGuard)
 
     if (Date.now() >= deadline) {
       throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
@@ -472,6 +698,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
     bodyError = err
   }
   clearInterval(heartbeat)
+  owned = false
 
   /** @type {unknown} */
   let cleanupError
@@ -479,21 +706,50 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
     if (cleanupError === undefined) cleanupError = err
   }
   if (fd !== null) {
-    try { closeSync(fd) } catch (err) { rememberCleanupError(err) }
+    try {
+      await retryCleanup(async () => { closeSync(fd) })
+    } catch (err) {
+      rememberCleanupError(err)
+    }
   }
   try {
-    const content = readFileSync(lockPath, 'utf8')
-    if (content === token) unlinkSync(lockPath)
+    await retryCleanup(async () => {
+      let content
+      try {
+        content = readFileSync(lockPath, 'utf8')
+      } catch (err) {
+        if (/** @type {any} */ (err).code === 'ENOENT') return
+        throw err
+      }
+      if (content === token) {
+        try { unlinkSync(lockPath) } catch (err) {
+          if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+        }
+      }
+    })
   } catch (err) {
-    if (/** @type {any} */ (err).code !== 'ENOENT') rememberCleanupError(err)
+    rememberCleanupError(err)
   }
-  try { unlinkSync(tempLockPath) } catch (err) {
-    if (/** @type {any} */ (err).code !== 'ENOENT') rememberCleanupError(err)
+  try {
+    await retryCleanup(async () => {
+      try { unlinkSync(tempLockPath) } catch (err) {
+        if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+      }
+    })
+  } catch (err) {
+    rememberCleanupError(err)
   }
-  if (guardToken !== null) {
-    try { releaseLeaseGuard(reclaimPath, guardToken) } catch (err) { rememberCleanupError(err) }
+  if (guardLease !== null) {
+    try {
+      await releaseLeaseGuard(guardLease)
+    } catch (err) {
+      rememberCleanupError(err)
+    }
   }
   if (bodyFailed) {
+    if (cleanupError !== undefined) {
+      throw new AggregateError([bodyError, cleanupError], 'lock body and cleanup both failed')
+    }
     throw bodyError
   }
   if (cleanupError !== undefined) {

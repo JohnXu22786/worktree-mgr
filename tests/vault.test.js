@@ -36,6 +36,18 @@ async function waitForFile(path, timeoutMs = 2000) {
   }
 }
 
+/**
+ * @param {string[]} paths
+ * @param {number} [timeoutMs]
+ */
+async function waitForAnyFile(paths, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  while (!paths.some((path) => existsSync(path))) {
+    if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${paths.join(', ')}`)
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
   const a = repoSlug('C:/work/proj')
   const b = repoSlug('D:/other/proj')
@@ -210,6 +222,9 @@ test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
   const dir = makeTmp()
   const reclaimPath = join(dir, '.lock.reclaim')
   mkdirSync(reclaimPath)
+  writeFileSync(join(reclaimPath, 'reclaiming'), 'legacy-reclaimer')
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(reclaimPath, past, past)
 
   let ran = false
   await withLock(dir, async () => { ran = true }, { timeoutMs: 200, staleMs: 60_000 })
@@ -223,28 +238,32 @@ test('withLock：释放清理失败时显式失败且不遗留锁', async () => 
   const lockPath = join(dir, '.lock')
   const reclaimPath = join(dir, '.lock.reclaim')
   const cleanupError = Object.assign(new Error('guard cleanup failed'), { code: 'EIO' })
-  const realMkdirSync = fs.mkdirSync
-  const realRenameSync = fs.renameSync
+  const bodyError = new Error('body failed')
+  const realUnlinkSync = fs.unlinkSync
   let failCleanup = false
-  mock.method(fs, 'mkdirSync', (/** @type {string} */ path, options) => {
+  mock.method(fs, 'unlinkSync', (/** @type {string} */ path) => {
     if (failCleanup && path === reclaimPath) throw cleanupError
-    return realMkdirSync(path, options)
-  })
-  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
-    if (failCleanup && source === reclaimPath) throw cleanupError
-    return realRenameSync(source, target)
+    return realUnlinkSync(path)
   })
   syncBuiltinESMExports()
   try {
     await assert.rejects(
-      withLock(dir, async () => { failCleanup = true }),
-      (error) => error === cleanupError,
+      withLock(dir, async () => {
+        failCleanup = true
+        throw bodyError
+      }),
+      (error) => error instanceof AggregateError &&
+        error.errors.includes(bodyError) && error.errors.includes(cleanupError),
     )
   } finally {
     mock.restoreAll()
     syncBuiltinESMExports()
   }
   assert.equal(existsSync(lockPath), false)
+  assert.equal(existsSync(reclaimPath), true)
+  utimesSync(reclaimPath, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
+  await withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10 })
+  assert.equal(existsSync(reclaimPath), false)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -327,15 +346,86 @@ test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', asy
   }
 })
 
+test('withLock：多个陈旧回收者不会同时进入临界区', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const releasePath = join(dir, '.release')
+  const enteredPaths = [join(dir, '.entered-a'), join(dir, '.entered-b')]
+  const donePaths = [join(dir, '.done-a'), join(dir, '.done-b')]
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'dead-process-token')
+  writeFileSync(reclaimPath, 'dead-guard-token')
+  utimesSync(lockPath, past, past)
+  utimesSync(reclaimPath, past, past)
+
+  const childScript = `
+    import fs from 'node:fs'
+    const { withLock } = await import(process.env.WTM_TEST_VAULT_MODULE)
+    await withLock(process.env.WTM_TEST_DIR, async () => {
+      fs.writeFileSync(process.env.WTM_TEST_ENTERED, '')
+      while (!fs.existsSync(process.env.WTM_TEST_RELEASE)) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    }, { timeoutMs: 1000, staleMs: 50, heartbeatMs: 10 })
+    fs.writeFileSync(process.env.WTM_TEST_DONE, '')
+  `
+  const children = enteredPaths.map((enteredPath, index) => spawn(
+    process.execPath,
+    ['--input-type=module', '-e', childScript],
+    {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      env: {
+        ...process.env,
+        WTM_TEST_DIR: dir,
+        WTM_TEST_VAULT_MODULE: new URL('../src/vault.js', import.meta.url).href,
+        WTM_TEST_ENTERED: enteredPath,
+        WTM_TEST_RELEASE: releasePath,
+        WTM_TEST_DONE: donePaths[index],
+      },
+      stdio: 'ignore',
+    },
+  ))
+  const exits = children.map((child) => new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  }))
+
+  try {
+    await waitForAnyFile(enteredPaths)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(enteredPaths.filter((path) => existsSync(path)).length, 1)
+    writeFileSync(releasePath, '')
+    await Promise.all(donePaths.map((path) => waitForFile(path)))
+    const results = await Promise.all(exits)
+    for (const result of results) {
+      assert.equal(result.code, 0, `回收者子进程异常退出：${result.signal ?? result.code}`)
+    }
+  } finally {
+    writeFileSync(releasePath, '')
+    for (const child of children) {
+      if (child.exitCode === null) child.kill()
+    }
+    await Promise.all(exits.map((exit) => exit.catch(() => {})))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('withLock：过期锁被回收（stale）', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
   writeFileSync(lockPath, String(process.pid))
+  // guard token 中的 PID 仍然是当前进程，但这个 lease 已停止续租；
+  // PID 存活不能阻止 stale lease 回收。
+  writeFileSync(reclaimPath, `${process.pid}-old-guard`)
   const past = new Date(Date.now() - 60_000)
   utimesSync(lockPath, past, past) // 锁文件时间戳拨回 1 分钟前
+  utimesSync(reclaimPath, past, past)
   let ran = false
   await withLock(dir, async () => { ran = true }, { timeoutMs: 2000, staleMs: 10_000 })
   assert.equal(ran, true)
+  assert.equal(existsSync(reclaimPath), false)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -360,6 +450,7 @@ test('withLock：长任务期间心跳刷新 mtime，不被陈旧判定窃取', 
     await new Promise((r) => setTimeout(r, 300))
   }, { heartbeatMs: 50, staleMs: 100 })
   // 等锁建立，记录 mtime；150ms 后（远超 staleMs=100）再比较
+  await waitForFile(lockPath)
   await new Promise((r) => setTimeout(r, 60))
   const t0 = statSync(lockPath).mtimeMs
   await new Promise((r) => setTimeout(r, 150))
