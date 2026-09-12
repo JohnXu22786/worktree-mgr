@@ -252,6 +252,24 @@ test('begin：基分支有未提交改动时产生警告但不中断', async () 
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：主工作区 git status 失败时终止创建', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], FAIL('fatal: index file smaller than expected'))
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /主工作区.*状态失败/)
+  assert.match(r.error ?? '', /index file smaller than expected/)
+  assert.equal(git.count(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：worktree add 失败透传 stderr', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
