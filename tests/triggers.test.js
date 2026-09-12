@@ -105,11 +105,11 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   assert.match(w2.warnings[0], /SIGKILL/)
 })
 
-test('runTriggers：将 AbortSignal 传递给触发器进程', async () => {
+test('runTriggers：取消后停止后续触发器，并传递 AbortSignal', async () => {
   /** @type {Array<{cmd: string, args: string[], opts: object}>} */
   const captured = []
   const ac = new AbortController()
-  const { warnings } = await runTriggers(['sleep-cmd'], {}, {
+  const { warnings } = await runTriggers(['sleep-cmd', 'after-cancel-cmd'], {}, {
     signal: ac.signal,
     spawn: (/** @type {string} */ cmd, /** @type {string[]} */ args, /** @type {object} */ opts) => {
       captured.push({ cmd, args, opts })
@@ -129,6 +129,6 @@ test('runTriggers：将 AbortSignal 传递给触发器进程', async () => {
     },
   })
   assert.equal((/** @type {{signal?: AbortSignal}} */ (captured[0].opts)).signal, ac.signal)
-  assert.equal(warnings.length, 1)
+  assert.equal(captured.length, 1, '取消后不应启动后续触发器')
+  assert.deepEqual(warnings, [])
 })
-

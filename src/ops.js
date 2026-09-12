@@ -227,6 +227,7 @@ export async function begin(opts) {
         { spawn: opts.triggerSpawn, cwd: wtPath, signal: opts.signal },
       )
       warnings.push(...triggerWarnings.warnings)
+      if (triggerWarnings.aborted || isAborted(opts.signal)) throw new Error('操作已取消（aborted）')
 
       /** @type {LedgerRecord} */
       const record = {
@@ -253,6 +254,7 @@ export async function begin(opts) {
         warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
+    if (isAborted(opts.signal)) return { ...abortResult(), ...(warnings.length > 0 ? { warnings } : {}) }
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
   }
@@ -419,11 +421,13 @@ export async function purge(opts) {
         : tasks.map((t) => ({ rec: findRecord(ledger, t), name: t }))
       const results = []
       for (const item of targets) {
+        if (isAborted(opts.signal)) return abortResult()
         if (!item.rec) {
           results.push({ task: item.name, ok: false, error: '任务不存在' })
           continue
         }
         const r = await finishCore(opts, { vault, ledger, rec: item.rec, mode })
+        if (isAborted(opts.signal)) return abortResult()
         results.push({ task: item.rec.task, ok: r.ok, error: r.error, note: r.note, merged: r.merged, committed: r.committed })
       }
       return { ok: true, results }
@@ -564,6 +568,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
     { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
+  if (triggerWarnings.aborted || isAborted(opts.signal)) return abortResult()
 
   // 4) 更新账本时间戳
   rec.updatedAt = nowIso()
@@ -664,6 +669,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
+  if (triggerWarnings.aborted || isAborted(opts.signal)) return abortResult()
 
   removeRecord(ledger, task)
   saveLedger(vault, ledger)

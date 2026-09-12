@@ -23,14 +23,19 @@ import { spawn } from 'node:child_process'
  * @param {TriggerContext} ctx
  * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal}} [opts]
  *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）；signal 用于中止触发器进程
- * @returns {Promise<{warnings: string[]}>}
+ * @returns {Promise<{warnings: string[], aborted?: boolean}>}
  */
 export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal } = {}) {
   /** @type {string[]} */
   const warnings = []
   if (!Array.isArray(commands)) return { warnings }
+  let aborted = false
   const isWin = process.platform === 'win32'
   for (const cmd of commands) {
+    if (signal?.aborted) {
+      aborted = true
+      break
+    }
     if (typeof cmd !== 'string' || cmd.trim() === '') continue
     const shell = isWin ? 'cmd' : 'sh'
     const args = isWin ? ['/d', '/s', '/c', cmd] : ['-c', cmd]
@@ -42,10 +47,14 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
       WTM_PATH: ctx.path ?? '',
       WTM_ROOT: ctx.root ?? '',
     }
-    const { ok, detail } = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal })
-    if (!ok) warnings.push(`触发器失败 [${cmd}]: ${detail}`)
+    const { ok, detail, aborted: commandAborted } = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal })
+    if (!ok && !commandAborted) warnings.push(`触发器失败 [${cmd}]: ${detail}`)
+    if (commandAborted || signal?.aborted) {
+      aborted = true
+      break
+    }
   }
-  return { warnings }
+  return aborted ? { warnings, aborted: true } : { warnings }
 }
 
 /**
@@ -54,7 +63,7 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
  * @param {string} shell
  * @param {string[]} args
  * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal}} opts
- * @returns {Promise<{ok: boolean, detail: string}>}
+ * @returns {Promise<{ok: boolean, detail: string, aborted?: boolean}>}
  */
 function runOne(spawnFn, shell, args, opts) {
   return new Promise((resolve) => {
@@ -63,14 +72,15 @@ function runOne(spawnFn, shell, args, opts) {
     try {
       child = spawnFn(shell, args, { ...opts, windowsHide: true })
     } catch (err) {
-      resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}` })
+      const aborted = /** @type {Error} */ (err).name === 'AbortError'
+      resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}`, aborted })
       return
     }
     let stdout = ''
     let stderr = ''
     let settled = false
     /**
-     * @param {{ok: boolean, detail: string}} result
+     * @param {{ok: boolean, detail: string, aborted?: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
@@ -81,7 +91,7 @@ function runOne(spawnFn, shell, args, opts) {
     child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
     child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
     child.on('error', (/** @type {any} */ err) => {
-      done({ ok: false, detail: `${stderr.trim() || err.message}` })
+      done({ ok: false, detail: `${stderr.trim() || err.message}`, aborted: err.name === 'AbortError' })
     })
     child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
       if (code === 0) {
