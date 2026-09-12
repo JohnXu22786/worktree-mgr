@@ -524,6 +524,30 @@ test('listStatus：计算存在性、脏状态与 ahead/behind', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('listStatus：git status 失败时标记状态未知并返回警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: join(cfg.vault, 't'), createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(join(cfg.vault, 't'), { recursive: true })
+
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['status', '--porcelain'], FAIL('fatal: damaged git metadata'))
+  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('0\t0'))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, true)
+  assert.ok(r.rows, '应有 rows')
+  assert.equal(r.rows[0].dirty, null, '无法读取时 dirty 必须为未知，而不是干净')
+  assert.ok(r.warnings?.some((w) => /T/.test(w) && /damaged git metadata/.test(w)), JSON.stringify(r.warnings))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 // ---- purge -----------------------------------------------------------------
 
 test('purge：批量清理，逐任务报告，单个失败不中断', async () => {

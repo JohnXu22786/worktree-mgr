@@ -87,7 +87,7 @@ import { runTriggers } from './triggers.js'
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
  * @property {string[]} [warnings]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
  * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean}>} [results]
  */
 
@@ -351,16 +351,24 @@ export async function listStatus(opts) {
     const wl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
     if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
     const worktrees = parseWorktreeList(wl.stdout)
+    /** @type {string[]} */
+    const warnings = []
     const rows = []
     for (const rec of ledger.records) {
       const wt = worktrees.find((w) => samePath(w.path, rec.path))
-      let dirty = false
       let counts = null
       // 存在性 = 注册表有该工作区 且 目录实际存在（目录被外部删除后注册表仍会列出）
       const alive = Boolean(wt) && existsSync(rec.path)
+      /** @type {boolean | null} */
+      let dirty = false
       if (alive) {
         const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
-        dirty = st.ok && isDirty(st.stdout)
+        if (st.ok) {
+          dirty = isDirty(st.stdout)
+        } else {
+          dirty = null
+          warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
+        }
         const rc = await git.run(['rev-list', '--left-right', '--count', `${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
         counts = rc.ok ? parseAheadBehind(rc.stdout) : null
       }
@@ -375,7 +383,7 @@ export async function listStatus(opts) {
         updatedAt: rec.updatedAt,
       })
     }
-    return { ok: true, rows, warnings: [] }
+    return { ok: true, rows, warnings }
   } catch (err) {
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `总览失败：${/** @type {Error} */ (err).message}` }
@@ -669,4 +677,3 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     warnings,
   }
 }
-
