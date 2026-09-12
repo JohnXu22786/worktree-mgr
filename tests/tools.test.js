@@ -141,6 +141,43 @@ test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 
   assert.equal(git.calls.length, 0)
 })
 
+test('wtm_begin：回滚失败警告透传并渲染手动清理提示', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-rollback-test-'))
+  const wtPath = join(tmp, 't')
+  const git = new FakeGit()
+  git.on(['rev-parse', '--show-toplevel'], OK('C:/repo\n'))
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], {
+    ok: false,
+    code: -1,
+    stdout: '',
+    stderr: 'fatal: aborted after creating worktree',
+    aborted: true,
+  })
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + wtPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['worktree', 'remove', '--force', wtPath], FAIL('fatal: remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('fatal: branch delete failed'))
+  const tools = createToolSet({ config: { root: 'C:/repo', vault: tmp }, git })
+  const begin = tools.find((t) => t.name === 'wtm_begin')
+  assert.ok(begin, '工具 begin 应存在')
+
+  const value = /** @type {{ok: boolean, warnings?: string[]}} */ (
+    await begin.execute({ task: 'T' }, { signal: makeSignal() })
+  )
+
+  assert.equal(value.ok, false)
+  assert.ok((value.warnings ?? []).some((w) => /手动/.test(w)), JSON.stringify(value))
+  const rendered = begin.output.render({ task: 'T' }, value)[0].text
+  assert.match(rendered, /手动/)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
   writeFileSync(join(tmp, '.wtm.json'), '{broken')

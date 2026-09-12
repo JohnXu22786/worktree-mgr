@@ -139,7 +139,11 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 创建失败：${value.error}`)
+        if (!value.ok) {
+          const lines = [`❌ 创建失败：${value.error}`]
+          for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
+          return textBlock(lines.join('\n'))
+        }
         const lines = [
           `✅ 已创建任务工作区`,
           `任务: ${value.task}`,
@@ -158,7 +162,7 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, base: a.base, branch: a.branch,
         note: a.note, cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
+      if (!r.ok) return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })

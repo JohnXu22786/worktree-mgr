@@ -302,6 +302,10 @@ test('begin：worktree add 创建后被中止时回滚工作区与分支', async
     stderr: '',
     aborted: true,
   })
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + wtPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
   git.on(['worktree', 'remove', '--force', wtPath], OK())
   git.on(['branch', '-D', 'wtm/t'], OK())
 
@@ -310,6 +314,64 @@ test('begin：worktree add 创建后被中止时回滚工作区与分支', async
   assert.equal(r.ok, false)
   assert.ok(git.called(['worktree', 'remove', '--force', wtPath]))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：回滚命令返回失败时报告失败并继续清理分支', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], {
+    ok: false,
+    code: -1,
+    stdout: '',
+    stderr: 'fatal: aborted after creating worktree',
+    aborted: true,
+  })
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + wtPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['worktree', 'remove', '--force', wtPath], FAIL('fatal: remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('fatal: branch delete failed'))
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 1)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 1)
+  assert.ok((r.warnings ?? []).some((w) => /工作区.*回滚失败/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).some((w) => /分支.*回滚失败/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).some((w) => /手动/.test(w)), JSON.stringify(r))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：目标分支未绑定本次工作区时不删除外部分支', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  // 预检查后其他进程创建了目标分支，但 worktree add 尚未创建目标工作区。
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], FAIL('fatal: a branch named wtm/t already exists'))
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n',
+  ))
+  git.on(['worktree', 'remove', '--force', wtPath], OK())
+
+  const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  assert.ok((r.warnings ?? []).some((w) => /归属|手动/.test(w)), JSON.stringify(r))
   rmSync(tmp, { recursive: true, force: true })
 })
 
