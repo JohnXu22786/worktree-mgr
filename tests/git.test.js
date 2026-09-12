@@ -54,6 +54,40 @@ test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标�
   assert.equal(list[1].locked, true)
 })
 
+test('parseWorktreeList：保留 NUL porcelain 路径末尾的空格', () => {
+  const text = [
+    'worktree /tmp/worktree  ',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/task',
+    '',
+  ].join('\0')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree  ',
+    branch: 'task',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：将 NUL porcelain 中含换行的路径保留为一个记录', () => {
+  const text = [
+    'worktree /tmp/worktree\nwith-newline',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\0')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
 test('parseWorktreeList：detached 与 bare 工作区', () => {
   const text = [
     'worktree /a',

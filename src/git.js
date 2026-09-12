@@ -87,7 +87,8 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
- * 解析 `git worktree list --porcelain` 输出。
+ * 解析 `git worktree list --porcelain -z` 输出。
+ * 兼容不带 `-z` 的换行分隔输出，以便处理旧的调用方。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}
  */
@@ -96,10 +97,11 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith('worktree ')) {
+  const fields = text.includes('\0') ? text.split('\0') : text.split(/\r?\n/)
+  for (const field of fields) {
+    if (field.startsWith('worktree ')) {
       current = {
-        path: line.slice('worktree '.length).trim(),
+        path: field.slice('worktree '.length),
         branch: null,
         detached: false,
         bare: false,
@@ -107,13 +109,13 @@ export function parseWorktreeList(text) {
       }
       out.push(current)
     } else if (current) {
-      if (line.startsWith('branch refs/heads/')) {
-        current.branch = line.slice('branch refs/heads/'.length).trim()
-      } else if (line === 'detached') {
+      if (field.startsWith('branch refs/heads/')) {
+        current.branch = field.slice('branch refs/heads/'.length).trim()
+      } else if (field === 'detached') {
         current.detached = true
-      } else if (line === 'bare') {
+      } else if (field === 'bare') {
         current.bare = true
-      } else if (line.startsWith('locked')) {
+      } else if (field.startsWith('locked')) {
         current.locked = true
       }
     }
