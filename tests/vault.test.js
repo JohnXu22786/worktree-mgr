@@ -1,9 +1,11 @@
 import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   VaultError,
   repoSlug,
@@ -20,6 +22,83 @@ import {
 function makeTmp() {
   const dir = mkdtempSync(join(tmpdir(), 'wtm-vault-test-'))
   return dir
+}
+
+/**
+ * @param {string} dir
+ * @param {string} mode
+ * @returns {Promise<{code: number | null, signal: NodeJS.Signals | null, stderr: string, timedOut: boolean}>}
+ */
+function runLockChild(dir, mode) {
+  const childScript = `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+    import { join } from 'node:path'
+    import { pathToFileURL } from 'node:url'
+
+    const dir = process.env.WTM_TEST_VAULT_DIR
+    const lockPath = join(dir, '.lock')
+    const sourcePath = process.env.WTM_TEST_VAULT_SOURCE
+    const originalStatSync = fs.statSync
+    const originalUnlinkSync = fs.unlinkSync
+
+    if (process.env.WTM_TEST_LOCK_MODE === 'stat') {
+      fs.statSync = (target, ...args) => {
+        if (target === lockPath) {
+          const error = new Error('simulated stat failure')
+          error.code = 'EIO'
+          throw error
+        }
+        return originalStatSync(target, ...args)
+      }
+    }
+    if (process.env.WTM_TEST_LOCK_MODE === 'unlink') {
+      fs.unlinkSync = (target, ...args) => {
+        if (target === lockPath) {
+          const error = new Error('simulated unlink failure')
+          error.code = 'EIO'
+          throw error
+        }
+        return originalUnlinkSync(target, ...args)
+      }
+    }
+    syncBuiltinESMExports()
+
+    const { withLock } = await import(pathToFileURL(sourcePath).href)
+    try {
+      await withLock(dir, async () => {}, { timeoutMs: 100, staleMs: 10 })
+      console.error('lock unexpectedly acquired')
+      process.exitCode = 1
+    } catch (error) {
+      if (error?.name !== 'VaultError') {
+        console.error(error)
+        process.exitCode = 2
+      }
+    }
+  `
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+      env: {
+        ...process.env,
+        WTM_TEST_VAULT_DIR: dir,
+        WTM_TEST_VAULT_SOURCE: fileURLToPath(new URL('../src/vault.js', import.meta.url)),
+        WTM_TEST_LOCK_MODE: mode,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+    }, 1000)
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('close', (code, signal) => {
+      clearTimeout(timer)
+      resolve({ code, signal, stderr, timedOut })
+    })
+  })
 }
 
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
@@ -189,6 +268,36 @@ test('withLock：超时抛出 VaultError', async () => {
     withLock(dir, async () => {}, { timeoutMs: 200, staleMs: 60_000 }),
     VaultError,
   )
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：statSync 持续失败时仍遵守 timeout', async () => {
+  const dir = makeTmp()
+  writeFileSync(join(dir, '.lock'), String(process.pid))
+  const result = await runLockChild(dir, 'stat')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：悬空 .lock 符号链接仍遵守 timeout', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  symlinkSync(join(dir, 'missing-lock-target'), join(dir, '.lock'))
+  const result = await runLockChild(dir, 'normal')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：回收锁删除失败时仍遵守 timeout', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  writeFileSync(lockPath, String(process.pid))
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(lockPath, past, past)
+  const result = await runLockChild(dir, 'unlink')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
   rmSync(dir, { recursive: true, force: true })
 })
 
