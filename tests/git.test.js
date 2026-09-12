@@ -59,6 +59,27 @@ test('runWorktreeList：Git 不支持 -z 时回退到换行 porcelain', async ()
   ])
 })
 
+test('runWorktreeList：根据退出码识别本地化的 -z 不支持错误', async () => {
+  /** @type {string[][]} */
+  const calls = []
+  const git = {
+    run: async (/** @type {string[]} */ args) => {
+      calls.push(args)
+      if (args.includes('-z')) {
+        return { ok: false, code: 129, stdout: '', stderr: '错误：未知选项 z', aborted: false }
+      }
+      return { ok: true, code: 0, stdout: 'legacy porcelain', stderr: '', aborted: false }
+    },
+  }
+  const result = await runWorktreeList(git)
+  assert.equal(result.ok, true)
+  assert.equal(result.stdout, 'legacy porcelain')
+  assert.deepEqual(calls, [
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '--porcelain'],
+  ])
+})
+
 test('runWorktreeList：非选项错误不回退重试', async () => {
   /** @type {string[][]} */
   const calls = []

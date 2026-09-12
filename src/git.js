@@ -95,7 +95,8 @@ export async function resolveToplevel(git, candidate, signal) {
  */
 export async function runWorktreeList(git, opts) {
   const nul = await git.run(['worktree', 'list', '--porcelain', '-z'], opts)
-  if (nul.ok || !/(?:unknown|unrecognized|invalid) (?:option|switch)/i.test(nul.stderr)) {
+  // Git uses exit status 129 for command-line option errors, independent of locale.
+  if (nul.ok || nul.code !== 129) {
     return nul
   }
   return git.run(['worktree', 'list', '--porcelain'], opts)
