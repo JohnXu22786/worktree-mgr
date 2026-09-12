@@ -1,9 +1,11 @@
+import { spawn } from 'node:child_process'
 import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   VaultError,
   repoSlug,
@@ -20,6 +22,18 @@ import {
 function makeTmp() {
   const dir = mkdtempSync(join(tmpdir(), 'wtm-vault-test-'))
   return dir
+}
+
+/**
+ * @param {string} path
+ * @param {number} [timeoutMs]
+ */
+async function waitForFile(path, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${path}`)
+    await new Promise((r) => setTimeout(r, 5))
+  }
 }
 
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
@@ -190,6 +204,84 @@ test('withLock：超时抛出 VaultError', async () => {
     VaultError,
   )
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const readyPath = join(dir, '.owner-ready')
+  const heartbeatPath = join(dir, '.owner-heartbeat')
+  const continuePath = join(dir, '.owner-continue')
+  const releasePath = join(dir, '.owner-release')
+  const donePath = join(dir, '.owner-done')
+  const childScript = `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+
+    const realFutimesSync = fs.futimesSync
+    let blockHeartbeat = false
+    const waitBuffer = new Int32Array(new SharedArrayBuffer(4))
+    fs.futimesSync = (...args) => {
+      if (blockHeartbeat && !fs.existsSync(process.env.WTM_TEST_CONTINUE)) {
+        fs.writeFileSync(process.env.WTM_TEST_HEARTBEAT, '')
+        while (!fs.existsSync(process.env.WTM_TEST_CONTINUE)) {
+          Atomics.wait(waitBuffer, 0, 0, 5)
+        }
+      }
+      return realFutimesSync(...args)
+    }
+    syncBuiltinESMExports()
+
+    const { withLock } = await import(process.env.WTM_TEST_VAULT_MODULE)
+    await withLock(process.env.WTM_TEST_DIR, async () => {
+      blockHeartbeat = true
+      fs.writeFileSync(process.env.WTM_TEST_READY, '')
+      while (!fs.existsSync(process.env.WTM_TEST_RELEASE)) await new Promise((resolve) => setTimeout(resolve, 5))
+    }, { heartbeatMs: 10, staleMs: 1000 })
+    fs.writeFileSync(process.env.WTM_TEST_DONE, '')
+  `
+  const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    env: {
+      ...process.env,
+      WTM_TEST_DIR: dir,
+      WTM_TEST_VAULT_MODULE: new URL('../src/vault.js', import.meta.url).href,
+      WTM_TEST_READY: readyPath,
+      WTM_TEST_HEARTBEAT: heartbeatPath,
+      WTM_TEST_CONTINUE: continuePath,
+      WTM_TEST_RELEASE: releasePath,
+      WTM_TEST_DONE: donePath,
+    },
+    stdio: 'ignore',
+  })
+  /** @type {Promise<{code: number | null, signal: NodeJS.Signals | null}>} */
+  const childExit = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  })
+
+  let contenderRan = false
+  try {
+    await waitForFile(readyPath)
+    await waitForFile(heartbeatPath)
+    const past = new Date(Date.now() - 60_000)
+    utimesSync(lockPath, past, past)
+    const contender = withLock(dir, async () => { contenderRan = true }, { timeoutMs: 250, staleMs: 1000 })
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(contenderRan, false)
+    writeFileSync(continuePath, '')
+    await assert.rejects(contender, VaultError)
+    writeFileSync(releasePath, '')
+    await waitForFile(donePath)
+    const result = await childExit
+    assert.equal(result.code, 0, `owner 子进程异常退出：${result.signal ?? result.code}`)
+  } finally {
+    writeFileSync(continuePath, '')
+    writeFileSync(releasePath, '')
+    if (child.exitCode === null) child.kill()
+    await childExit.catch(() => {})
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('withLock：过期锁被回收（stale）', async () => {
