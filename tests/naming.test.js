@@ -58,6 +58,15 @@ test('slugifyTask：超长任务名被截断（含前缀仍不超 100 字符）'
   assert.ok(branch.length <= 100, `分支名长度 ${branch.length} 应 ≤ 100`)
 })
 
+test('slugifyTask：截断不切断非 BMP Unicode 字符', () => {
+  const task = 'a'.repeat(59) + '𐐀'
+  const normalized = task.normalize('NFKC').toLowerCase()
+  const slug = slugifyTask(task)
+
+  assert.equal(slug, normalized)
+  assert.equal(validateBranch(deriveBranch(task)).ok, true)
+})
+
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
   // 截断切在 . 上：段尾残留 '.'
   assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)
