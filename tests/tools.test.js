@@ -141,6 +141,44 @@ test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 
   assert.equal(git.calls.length, 0)
 })
 
+test('wtm_begin：工具入口保留并渲染回滚失败警告', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-tools-root-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-tools-vault-'))
+  const git = new FakeGit()
+  const ac = new AbortController()
+  const worktree = join(vault, 't')
+  try {
+    git.on(['rev-parse', '--show-toplevel'], OK(root + '\n'))
+    git.on(['branch', '--show-current'], OK('main\n'))
+    git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+    git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+    git.on(['status', '--porcelain'], OK(''))
+    git.on(['worktree', 'add', worktree, '-b', 'wtm/t', 'main'], () => {
+      ac.abort()
+      return OK()
+    })
+    git.on(['worktree', 'remove', '--force', worktree], FAIL('remove failed'))
+    git.on(['branch', '-D', 'wtm/t'], FAIL('branch failed'))
+
+    const tools = createToolSet({ config: { root, vault }, git })
+    const begin = tools.find((t) => t.name === 'wtm_begin')
+    assert.ok(begin, '工具 begin 应存在')
+    const value = /** @type {{ok: boolean, error?: string, warnings?: string[]}} */ (
+      await begin.execute({ task: 'T' }, { signal: ac.signal })
+    )
+    assert.equal(value.ok, false)
+    assert.ok((value.warnings ?? []).some((w) => /remove failed/.test(w)), JSON.stringify(value))
+    assert.ok((value.warnings ?? []).some((w) => /branch failed/.test(w)), JSON.stringify(value))
+
+    const rendered = begin.output.render({}, value)
+    assert.match(rendered[0].text, /remove failed/)
+    assert.match(rendered[0].text, /branch failed/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
 test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
   writeFileSync(join(tmp, '.wtm.json'), '{broken')
