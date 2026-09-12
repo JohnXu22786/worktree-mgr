@@ -151,6 +151,24 @@ test('parseWorktreeList：将 NUL porcelain 中含换行的路径保留为一个
   }])
 })
 
+test('parseWorktreeList：兼容旧版 porcelain 中含换行的路径', () => {
+  const text = [
+    'worktree /tmp/worktree',
+    'with-newline',
+    'HEAD 3333333333333333333333333333333333333333',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\n')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list, [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
 test('parseWorktreeList：detached 与 bare 工作区', () => {
   const text = [
     'worktree /a',

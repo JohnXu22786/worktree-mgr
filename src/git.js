@@ -113,8 +113,7 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  const fields = text.includes('\0') ? text.split('\0') : text.split(/\r?\n/)
-  for (const field of fields) {
+  const consume = (/** @type {string} */ field) => {
     if (field.startsWith('worktree ')) {
       current = {
         path: field.slice('worktree '.length),
@@ -135,6 +134,25 @@ export function parseWorktreeList(text) {
         current.locked = true
       }
     }
+  }
+
+  if (text.includes('\0')) {
+    for (const field of text.split('\0')) consume(field)
+    return out
+  }
+
+  // Legacy porcelain has no record delimiter. The stable HEAD line lets us
+  // keep newlines that belong to the path before parsing the record fields.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\nHEAD [0-9a-f]+(?:\r?\n|$)/gm)]
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]
+    consume(`worktree ${record[1]}`)
+    const start = (record.index ?? 0) + record[0].length
+    const end = records[i + 1]?.index ?? text.length
+    for (const field of text.slice(start, end).split(/\r?\n/)) consume(field)
+  }
+  if (records.length === 0) {
+    for (const field of text.split(/\r?\n/)) consume(field)
   }
   return out
 }
