@@ -87,6 +87,21 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
+ * 读取 `git worktree list` 的机器可读输出。
+ * Git 2.36 之前不支持 `-z`，遇到该选项错误时回退到换行分隔格式。
+ * @param {{run: Function}} git
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
+ */
+export async function runWorktreeList(git, opts) {
+  const nul = await git.run(['worktree', 'list', '--porcelain', '-z'], opts)
+  if (nul.ok || !/(?:unknown|unrecognized|invalid) (?:option|switch)/i.test(nul.stderr)) {
+    return nul
+  }
+  return git.run(['worktree', 'list', '--porcelain'], opts)
+}
+
+/**
  * 解析 `git worktree list --porcelain -z` 输出。
  * 兼容不带 `-z` 的换行分隔输出，以便处理旧的调用方。
  * @param {string} text

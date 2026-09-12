@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, GitRunner } from '../src/git.js'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runWorktreeList, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -30,6 +30,48 @@ test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
   }
   const result = await resolveToplevel(git, '/tmp/repo\r')
   assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
+})
+
+test('runWorktreeList：Git 不支持 -z 时回退到换行 porcelain', async () => {
+  /** @type {Array<{args: string[], opts: object | undefined}>} */
+  const calls = []
+  const git = {
+    run: async (/** @type {string[]} */ args, /** @type {object | undefined} */ opts) => {
+      calls.push({ args, opts })
+      if (args.includes('-z')) {
+        return { ok: false, code: 129, stdout: '', stderr: "error: unknown switch 'z'", aborted: false }
+      }
+      return {
+        ok: true,
+        code: 0,
+        stdout: 'worktree /tmp/worktree  \nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task\n',
+        stderr: '',
+        aborted: false,
+      }
+    },
+  }
+  const result = await runWorktreeList(git, { cwd: '/tmp/repo' })
+  assert.equal(result.ok, true)
+  assert.equal(parseWorktreeList(result.stdout)[0].path, '/tmp/worktree  ')
+  assert.deepEqual(calls.map(({ args }) => args), [
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '--porcelain'],
+  ])
+})
+
+test('runWorktreeList：非选项错误不回退重试', async () => {
+  /** @type {string[][]} */
+  const calls = []
+  const failure = { ok: false, code: 128, stdout: '', stderr: 'fatal: not a git repository', aborted: false }
+  const git = {
+    run: async (/** @type {string[]} */ args) => {
+      calls.push(args)
+      return failure
+    },
+  }
+  const result = await runWorktreeList(git, { cwd: '/tmp/not-a-repo' })
+  assert.deepEqual(result, failure)
+  assert.deepEqual(calls, [['worktree', 'list', '--porcelain', '-z']])
 })
 
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
