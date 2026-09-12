@@ -110,6 +110,84 @@ function abortResult() {
 }
 
 /**
+ * @param {string} wtPath
+ * @param {string} branchName
+ */
+function manualCleanupHint(wtPath, branchName) {
+  return `请手动检查并清理：git worktree remove --force "${wtPath}"；git branch -D "${branchName}"`
+}
+
+/**
+ * 确认失败的 worktree add 是否确实创建了目标工作区与分支的绑定。
+ * 只有两者同时匹配时才允许自动回滚，避免误删竞争进程创建的分支。
+ * @param {{run: Function}} git
+ * @param {string} root
+ * @param {string} wtPath
+ * @param {string} branchName
+ * @returns {Promise<{owned: boolean, warning?: string}>}
+ */
+async function confirmWorktreeOwnership(git, root, wtPath, branchName) {
+  try {
+    const list = await git.run(['worktree', 'list', '--porcelain'], { cwd: root })
+    if (!list.ok) {
+      return {
+        owned: false,
+        warning: `无法确认未完成工作区的归属：${list.stderr.trim() || 'git worktree list 失败'}；` +
+          manualCleanupHint(wtPath, branchName),
+      }
+    }
+    const owned = parseWorktreeList(list.stdout).some((worktree) =>
+      samePath(worktree.path, wtPath) && worktree.branch === branchName)
+    if (owned) return { owned: true }
+    return {
+      owned: false,
+      warning: `未确认本次创建的工作区与分支归属，未自动删除分支；${manualCleanupHint(wtPath, branchName)}`,
+    }
+  } catch (err) {
+    return {
+      owned: false,
+      warning: `无法确认未完成工作区的归属：${/** @type {Error} */ (err).message}；` +
+        manualCleanupHint(wtPath, branchName),
+    }
+  }
+}
+
+/**
+ * 回滚已确认属于本次操作的 worktree 与分支。
+ * @param {{run: Function}} git
+ * @param {string} root
+ * @param {string} wtPath
+ * @param {string} branchName
+ * @returns {Promise<string[]>}
+ */
+async function rollbackCreatedWorktree(git, root, wtPath, branchName) {
+  /** @type {string[]} */
+  const warnings = []
+  try {
+    const remove = await git.run(['worktree', 'remove', '--force', wtPath], { cwd: root })
+    if (!remove.ok) {
+      warnings.push(`工作区回滚失败：${remove.stderr.trim() || 'git worktree remove 失败'}`)
+    }
+  } catch (err) {
+    warnings.push(`工作区回滚失败：${/** @type {Error} */ (err).message}`)
+  }
+  try {
+    const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+    if (!branch.ok) {
+      warnings.push(`分支回滚失败：${branch.stderr.trim() || 'git branch -D 失败'}`)
+    }
+  } catch (err) {
+    warnings.push(`分支回滚失败：${/** @type {Error} */ (err).message}`)
+  }
+  if (warnings.length === 0) {
+    warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
+  } else {
+    warnings.push(`回滚未完全成功；${manualCleanupHint(wtPath, branchName)}`)
+  }
+  return warnings
+}
+
+/**
  * 创建任务工作区：派生分支 → 校验 → git worktree add → 种子文件 → 触发器 → 落账本。
  * @param {{root: string, task?: string, base?: string, branch?: string, note?: string,
  *          cfg: PluginConfig, git: {run: Function}, repo: RepoConfig | null,
@@ -142,8 +220,11 @@ export async function begin(opts) {
   }
   /** @type {string[]} */
   const warnings = []
+  const wtPath = join(vault, slugifyTask(task))
   let result
   let createdWorktree = false
+  let addAttempted = false
+  let addError = null
   try {
     result = await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -179,7 +260,6 @@ export async function begin(opts) {
         warnings.push('主工作区存在未提交改动，新建的工作区不会包含这些改动，请留意')
       }
 
-      const wtPath = join(vault, slugifyTask(task))
       // 防碰撞：不同任务名可能派生同一 slug（如 "a b" 与 "a-b"），
       // 账本中已有记录指向同一工作区路径时拒绝
       if (ledger.records.some((rec) => samePath(rec.path, wtPath))) {
@@ -190,8 +270,13 @@ export async function begin(opts) {
       }
 
       // 核心动作：创建 worktree
+      // git 可能在 AbortSignal 触发前已经创建工作区和分支，随后才返回失败。
+      addAttempted = true
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      if (!add.ok) {
+        addError = `创建工作区失败：${add.stderr.trim()}`
+        throw new Error(addError)
+      }
       createdWorktree = true
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
@@ -247,17 +332,23 @@ export async function begin(opts) {
     })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
-    if (createdWorktree && typeof result === 'undefined') {
-      try {
-        await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        await git.run(['branch', '-D', branchName], { cwd: root })
-        warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
-      } catch {
-        warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
+    if (addAttempted && typeof result === 'undefined') {
+      if (!createdWorktree) {
+        const ownership = await confirmWorktreeOwnership(git, root, wtPath, branchName)
+        if (ownership.warning) warnings.push(ownership.warning)
+        createdWorktree = ownership.owned
+      }
+      if (createdWorktree) {
+        warnings.push(...await rollbackCreatedWorktree(git, root, wtPath, branchName))
       }
     }
-    if (err instanceof VaultError) return { ok: false, error: err.message }
-    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
+    const error = err instanceof VaultError
+      ? err.message
+      : (addError ?? `创建失败：${/** @type {Error} */ (err).message}`)
+    /** @type {OpResult} */
+    const failure = { ok: false, error }
+    if (warnings.length > 0) failure.warnings = warnings
+    return failure
   }
   if (!result.ok) return result
   return {
