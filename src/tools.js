@@ -96,6 +96,16 @@ function textBlock(text) {
 }
 
 /**
+ * @param {string} prefix
+ * @param {{error?: string, warnings?: string[]}} value
+ */
+function errorBlock(prefix, value) {
+  const lines = [`${prefix}${value.error ?? '未知错误'}`]
+  for (const warning of value.warnings ?? []) lines.push(`⚠️  ${warning}`)
+  return textBlock(lines.join('\n'))
+}
+
+/**
  * 组装全部工具定义。
  * @param {{config: Record<string, unknown>, git: {run: Function}}} opts
  * @returns {ToolDef[]}
@@ -139,11 +149,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) {
-          const lines = [`❌ 创建失败：${value.error}`]
-          for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
-          return textBlock(lines.join('\n'))
-        }
+        if (!value.ok) return errorBlock('❌ 创建失败：', value)
         const lines = [
           `✅ 已创建任务工作区`,
           `任务: ${value.task}`,
@@ -196,7 +202,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 同步失败：${value.error}`)
+        if (!value.ok) return errorBlock('❌ 同步失败：', value)
         const parts = [`✅ 已同步任务 ${value.task} → ${value.base}`]
         if (value.committed) parts.push(`已自动快照提交任务工作区的改动`)
         if (value.merged) parts.push(`已合并分支 ${value.branch} 回 ${value.base}`)
@@ -212,7 +218,6 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, mode: a.mode, message: a.message,
         cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
@@ -250,7 +255,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 收尾失败：${value.error}`)
+        if (!value.ok) return errorBlock('❌ 收尾失败：', value)
         if (value.note) return textBlock(`✅ ${value.note}`)
         const parts = [`✅ 任务 ${value.task} 已收尾`]
         if (value.committed) parts.push(`已快照提交任务改动`)
@@ -268,7 +273,6 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, mode: a.mode, message: a.message,
         cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
@@ -297,7 +301,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 总览失败：${value.error}`)
+        if (!value.ok) return errorBlock('❌ 总览失败：', value)
         const rows = value.rows ?? []
         if (rows.length === 0) {
           return textBlock(`暂无进行中的任务。可用 wtm_begin 为任务创建隔离工作区。`)
@@ -324,7 +328,6 @@ export function createToolSet(opts) {
       const p = await prepare({ args, exec, tool: { config }, git })
       if (!p.ok) return p
       const r = await listStatus({ root: p.root, cfg: p.cfg, git, repo: p.repo, signal: exec?.signal })
-      if (!r.ok) return { ...r, warnings: p.warnings }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
@@ -356,12 +359,14 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 批量清理失败：${value.error}`)
+        if (!value.ok) return errorBlock('❌ 批量清理失败：', value)
         const results = value.results ?? []
         const lines = [`批量清理完成（${results.length} 个任务）：`, '']
         for (const r of results) {
           lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${r.note ? `（${r.note}）` : ''}`)
+          for (const warning of r.warnings ?? []) lines.push(`  ⚠️  ${warning}`)
         }
+        for (const warning of value.warnings ?? []) lines.push(`⚠️  ${warning}`)
         return textBlock(lines.join('\n'))
       },
     },
@@ -373,7 +378,7 @@ export function createToolSet(opts) {
         root: p.root, tasks: a.tasks, all: a.all === true, mode: a.mode,
         message: a.message, cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      return { ...r, warnings: p.warnings }
+      return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
 

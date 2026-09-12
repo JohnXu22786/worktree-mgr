@@ -395,6 +395,44 @@ test('begin：on_begin 触发器取消时回滚工作区与分支且不落账本
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：触发器后代清理失败时不与后代并发回滚', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], OK())
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const r = await begin({
+    root: 'C:/repo', task: 'T', cfg, git,
+    repo: { triggers: { on_begin: ['sleep-cmd'] } },
+    signal: ac.signal,
+    triggerSpawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+    triggerTerminate: async () => ({ ok: false, detail: 'taskkill failed' }),
+  })
+  assert.equal(r.ok, false)
+  assert.equal(r.cleanupFailed, true)
+  assert.match(r.error ?? '', /未能确认终止|清理/i)
+  assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  assert.ok((r.warnings ?? []).some((w) => /手动清理|taskkill failed/.test(w)), JSON.stringify(r))
+  assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：worktree add 报告取消时回滚部分创建资源', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
@@ -455,6 +493,29 @@ test('begin：回滚命令返回失败时报告真实失败', async () => {
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   assert.ok((r.warnings ?? []).some((w) => /回滚失败|remove failed|branch failed/.test(w)), JSON.stringify(r))
   assert.equal(loadLedger(cfg.vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：非取消异常时保留回滚失败警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const wtPath = join(tmp, 'vault', 't')
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', wtPath, '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'remove', '--force', wtPath], FAIL('remove failed'))
+  git.on(['branch', '-D', 'wtm/t'], FAIL('branch failed'))
+  const r = await begin({
+    root: 'C:/repo', task: 'T', cfg, git,
+    repo: { triggers: { on_begin: ['broken-trigger'] } },
+    triggerSpawn: () => ({ stdout: {}, stderr: {}, on: () => { throw new Error('trigger exploded') } }),
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /创建失败|trigger exploded/)
+  assert.ok((r.warnings ?? []).some((w) => /回滚失败|remove failed|branch failed/.test(w)), JSON.stringify(r))
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -705,6 +766,41 @@ test('finishTask：keep 模式仅解除管理，不触碰工作区与分支', as
   assert.equal(git.count(['worktree', 'remove', join(vault, 't')]), 0)
   assert.equal(git.count(['branch', '-d', 'wtm/t']), 0)
   assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：stale 检查后取消时保留账本记录', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: 'P', createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  const ac = new AbortController()
+  git.on(['worktree', 'list', '--porcelain'], () => {
+    ac.abort()
+    return OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n')
+  })
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null, signal: ac.signal })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(loadLedger(cfg.vault).records.length, 1)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：keep 检查后取消时保留账本记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const ac = new AbortController()
+  git.on(['worktree', 'list', '--porcelain'], () => {
+    ac.abort()
+    return OK('worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n')
+  })
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'keep', cfg, git, repo: null, signal: ac.signal })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(loadLedger(vault).records.length, 1)
+  assert.equal(git.count(['worktree', 'remove', join(vault, 't')]), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 

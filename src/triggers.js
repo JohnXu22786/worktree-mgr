@@ -21,15 +21,16 @@ import { spawn } from 'node:child_process'
  * 顺序执行一组触发器命令。
  * @param {string[] | undefined} commands
  * @param {TriggerContext} ctx
- * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal}} [opts]
+ * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal, terminate?: (child: any) => Promise<{ok: boolean, detail?: string}>}} [opts]
  *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）；signal 用于中止触发器进程
- * @returns {Promise<{warnings: string[], aborted?: boolean}>}
+ * @returns {Promise<{warnings: string[], aborted?: boolean, cleanupFailed?: boolean}>}
  */
-export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal } = {}) {
+export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal, terminate = terminateProcessTree } = {}) {
   /** @type {string[]} */
   const warnings = []
   if (!Array.isArray(commands)) return { warnings }
   let aborted = false
+  let cleanupFailed = false
   const isWin = process.platform === 'win32'
   for (const cmd of commands) {
     if (signal?.aborted) {
@@ -47,14 +48,20 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
       WTM_PATH: ctx.path ?? '',
       WTM_ROOT: ctx.root ?? '',
     }
-    const result = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal })
+    const result = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal }, terminate)
     if (!result.ok && !result.aborted) warnings.push(`触发器失败 [${cmd}]: ${result.detail}`)
+    if (result.cleanupFailed) {
+      cleanupFailed = true
+      warnings.push(`触发器终止失败 [${cmd}]: ${result.detail}`)
+    }
     if (result.aborted || signal?.aborted) {
       aborted = true
       break
     }
   }
-  return aborted ? { warnings, aborted: true } : { warnings }
+  return aborted
+    ? { warnings, aborted: true, ...(cleanupFailed ? { cleanupFailed: true } : {}) }
+    : { warnings }
 }
 
 /**
@@ -63,9 +70,10 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
  * @param {string} shell
  * @param {string[]} args
  * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal}} opts
- * @returns {Promise<{ok: boolean, detail: string, aborted?: boolean}>}
+ * @param {(child: any) => Promise<{ok: boolean, detail?: string}>} terminate
+ * @returns {Promise<{ok: boolean, detail: string, aborted?: boolean, cleanupFailed?: boolean}>}
  */
-function runOne(spawnFn, shell, args, opts) {
+function runOne(spawnFn, shell, args, opts, terminate) {
   return new Promise((resolve) => {
     /** @type {any} */
     let child
@@ -88,6 +96,7 @@ function runOne(spawnFn, shell, args, opts) {
     let closeSeen = false
     let terminationStarted = false
     let terminationDone = false
+    let terminationFailure = ''
     /** @type {number | null} */
     let exitCode = null
     /** @type {string | null} */
@@ -96,7 +105,7 @@ function runOne(spawnFn, shell, args, opts) {
     /** @type {() => void} */
     let onAbort = () => {}
     /**
-     * @param {{ok: boolean, detail: string, aborted?: boolean}} result
+     * @param {{ok: boolean, detail: string, aborted?: boolean, cleanupFailed?: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
@@ -107,16 +116,25 @@ function runOne(spawnFn, shell, args, opts) {
     }
     const finishAborted = () => {
       if ((aborting || signal?.aborted) && closeSeen && terminationDone) {
-        done({ ok: false, detail: abortDetail, aborted: true })
+        done({
+          ok: false,
+          detail: abortDetail,
+          aborted: true,
+          ...(terminationFailure ? { cleanupFailed: true } : {}),
+        })
       }
     }
     const startTermination = () => {
       if (terminationStarted) return
       terminationStarted = true
-      Promise.resolve(terminateProcessTree(child))
-        .catch(() => {})
-        .then(() => {
+      Promise.resolve(terminate(child))
+        .catch((err) => ({ ok: false, detail: `终止触发器失败：${err instanceof Error ? err.message : String(err)}` }))
+        .then((result) => {
           terminationDone = true
+          if (!result.ok) {
+            terminationFailure = result.detail || '无法确认触发器后代已终止'
+            abortDetail = `${abortDetail}；${terminationFailure}`
+          }
           finishAborted()
         })
     }
@@ -167,7 +185,7 @@ function runOne(spawnFn, shell, args, opts) {
  * 终止触发器进程组，避免 shell 的后代在取消后继续执行。
  * @param {any} child
  * @param {{platform?: string, spawnFn?: (command: string, args: string[], opts: object) => any}} [opts]
- * @returns {Promise<void>}
+ * @returns {Promise<{ok: boolean, detail?: string}>}
  */
 export function terminateProcessTree(child, { platform = process.platform, spawnFn = spawn } = {}) {
   const pid = child?.pid
@@ -178,17 +196,25 @@ export function terminateProcessTree(child, { platform = process.platform, spawn
         /** @type {number | null | undefined} */
         let exitCode
         const fallback = () => {
-          try { child.kill?.('SIGKILL') } catch { /* 进程可能已经结束 */ }
+          try {
+            if (typeof child?.kill !== 'function') return false
+            return child.kill('SIGKILL') !== false
+          } catch {
+            return false
+          }
         }
-        /**
-         * @param {number | null | undefined} code
-         * @param {boolean} [shouldFallback]
-         */
-        const finish = (code, shouldFallback = code !== 0) => {
+        const reportFailure = (/** @type {string} */ detail) => {
           if (settled) return
           settled = true
-          if (shouldFallback) fallback()
-          resolve()
+          const fallbackDetail = fallback()
+            ? '已尝试直接终止 shell，但无法确认后代已结束'
+            : '直接终止 shell 也失败，后代状态未知'
+          resolve({ ok: false, detail: `${detail}；${fallbackDetail}` })
+        }
+        const reportSuccess = () => {
+          if (settled) return
+          settled = true
+          resolve({ ok: true })
         }
         let killer
         try {
@@ -196,25 +222,27 @@ export function terminateProcessTree(child, { platform = process.platform, spawn
             windowsHide: true,
             stdio: 'ignore',
           })
-        } catch {
-          fallback()
-          resolve()
+        } catch (err) {
+          reportFailure(`启动 taskkill 失败：${err instanceof Error ? err.message : String(err)}`)
           return
         }
-        killer.on('error', () => finish(undefined, true))
-        killer.on('exit', (/** @type {number | null} */ code) => {
-          exitCode = code
-          finish(code)
+        killer.on('error', (/** @type {Error} */ err) => reportFailure(`taskkill 失败：${err.message}`))
+        killer.on('exit', (/** @type {number | null} */ code) => { exitCode = code })
+        killer.on('close', (/** @type {number | null} */ code) => {
+          const finalCode = code ?? exitCode
+          if (finalCode === 0) reportSuccess()
+          else reportFailure(`taskkill 失败（退出码 ${finalCode ?? 'unknown'}）`)
         })
-        killer.on('close', (/** @type {number | null} */ code) => finish(code ?? exitCode))
       })
     } else {
       try {
         process.kill(-pid, 'SIGKILL')
-        return Promise.resolve()
+        return Promise.resolve({ ok: true })
       } catch { /* 进程组可能已经结束 */ }
     }
   }
-  try { child?.kill?.('SIGKILL') } catch { /* 进程可能已经结束 */ }
-  return Promise.resolve()
+  try {
+    child?.kill?.('SIGKILL')
+  } catch { /* 进程可能已经结束 */ }
+  return Promise.resolve({ ok: true })
 }

@@ -179,8 +179,35 @@ test('terminateProcessTree：Windows taskkill 未完成时等待，失败时回�
   await Promise.resolve()
   assert.equal(settled, false, 'taskkill 完成前不应报告清理完成')
   killer.emit('exit', 5, null)
+  await Promise.resolve()
+  assert.equal(settled, false, 'taskkill close 前不应报告清理完成')
+  killer.emit('close', 5, null)
+  const outcome = await cleanup
   await pending
+  assert.equal(outcome.ok, false)
   assert.equal(killedWith, 'SIGKILL')
+})
+
+test('runTriggers：Windows 进程树终止失败时报告清理警告', async () => {
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  const result = await runTriggers(['abort-cmd'], {}, {
+    signal: ac.signal,
+    terminate: async () => ({ ok: false, detail: 'taskkill failed' }),
+    spawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(result.aborted, true)
+  assert.equal(result.cleanupFailed, true)
+  assert.ok(result.warnings.some((warning) => /终止失败|taskkill failed/.test(warning)), JSON.stringify(result))
 })
 
 test('runTriggers：取消后等待触发器 close 再返回', async () => {

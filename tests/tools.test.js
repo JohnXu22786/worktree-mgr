@@ -165,6 +165,45 @@ test('wtm_begin：显式 root 参数优先于配置', async () => {
   }
 })
 
+test('wtm_begin：失败时合并准备阶段与操作阶段警告', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-tools-root-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-tools-vault-'))
+  writeFileSync(join(root, '.wtm.json'), JSON.stringify({ extra: true }))
+  const git = new FakeGit()
+  git.on(['rev-parse', '--show-toplevel'], OK(root + '\n'))
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
+  git.on(['status', '--porcelain'], OK(' M dirty.txt\n'))
+  git.on(['worktree', 'add', join(vault, 't'), '-b', 'wtm/t', 'main'], FAIL('add failed'))
+  try {
+    const tools = createToolSet({ config: { root, vault }, git })
+    const begin = tools.find((tool) => tool.name === 'wtm_begin')
+    assert.ok(begin, '工具 begin 应存在')
+    const value = /** @type {{ok: boolean, warnings?: string[]}} */ (await begin.execute({ task: 'T' }, { signal: makeSignal() }))
+    assert.equal(value.ok, false)
+    assert.ok(value.warnings?.some((warning) => /未提交/.test(warning)), JSON.stringify(value))
+    assert.ok(value.warnings?.some((warning) => /extra|未知/.test(warning)), JSON.stringify(value))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('wtm_begin：失败渲染包含操作阶段 warnings', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const begin = tools.find((tool) => tool.name === 'wtm_begin')
+  assert.ok(begin, '工具 begin 应存在')
+  const rendered = begin.output.render({}, {
+    ok: false,
+    error: '操作已取消（aborted）',
+    warnings: ['工作区创建未完成，且回滚失败：branch -D 失败'],
+  })
+  assert.match(rendered[0].text, /操作已取消/)
+  assert.match(rendered[0].text, /回滚失败/)
+})
+
 test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 命令', async () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })
