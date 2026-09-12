@@ -444,13 +444,17 @@ export async function purge(opts) {
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
+ * @param {string} [mode='commit']
  * @returns {Promise<{ok: boolean, committed: boolean, error?: string}>}
  */
-async function snapshotCommit(opts, rec, task) {
+async function snapshotCommit(opts, rec, task, mode = 'commit') {
   const { git, cfg } = opts
   const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
   if (!st.ok) return { ok: false, committed: false, error: `读取任务工作区状态失败：${st.stderr.trim()}` }
   if (!isDirty(st.stdout)) return { ok: true, committed: false }
+  if (mode === 'refuse') {
+    return { ok: false, committed: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
+  }
   const message = opts.message ?? renderTemplate(cfg.commitMessage, { task, branch: rec.branch, base: rec.base })
   const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
   if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
@@ -552,7 +556,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
       return { ok: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
     }
   }
-  const snap = await snapshotCommit(opts, rec, task)
+  const snap = await snapshotCommit(opts, rec, task, mode)
   if (!snap.ok) return { ok: false, error: snap.error }
 
   // 2) 合并回基分支
