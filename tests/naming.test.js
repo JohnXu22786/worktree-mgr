@@ -67,6 +67,15 @@ test('slugifyTask：截断不切断非 BMP Unicode 字符', () => {
   assert.equal(validateBranch(deriveBranch(task)).ok, true)
 })
 
+test('deriveBranch：前缀较长时仍限制分支总长度', () => {
+  const prefix = 'p'.repeat(190)
+  const task = '𐐀'.repeat(60)
+  const branch = deriveBranch(task, prefix)
+
+  assert.equal(branch.length, 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
   // 截断切在 . 上：段尾残留 '.'
   assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)

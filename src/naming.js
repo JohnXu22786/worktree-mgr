@@ -12,6 +12,37 @@ const MAX_SLUG_LENGTH = 60
 const MAX_TASK_LENGTH = 200
 
 /**
+ * @param {string} slug
+ * @returns {string}
+ */
+function normalizeTruncatedSlug(slug) {
+  return slug
+    .split('/')
+    .map((seg) => seg
+      .replace(/\.{2,}/g, '-')
+      .replace(/\.lock$/g, '-lock')
+      .replace(/^\.+/g, ''))
+    .filter((seg) => seg !== '')
+    .join('/')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+}
+
+/**
+ * @param {string} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function truncateByUtf16Length(value, maxLength) {
+  let result = ''
+  for (const ch of value) {
+    if (result.length + ch.length > maxLength) break
+    result += ch
+  }
+  return result
+}
+
+/**
  * 将任意任务名规范化为分支可用的 slug（全小写、非法字符转连字符）。
  * 允许 Unicode 字母/数字（含 CJK）、下划线、点、连字符、斜杠分段。
  * 返回的 slug 一定可以通过 validateBranch 的组件级检查
@@ -44,18 +75,7 @@ export function slugifyTask(task) {
     // .lock / . / - 上，甚至切出一个空段（切在 / 后），
     // 导致派生分支违反 ref 规则（与“slug 必通过 validateBranch”的契约冲突）。
     // 对截断结果重新做一次段级修正。
-    slug = Array.from(slug)
-      .slice(0, MAX_SLUG_LENGTH)
-      .join('')
-      .split('/')
-      .map((seg) => seg
-        .replace(/\.{2,}/g, '-')
-        .replace(/\.lock$/g, '-lock')
-        .replace(/^\.+/g, ''))
-      .filter((seg) => seg !== '')
-      .join('/')
-      .replace(/-+/g, '-')
-      .replace(/^[-.]+|[-.]+$/g, '')
+    slug = normalizeTruncatedSlug(Array.from(slug).slice(0, MAX_SLUG_LENGTH).join(''))
   }
   if (slug === '' || slug === '.') return 'task'
   return slug
@@ -68,7 +88,12 @@ export function slugifyTask(task) {
  * @returns {string}
  */
 export function deriveBranch(task, prefix = 'wtm') {
-  return `${prefix}/${slugifyTask(task)}`
+  const slug = slugifyTask(task)
+  const maxSlugLength = MAX_BRANCH_LENGTH - prefix.length - 1
+  const boundedSlug = slug.length > maxSlugLength
+    ? normalizeTruncatedSlug(truncateByUtf16Length(slug, maxSlugLength))
+    : slug
+  return `${prefix}/${boundedSlug}`
 }
 
 /**
