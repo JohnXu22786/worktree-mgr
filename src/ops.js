@@ -110,6 +110,21 @@ function abortResult() {
 }
 
 /**
+ * Extract the immutable commit ID reported by `git commit`.
+ *
+ * Reading HEAD in a later git process is not safe: an external checkout can
+ * move the worktree away and back between the commit and that read.  The
+ * summary printed by the commit that actually created the object is the
+ * stable source we can pass to the merge.
+ * @param {string} text
+ * @returns {string | null}
+ */
+function parseCommittedObject(text) {
+  const match = text.match(/^\[[^\]\r\n]*\s([0-9a-f]{4,64})\]/m)
+  return match?.[1] ?? null
+}
+
+/**
  * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
  * @param {string} path
  * @returns {{exists: boolean, error?: string}}
@@ -523,13 +538,13 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
   const beforeCommitBranchCheck = await revalidateWorktreeBranch(opts, rec)
   if (!beforeCommitBranchCheck.ok) return { ok: false, committed: false, error: beforeCommitBranchCheck.error }
 
-  const commit = await git.run(['commit', '-m', message], { cwd: rec.path, signal: opts.signal })
+  const commit = await git.run(['commit', '--no-quiet', '-m', message], { cwd: rec.path, signal: opts.signal })
   if (!commit.ok) return { ok: false, committed: false, error: `快照提交失败：${commit.stderr.trim()}` }
-  const head = await git.run(['rev-parse', 'HEAD'], { cwd: rec.path, signal: opts.signal })
-  if (!head.ok || !head.stdout.trim()) {
-    return { ok: false, committed: false, error: `读取快照提交失败：${head.stderr.trim() || 'git rev-parse 失败'}` }
+  const sourceRef = parseCommittedObject(commit.stdout)
+  if (!sourceRef) {
+    return { ok: false, committed: false, error: '读取快照提交失败：git commit 未返回提交 ID' }
   }
-  return { ok: true, committed: true, sourceRef: head.stdout.trim() }
+  return { ok: true, committed: true, sourceRef }
 }
 
 /**
@@ -578,6 +593,10 @@ async function mergeIntoBase(opts, rec, task, sourceRef) {
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', taskRef, 'HEAD'], { cwd: root, signal: opts.signal })
   if (ancestor.ok) {
+    const finalBranchCheck = await revalidateWorktreeBranch(opts, rec)
+    if (!finalBranchCheck.ok) {
+      return { ok: false, merged: false, error: finalBranchCheck.error, warnings: [] }
+    }
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
   if (ancestor.code !== 1) {
@@ -604,6 +623,12 @@ async function mergeIntoBase(opts, rec, task, sourceRef) {
       error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
       warnings: [],
     }
+  }
+  // The pre-merge check cannot be atomic with git merge.  Recheck after the
+  // write so a branch switch during the merge is never reported as success.
+  const finalBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!finalBranchCheck.ok) {
+    return { ok: false, merged: true, error: finalBranchCheck.error, warnings: [] }
   }
   return { ok: true, merged: true, warnings: [] }
 }
@@ -791,6 +816,12 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     }
   }
 
+  // Both commit and abandon remove the worktree and delete the task branch.
+  // Revalidate immediately before cleanup so observed drift cannot turn those
+  // destructive operations into cleanup of an unrelated branch/worktree.
+  const beforeCleanupBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!beforeCleanupBranchCheck.ok) return { ok: false, error: beforeCleanupBranchCheck.error, warnings }
+
   // 移除工作区：commit 用安全移除，abandon 用 --force
   const removeArgs = mode === 'abandon'
     ? ['worktree', 'remove', '--force', rec.path]
@@ -802,6 +833,14 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
       error: `移除工作区失败：${remove.stderr.trim()}（如存在未跟踪文件，可改用 abandon 模式强制清理）`,
       warnings,
     }
+  }
+
+  // A direct checkout can race the final check and the remove command.  Once
+  // the worktree is gone there is nothing to validate; if it is still listed,
+  // however, refuse to delete the recorded branch after observing drift.
+  const afterRemoveBranchCheck = await checkRemovedWorktreeBranch(opts, rec)
+  if (!afterRemoveBranchCheck.ok) {
+    return { ok: false, error: afterRemoveBranchCheck.error, warnings }
   }
 
   // 删除任务分支：commit 用安全删除 -d；abandon 用 -D
@@ -829,4 +868,21 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     branchDeleted,
     warnings,
   }
+}
+
+/**
+ * Verify the cleanup result without treating a successfully removed worktree
+ * as an error.  This gives finish/abandon a postcondition when a test double
+ * or a concurrent operation leaves the path registered.
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true} | {ok: false, error: string}>}
+ */
+async function checkRemovedWorktreeBranch(opts, rec) {
+  const { root, git } = opts
+  const wl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
+  if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
+  const wt = parseWorktreeList(wl.stdout).find((w) => samePath(w.path, rec.path))
+  if (!wt) return { ok: true }
+  return checkWorktreeBranch(wt, rec)
 }
