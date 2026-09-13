@@ -15,7 +15,7 @@
 
 import { GitRunner, resolveToplevel } from '../src/git.js'
 import { loadConfig } from '../src/config.js'
-import { quoteShellArg, readRepoConfig } from '../src/tools.js'
+import { formatRecoveryCommand, readRepoConfig } from '../src/tools.js'
 import { begin, mergeTask, finishTask, listStatus, purge } from '../src/ops.js'
 
 function usage() {
@@ -121,8 +121,12 @@ function printResult(result, json) {
           const currentBranch = r.currentBranch ?? 'detached HEAD'
           state.push(
             `分支漂移（工作区当前为 ${currentBranch}，账本记录为 ${r.branch}）。` +
-            `请执行 git -C ${quoteShellArg(r.path)} switch ${quoteShellArg(r.branch)} 切回记录分支，` +
-            `或执行 wtm finish ${quoteShellArg(r.task)} --mode keep 解除管理后手动处理`,
+            `请执行 ${formatRecoveryCommand({
+              path: r.path,
+              branch: r.branch,
+              task: r.task,
+              finishCommand: 'wtm finish',
+            })} 解除管理后手动处理`,
           )
         } else if (!r.exists) state.push('工作区缺失')
         else if (r.dirty) state.push('有未提交改动')

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createToolSet, readRepoConfig } from '../src/tools.js'
+import { createToolSet, formatRecoveryCommand, quoteShellArg, readRepoConfig } from '../src/tools.js'
 import { GitRunner } from '../src/git.js'
 import { EMPTY_LEDGER, saveLedger, upsertRecord } from '../src/vault.js'
 
@@ -65,6 +65,25 @@ test('createToolSet：注册 5 个工具，参数为对象 schema 且 render 返
     assert.equal(typeof rendered[0].text, 'string')
     assert.equal(typeof t.execute, 'function')
   }
+})
+
+test('quoteShellArg：按 POSIX、cmd 与 PowerShell 语法分别保护特殊字符', () => {
+  assert.equal(quoteShellArg('wtm/needs!bang', 'posix'), "'wtm/needs!bang'")
+  assert.equal(quoteShellArg("Add 'Search' Box", 'posix'), "'Add '\\''Search'\\'' Box'")
+  assert.equal(quoteShellArg('wtm/needs$bang', 'cmd'), '"wtm/needs$bang"')
+  assert.equal(quoteShellArg('wtm/needs$bang', 'powershell'), "'wtm/needs$bang'")
+})
+
+test('formatRecoveryCommand：Windows 同时提供 cmd 与 PowerShell 可执行提示', () => {
+  const text = formatRecoveryCommand({
+    path: 'C:\\work tree',
+    branch: 'wtm/needs$bang',
+    task: 'Add Search Box',
+    finishCommand: 'wtm finish',
+    platform: 'win32',
+  })
+  assert.match(text, /cmd\.exe: git -C "C:\\work tree" switch "wtm\/needs\$bang"/)
+  assert.match(text, /PowerShell: git -C 'C:\\work tree' switch 'wtm\/needs\$bang'/)
 })
 
 test('wtm_purge：渲染分支删除状态和收尾警告', () => {
@@ -279,8 +298,14 @@ test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区�
     const text = rendered[0].text
     assert.match(text, /分支漂移/)
     assert.doesNotMatch(text, /工作区缺失/)
-    assert.match(text, /git -C ".+" switch "wtm\/add-search\\\$box"/)
-    assert.match(text, /wtm_finish "Add Search Box" --mode keep/)
+    if (process.platform === 'win32') {
+      assert.match(text, /cmd\.exe: git -C ".+" switch "wtm\/add-search\$box"/)
+      assert.match(text, /PowerShell: git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish "Add Search Box" --mode keep/)
+    } else {
+      assert.match(text, /git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish 'Add Search Box' --mode keep/)
+    }
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

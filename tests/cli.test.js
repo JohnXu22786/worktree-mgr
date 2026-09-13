@@ -72,7 +72,7 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
   }
 })
 
-test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作区缺失', { skip: process.platform === 'win32' }, () => {
+test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作区缺失', () => {
   const root = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-'))
   const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-vault-'))
   const task = 'Add Search Box'
@@ -96,8 +96,14 @@ test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作�
     assert.equal(status.status, 0, `${status.stderr}\n${status.stdout}`)
     assert.doesNotMatch(status.stdout, /工作区缺失/)
     assert.match(status.stdout, /分支漂移/)
-    assert.match(status.stdout, /git -C ".+" switch "wtm\/add-search-box"/)
-    assert.match(status.stdout, /wtm finish "Add Search Box" --mode keep/)
+    if (process.platform === 'win32') {
+      assert.match(status.stdout, /cmd\.exe: git -C ".+" switch "wtm\/add-search-box"/)
+      assert.match(status.stdout, /PowerShell: git -C '.+' switch 'wtm\/add-search-box'/)
+      assert.match(status.stdout, /wtm finish "Add Search Box" --mode keep/)
+    } else {
+      assert.match(status.stdout, /git -C '.+' switch 'wtm\/add-search-box'/)
+      assert.match(status.stdout, /wtm finish 'Add Search Box' --mode keep/)
+    }
   } finally {
     if (existsSync(taskPath)) {
       execFileSync('git', ['-C', root, 'worktree', 'remove', '--force', taskPath], { stdio: 'ignore' })
