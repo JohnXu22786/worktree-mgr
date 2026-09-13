@@ -31,6 +31,13 @@ test('CLI：finish 的 --mode 缺少值时拒绝执行，不采用默认 commit'
   assert.match(result.stderr, /--mode.*缺少值/)
 })
 
+test('CLI：finish 的未知选项拒绝执行，不采用默认 commit', () => {
+  const result = runCli(['finish', 'task', '--modee', 'abandon'], process.cwd())
+
+  assert.equal(result.status, 2)
+  assert.match(result.stderr, /未知选项：--modee/)
+})
+
 test('CLI：begin 的 --base 缺少值时在解析阶段报错', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-base-'))
   try {
