@@ -198,3 +198,16 @@ test('validateTask：非空且长度受限', () => {
   assert.equal(validateTask('   ').ok, false)
   assert.equal(validateTask('x'.repeat(500)).ok, false)
 })
+
+test('validateTask：拒绝 Windows 保留设备名工作区段', () => {
+  const reserved = ['CON', 'Aux', 'NUL.txt', 'PRN.log', 'COM1', 'lpt9', 'nested/CON', 'foo/com1.txt/bar']
+  for (const task of reserved) {
+    const result = validateTask(task)
+    assert.equal(result.ok, false, `应拒绝 Windows 设备名任务: ${task}`)
+    assert.match(result.reason ?? '', /Windows.*设备名/)
+  }
+
+  for (const task of ['COM10', 'LPT0', 'CONSOLE', 'my-con']) {
+    assert.equal(validateTask(task).ok, true, `不应误拒绝普通任务名: ${task}`)
+  }
+})

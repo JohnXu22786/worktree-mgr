@@ -206,6 +206,17 @@ test('begin：任务名非法直接报错，不执行任何 git 写操作', asyn
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('begin：Windows 设备名任务在任何 git 调用前拒绝', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const r = await begin({ root: 'C:/repo', task: 'CON', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /Windows.*设备名/)
+  assert.equal(git.calls.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('begin：显式分支非法报错', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
