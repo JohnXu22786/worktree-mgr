@@ -728,6 +728,22 @@ test('purge：commit 模式执行 on_merge 触发器', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('purge：保留收尾警告并报告分支删除失败', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], FAIL('branch is not fully merged'))
+
+  const r = await purge({ root: 'C:/repo', tasks: ['T'], mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, true)
+  const result = r.results?.[0]
+  assert.ok(result, '应有 T 的收尾结果')
+  assert.equal(result.branchDeleted, false)
+  assert.ok(result.warnings?.some((w) => /分支删除失败/.test(w)), JSON.stringify(result))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('purge：批量清理，逐任务报告，单个失败不中断', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)

@@ -88,7 +88,7 @@ import { runTriggers } from './triggers.js'
  * @property {boolean} [branchDeleted]
  * @property {string[]} [warnings]
  * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
- * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean}>} [results]
+ * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean, branchDeleted?: boolean, warnings?: string[]}>} [results]
  */
 
 const MERGE_MODES = new Set(['commit', 'refuse'])
@@ -435,7 +435,16 @@ export async function purge(opts) {
           continue
         }
         const r = await finishCore(opts, { vault, ledger, rec: item.rec, mode })
-        results.push({ task: item.rec.task, ok: r.ok, error: r.error, note: r.note, merged: r.merged, committed: r.committed })
+        results.push({
+          task: item.rec.task,
+          ok: r.ok,
+          error: r.error,
+          note: r.note,
+          merged: r.merged,
+          committed: r.committed,
+          branchDeleted: r.branchDeleted,
+          warnings: r.warnings,
+        })
       }
       return { ok: true, results }
     })
