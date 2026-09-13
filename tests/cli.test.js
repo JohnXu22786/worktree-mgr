@@ -24,6 +24,37 @@ function runCli(args, cwd) {
   })
 }
 
+test('CLI：单任务命令拒绝多余的位置参数', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-positionals-'))
+  try {
+    for (const [command, args] of [
+      ['begin', ['Task A', 'typo']],
+      ['merge', ['Task A', 'typo']],
+      ['finish', ['Task A', 'typo']],
+      ['status', ['unexpected']],
+    ]) {
+      const result = runCli([command, ...args], cwd)
+
+      assert.equal(result.status, 2, `${command} should reject extra positional arguments`)
+      assert.match(result.stderr, /位置参数/)
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：purge 保留多任务位置参数', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-positionals-'))
+  try {
+    const result = runCli(['purge', 'Task A', 'Task B'], cwd)
+
+    assert.notEqual(result.status, 2)
+    assert.doesNotMatch(result.stderr, /位置参数/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test('CLI：finish 的 --mode 缺少值时拒绝执行，不采用默认 commit', () => {
   const result = runCli(['finish', 'task', '--mode'], process.cwd())
 

@@ -159,6 +159,12 @@ async function main() {
     process.stderr.write(`错误：${error}\n`)
     return 2
   }
+  const maxPositionals = command === 'purge' ? Infinity : command === 'status' ? 0 : 1
+  if (positional.length > maxPositionals) {
+    const expected = maxPositionals === 0 ? '不接受位置参数' : `最多接受 ${maxPositionals} 个位置参数`
+    process.stderr.write(`错误：命令 ${command} ${expected}\n`)
+    return 2
+  }
   const json = options.json === true
   const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
 
