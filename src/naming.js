@@ -11,6 +11,7 @@ const MAX_BRANCH_BYTES = 255
 const MAX_SLUG_LENGTH = 60
 const MIN_SLUG_UTF8_BYTES = 4
 const MAX_TASK_LENGTH = 200
+const WINDOWS_DEVICE_NAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/u
 
 /**
  * @param {string} slug
@@ -170,6 +171,12 @@ export function validateTask(task) {
   }
   if (task.length > MAX_TASK_LENGTH) {
     return { ok: false, reason: `任务名超过 ${MAX_TASK_LENGTH} 字符` }
+  }
+  const deviceName = slugifyTask(task)
+    .split('/')
+    .find((segment) => WINDOWS_DEVICE_NAME_RE.test(segment))
+  if (deviceName) {
+    return { ok: false, reason: `任务名会生成 Windows 保留设备名工作区目录: ${deviceName}` }
   }
   return { ok: true }
 }
