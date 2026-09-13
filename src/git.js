@@ -65,12 +65,12 @@ export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
         aborted,
       })
     })
-    child.on('close', (code, codeSig) => {
+    child.on('close', (code) => {
       if (abortPending) {
         done({ ok: false, code: -1, aborted: true })
         return
       }
-      done({ ok: code === 0, code, aborted: codeSig !== null })
+      done({ ok: code === 0, code, aborted: false })
     })
   })
 }

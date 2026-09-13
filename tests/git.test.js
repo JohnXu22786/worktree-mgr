@@ -207,6 +207,31 @@ test('runGit：AbortError 后等待 close 再完成', async () => {
   })
 })
 
+test('runGit：未中止的 AbortSignal 遇到外部 SIGTERM/SIGKILL 时不标记 aborted', async () => {
+  for (const codeSig of ['SIGTERM', 'SIGKILL']) {
+    let child = /** @type {any} */ (null)
+    const spawnImpl = () => {
+      child = new EventEmitter()
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => child.emit('close', null, codeSig))
+      return child
+    }
+    const ac = new AbortController()
+
+    const result = await runGit(['status'], { signal: ac.signal, spawnImpl })
+
+    assert.equal(ac.signal.aborted, false)
+    assert.deepEqual(result, {
+      ok: false,
+      code: null,
+      stdout: '',
+      stderr: '',
+      aborted: false,
+    })
+  }
+})
+
 test('GitRunner.run：真实 git 可用时返回结构 {ok, code, stdout, stderr}', { skip: !GitRunner.probe() }, async () => {
   const git = new GitRunner()
   const r = await git.run(['--version'], { cwd: process.cwd() })
