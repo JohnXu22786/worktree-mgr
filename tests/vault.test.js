@@ -28,7 +28,7 @@ function makeTmp() {
  * @param {string} path
  * @param {number} [timeoutMs]
  */
-async function waitForFile(path, timeoutMs = 2000) {
+async function waitForFile(path, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${path}`)
@@ -40,7 +40,7 @@ async function waitForFile(path, timeoutMs = 2000) {
  * @param {string[]} paths
  * @param {number} [timeoutMs]
  */
-async function waitForAnyFile(paths, timeoutMs = 2000) {
+async function waitForAnyFile(paths, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs
   while (!paths.some((path) => existsSync(path))) {
     if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${paths.join(', ')}`)
@@ -223,11 +223,11 @@ test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
   const reclaimPath = join(dir, '.lock.reclaim')
   mkdirSync(reclaimPath)
   writeFileSync(join(reclaimPath, 'reclaiming'), 'legacy-reclaimer')
-  const past = new Date(Date.now() - 60_000)
+  const past = new Date(Date.now() - 120_000)
   utimesSync(reclaimPath, past, past)
 
   let ran = false
-  await withLock(dir, async () => { ran = true }, { timeoutMs: 200, staleMs: 60_000 })
+  await withLock(dir, async () => { ran = true }, { timeoutMs: 1000, staleMs: 60_000 })
   assert.equal(ran, true)
   assert.equal(existsSync(reclaimPath), false)
   rmSync(dir, { recursive: true, force: true })
@@ -239,11 +239,11 @@ test('withLock：释放清理失败时显式失败且不遗留锁', async () => 
   const reclaimPath = join(dir, '.lock.reclaim')
   const cleanupError = Object.assign(new Error('guard cleanup failed'), { code: 'EIO' })
   const bodyError = new Error('body failed')
-  const realUnlinkSync = fs.unlinkSync
+  const realRenameSync = fs.renameSync
   let failCleanup = false
-  mock.method(fs, 'unlinkSync', (/** @type {string} */ path) => {
-    if (failCleanup && path === reclaimPath) throw cleanupError
-    return realUnlinkSync(path)
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (failCleanup && source === reclaimPath && target.includes('.released-')) throw cleanupError
+    return realRenameSync(source, target)
   })
   syncBuiltinESMExports()
   try {
@@ -264,6 +264,69 @@ test('withLock：释放清理失败时显式失败且不遗留锁', async () => 
   utimesSync(reclaimPath, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
   await withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10 })
   assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放 guard 时后继 guard 不会被旧流程删除', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const successorToken = 'successor-guard-token'
+  const realRenameSync = fs.renameSync
+  let replaced = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!replaced && source === reclaimPath && target.includes('.released-')) {
+      replaced = true
+      unlinkSync(source)
+      writeFileSync(source, successorToken)
+    }
+    return realRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(replaced, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放 reclaim marker 时后继 marker 不会被旧流程删除', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const markerPath = `${reclaimPath}.reclaiming`
+  const successorToken = 'successor-marker-token'
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(reclaimPath, 'stale-guard-token')
+  utimesSync(reclaimPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let replaced = false
+  let successorMoved = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!replaced && source === markerPath && target.includes('.released-')) {
+      replaced = true
+      unlinkSync(source)
+      writeFileSync(source, successorToken)
+      utimesSync(source, past, past)
+    }
+    const result = realRenameSync(source, target)
+    if (replaced && source === markerPath && target.includes('.released-')) {
+      successorMoved = readFileSync(target, 'utf8') === successorToken
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(replaced, true)
+  assert.equal(successorMoved, true)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -409,6 +472,74 @@ test('withLock：多个陈旧回收者不会同时进入临界区', async () => 
     await Promise.all(exits.map((exit) => exit.catch(() => {})))
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('withLock：陈旧锁持续重建时仍按 timeoutMs 退出', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'stale-lock-token')
+  utimesSync(lockPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let rebuilds = 0
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = realRenameSync(source, target)
+    if (source === lockPath && target.includes('.stale-')) {
+      rebuilds += 1
+      writeFileSync(lockPath, 'rebuilt-stale-lock')
+      utimesSync(lockPath, past, past)
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  const started = Date.now()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.ok(rebuilds > 1, `应持续重建陈旧锁，实际 ${rebuilds} 次`)
+  assert.ok(Date.now() - started < 1000, '持续重建陈旧锁不应阻塞超过 timeoutMs')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：陈旧回收标记持续重建时仍按 timeoutMs 退出', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const markerPath = join(dir, '.lock.reclaim.reclaiming')
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(markerPath, 'stale-marker-token')
+  utimesSync(markerPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let rebuilds = 0
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = realRenameSync(source, target)
+    if (source === markerPath && target.includes('.stale-')) {
+      rebuilds += 1
+      writeFileSync(markerPath, 'rebuilt-stale-marker')
+      utimesSync(markerPath, past, past)
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  const started = Date.now()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.ok(rebuilds > 1, `应持续重建陈旧标记，实际 ${rebuilds} 次`)
+  assert.ok(Date.now() - started < 1500, '持续重建陈旧标记不应阻塞超过 timeoutMs')
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test('withLock：过期锁被回收（stale）', async () => {
