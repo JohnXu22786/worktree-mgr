@@ -584,6 +584,33 @@ test('finishTask：移除工作区失败时保留 on_merge 触发器警告', asy
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('finishTask：任务分支已合并时跳过 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], OK())
+  git.on(['worktree', 'remove', join(vault, 't')], OK())
+  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  let triggerCalls = 0
+
+  const r = await finishTask({
+    root: 'C:/repo',
+    task: 'T',
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['deploy.sh'] } },
+    triggerSpawn: () => {
+      triggerCalls += 1
+      throw new Error('on_merge should not run for an already-merged branch')
+    },
+  })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.merged, false)
+  assert.equal(triggerCalls, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 清记录', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
@@ -914,6 +941,31 @@ test('mergeTask：任务分支已合并时跳过重复合并（重试不再产�
   assert.equal(r.merged, false)
   assert.ok((r.warnings ?? []).some((w) => /已包含/.test(w)))
   assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：任务分支已合并时跳过 on_merge 触发器', async () => {
+  const tmp = makeTmp()
+  const { cfg, git } = mergeFixture(tmp)
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], OK())
+  let triggerCalls = 0
+
+  const r = await mergeTask({
+    root: 'C:/repo',
+    task: 'T',
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['deploy.sh'] } },
+    triggerSpawn: () => {
+      triggerCalls += 1
+      throw new Error('on_merge should not run for an already-merged branch')
+    },
+  })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.merged, false)
+  assert.equal(triggerCalls, 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
