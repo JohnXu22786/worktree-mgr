@@ -555,11 +555,22 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  // The checks above are necessarily asynchronous preflights. Install a
-  // merge-time guard so Git itself refuses to create the merge commit if the
-  // branch or worktree changes in the remaining gap. `pre-merge-commit` runs
-  // inside `git merge`, after the merge is prepared but before HEAD moves.
-  const guard = createMergeGuard()
+  // The checks above are necessarily asynchronous preflights. Install
+  // merge-time guards so Git itself refuses to create the merge commit if the
+  // branch or worktree changes in the remaining gap. The reference-transaction
+  // hook runs during the prepared phase while Git holds the ref transaction
+  // locks, immediately before it updates HEAD and the base branch.
+  let guard
+  try {
+    guard = await createMergeGuard(root, git, opts.signal, rec.base)
+  } catch (err) {
+    return {
+      ok: false,
+      merged: false,
+      error: `准备合并保护钩子失败：${/** @type {Error} */ (err).message}`,
+      warnings: [],
+    }
+  }
   try {
     const merge = await git.run(
       ['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message],
@@ -590,16 +601,37 @@ async function mergeIntoBase(opts, rec, task) {
 }
 
 /**
- * 创建一次性的 Git merge hook。Git 持有 merge/index 状态时运行该 hook，
- * 因而分支与工作区状态的最后一道检查属于同一次 merge 操作，而不是两个
- * 可被另一个 checkout 或写入插入的 Node.js await。
- * @returns {{hooksPath: string}}
+ * 创建一次性的 Git merge hooks。Git 的 reference-transaction hook 在
+ * prepared 阶段执行最终校验；其他 wrapper 则把仓库原有 hooks 链接回来，
+ * 避免临时 core.hooksPath 改变仓库行为。
+ * @param {string} root
+ * @param {{run: Function}} git
+ * @param {AbortSignal | undefined} signal
+ * @param {string} expectedBase
+ * @returns {Promise<{hooksPath: string}>}
  */
-function createMergeGuard() {
+async function createMergeGuard(root, git, signal, expectedBase) {
+  const hooks = await git.run(['rev-parse', '--git-path', 'hooks'], { cwd: root, signal })
+  if (!hooks.ok) {
+    throw new Error(`读取仓库 hooks 路径失败：${hooks.stderr.trim() || 'git rev-parse 失败'}`)
+  }
+  const originalHooksPath = resolve(root, hooks.stdout.trim())
   const hooksPath = mkdtempSync(join(tmpdir(), 'wtm-merge-hooks-'))
   try {
-    const hookPath = join(hooksPath, 'pre-merge-commit')
-    writeFileSync(hookPath, `#!/bin/sh
+    const guardPath = join(hooksPath, 'wtm-merge-guard')
+    const baseRef = `refs/heads/${expectedBase}`
+    /** @param {string} value */
+    const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`
+    /** @param {string} name */
+    const originalHook = (name) => quote(join(originalHooksPath, name))
+    /** @param {string} name @param {string} body */
+    const writeHook = (name, body) => {
+      const hookPath = join(hooksPath, name)
+      writeFileSync(hookPath, body, 'utf8')
+      chmodSync(hookPath, 0o755)
+    }
+
+    writeHook('wtm-merge-guard', `#!/bin/sh
 state=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch) || {
   echo "wtm: unable to read base worktree state during merge" >&2
   exit 1
@@ -633,8 +665,52 @@ if [ "$actual_tree" != "$expected_tree" ]; then
   exit 1
 fi
 exit 0
-`, 'utf8')
-    chmodSync(hookPath, 0o755)
+`)
+
+    // Git's built-in fallback runs pre-commit when pre-merge-commit is absent.
+    // Preserve that behavior through the wrapper as well.
+    writeHook('pre-merge-commit', `#!/bin/sh
+guard=${quote(guardPath)}
+"$guard" "$@" || exit $?
+hook=${originalHook('pre-merge-commit')}
+if [ ! -x "$hook" ]; then hook=${originalHook('pre-commit')}; fi
+if [ -x "$hook" ]; then "$hook" "$@" || exit $?; fi
+exit 0
+`)
+
+    writeHook('commit-msg', `#!/bin/sh
+hook=${originalHook('commit-msg')}
+if [ -x "$hook" ]; then exec "$hook" "$@"; fi
+exit 0
+`)
+
+    writeHook('post-merge', `#!/bin/sh
+hook=${originalHook('post-merge')}
+if [ -x "$hook" ]; then exec "$hook" "$@"; fi
+exit 0
+`)
+
+    // reference-transaction receives its input on stdin. Save it so the
+    // repository hook sees the exact same stream before the final guard runs.
+    writeHook('reference-transaction', `#!/bin/sh
+input=$(mktemp "\${TMPDIR:-/tmp}/wtm-reference-transaction.XXXXXX") || {
+  echo 'wtm: unable to create reference transaction input' >&2
+  exit 1
+}
+cleanup() { rm -f "$input"; }
+trap cleanup 0 HUP INT TERM
+cat >"$input" || exit 1
+hook=${originalHook('reference-transaction')}
+if [ -x "$hook" ]; then
+  "$hook" "$@" <"$input" || exit $?
+fi
+if [ "$1" = prepared ] && awk -v ref=${quote(baseRef)} '$3 == ref { found = 1 } END { exit found ? 0 : 1 }' "$input"; then
+  guard=${quote(guardPath)}
+  "$guard" || exit $?
+fi
+exit 0
+`)
+
     return { hooksPath }
   } catch (err) {
     rmSync(hooksPath, { recursive: true, force: true })

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,23 +42,20 @@ function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
 }
 
-class MergeRaceGit extends GitRunner {
-  /**
-   * @param {() => void} beforeMerge
-   */
-  constructor(beforeMerge) {
-    super()
-    this.beforeMerge = beforeMerge
-  }
+/** @param {string} value */
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`
+}
 
-  /**
-   * @param {string[]} args
-   * @param {any} opts
-   */
-  async run(args, opts) {
-    if (args[0] === 'merge') this.beforeMerge()
-    return super.run(args, opts)
-  }
+/**
+ * @param {string} root
+ * @param {string} name
+ * @param {string} body
+ */
+function installHook(root, name, body) {
+  const path = join(root, '.git', 'hooks', name)
+  writeFileSync(path, body, 'utf8')
+  chmodSync(path, 0o755)
 }
 
 test('集成：非 Git 目录的未知命令先报用法错误', () => {
@@ -339,7 +336,7 @@ test('集成：merge 在基分支脏时拒绝', { skip: !HAS_GIT, timeout: 12000
   }
 })
 
-test('集成：merge 启动后基分支产生非冲突改动时由 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+test('集成：现有 commit-msg hook 在早期校验后弄脏基分支时由事务 guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()
   const cfg = {
@@ -349,15 +346,20 @@ test('集成：merge 启动后基分支产生非冲突改动时由 merge-time gu
     warnings: [],
   }
   let worktreePath
-  const git = new MergeRaceGit(() => writeFileSync(join(root, 'a.txt'), 'base\n+race\n'))
+  const git = new GitRunner()
   try {
     const b = await begin({ root, task: 'Merge Guard Edit', cfg, git, repo: null })
     assert.equal(b.ok, true, b.error ?? '')
     worktreePath = /** @type {string} */ (b.path)
     writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    installHook(root, 'commit-msg', `#!/bin/sh
+printf '%s\\n' 'base' '+race' > ${shellQuote(join(root, 'a.txt'))}
+`)
     const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
 
-    const m = await mergeTask({ root, task: 'Merge Guard Edit', mode: 'commit', cfg, git, repo: null })
+    const m = await mergeTask({ root, task: 'Merge Guard Edit', mode: 'refuse', cfg, git, repo: null })
 
     assert.equal(m.ok, false)
     assert.match(m.error ?? '', /合并失败|dirty|脏|未提交/)
@@ -372,7 +374,7 @@ test('集成：merge 启动后基分支产生非冲突改动时由 merge-time gu
   }
 })
 
-test('集成：merge 启动后主工作区切换分支时由 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+test('集成：临时 merge hooks 保留仓库原有 pre-merge、commit-msg、post-merge hooks', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()
   const cfg = {
@@ -382,26 +384,34 @@ test('集成：merge 启动后主工作区切换分支时由 merge-time guard �
     warnings: [],
   }
   let worktreePath
-  const git = new MergeRaceGit(() => {
-    assert.equal(gitOk(['checkout', '-b', 'develop'], root).status, 0)
-  })
+  const git = new GitRunner()
   try {
-    const b = await begin({ root, task: 'Merge Guard Checkout', cfg, git, repo: null })
+    const b = await begin({ root, task: 'Merge Hook Chain', cfg, git, repo: null })
     assert.equal(b.ok, true, b.error ?? '')
     worktreePath = /** @type {string} */ (b.path)
     writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
-    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    const hookLog = join(vault, 'hook-log')
+    installHook(root, 'pre-merge-commit', `#!/bin/sh
+printf '%s\\n' pre-merge >> ${shellQuote(hookLog)}
+`)
+    installHook(root, 'commit-msg', `#!/bin/sh
+printf '%s\\n' commit-msg >> ${shellQuote(hookLog)}
+`)
+    installHook(root, 'post-merge', `#!/bin/sh
+printf '%s\\n' post-merge >> ${shellQuote(hookLog)}
+`)
 
-    const m = await mergeTask({ root, task: 'Merge Guard Checkout', mode: 'commit', cfg, git, repo: null })
+    const m = await mergeTask({ root, task: 'Merge Hook Chain', mode: 'refuse', cfg, git, repo: null })
 
-    assert.equal(m.ok, false)
-    assert.match(m.error ?? '', /合并失败|branch|分支/)
-    assert.equal(gitOk(['branch', '--show-current'], root).stdout.trim(), 'develop')
-    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+    assert.equal(m.ok, true, m.error ?? '')
+    assert.equal(m.merged, true)
+    assert.equal(readFileSync(hookLog, 'utf8'), 'pre-merge\ncommit-msg\npost-merge\n')
   } finally {
     gitOk(['merge', '--abort'], root)
     if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
-    gitOk(['branch', '-D', 'wtm/merge-guard-checkout'], root)
+    gitOk(['branch', '-D', 'wtm/merge-hook-chain'], root)
     rmSync(root, { recursive: true, force: true })
     rmSync(vault, { recursive: true, force: true })
   }

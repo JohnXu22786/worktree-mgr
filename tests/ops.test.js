@@ -438,6 +438,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   git.on(['branch', '--show-current'], OK('main\n'))
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
+  git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   return { cfg, git, vault }
 }
 
@@ -963,6 +964,7 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   git.on(['status', '--porcelain'], OK(''))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t1', '-m', 'fold T1 into main'], OK('merged'))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t2', '-m', 'fold T2 into main'], FAIL('conflict'))
+  git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   git.on(['worktree', 'remove', join(cfg.vault, 't1')], OK())
   git.on(['worktree', 'remove', join(cfg.vault, 't2')], OK())
   git.on(['branch', '-d', 'wtm/t1'], OK())
