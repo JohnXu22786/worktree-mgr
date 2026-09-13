@@ -75,7 +75,8 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
 test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作区缺失', { skip: process.platform === 'win32' }, () => {
   const root = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-'))
   const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-vault-'))
-  const taskPath = join(vault, 'branch-drift')
+  const task = 'Add Search Box'
+  const taskPath = join(vault, 'add-search-box')
   try {
     execFileSync('git', ['init', '--quiet', '-b', 'main', root])
     execFileSync('git', ['-C', root, 'config', 'user.name', 'wtm-test'])
@@ -85,7 +86,7 @@ test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作�
     execFileSync('git', ['-C', root, 'commit', '--quiet', '-m', 'init'])
     writeFileSync(join(root, '.wtm.json'), JSON.stringify({ vault }))
 
-    const begin = runCli(['begin', 'branch-drift', '--root', root], root)
+    const begin = runCli(['begin', task, '--root', root], root)
     assert.equal(begin.status, 0, begin.stderr)
     assert.equal(existsSync(taskPath), true)
 
@@ -95,8 +96,8 @@ test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作�
     assert.equal(status.status, 0, `${status.stderr}\n${status.stdout}`)
     assert.doesNotMatch(status.stdout, /工作区缺失/)
     assert.match(status.stdout, /分支漂移/)
-    assert.match(status.stdout, /git -C ".+" switch wtm\/branch-drift/)
-    assert.match(status.stdout, /wtm finish branch-drift --mode keep/)
+    assert.match(status.stdout, /git -C ".+" switch "wtm\/add-search-box"/)
+    assert.match(status.stdout, /wtm finish "Add Search Box" --mode keep/)
   } finally {
     if (existsSync(taskPath)) {
       execFileSync('git', ['-C', root, 'worktree', 'remove', '--force', taskPath], { stdio: 'ignore' })

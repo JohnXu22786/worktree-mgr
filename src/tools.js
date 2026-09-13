@@ -51,6 +51,15 @@ export function readRepoConfig(root) {
 }
 
 /**
+ * Quote a value for a POSIX shell command shown in recovery guidance.
+ * @param {string} value
+ * @returns {string}
+ */
+export function quoteShellArg(value) {
+  return '"' + value.replace(/["\\$`!]/g, (char) => '\\' + char) + '"'
+}
+
+/**
  * 工具定义形态（dsh 工具约定）。
  * @typedef {object} ToolDef
  * @property {string} name
@@ -333,7 +342,8 @@ export function createToolSet(opts) {
             const currentBranch = r.currentBranch ?? 'detached HEAD'
             state.push(
               `分支漂移（工作区当前为 ${currentBranch}，账本记录为 ${r.branch}）。` +
-              `请在工作区切回 ${r.branch}（git switch ${r.branch}），或用 wtm_finish --mode keep 解除管理后手动处理`,
+              `请执行 git -C ${quoteShellArg(r.path)} switch ${quoteShellArg(r.branch)} 切回记录分支，` +
+              `或用 wtm_finish ${quoteShellArg(r.task)} --mode keep 解除管理后手动处理`,
             )
           } else if (!r.exists) state.push('工作区缺失')
           else {

@@ -254,7 +254,7 @@ test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区�
     mkdirSync(taskPath, { recursive: true })
     const ledger = structuredClone(EMPTY_LEDGER)
     upsertRecord(ledger, {
-      task: 'T', branch: 'wtm/t', base: 'main', path: taskPath,
+      task: 'Add Search Box', branch: 'wtm/add-search$box', base: 'main', path: taskPath,
       createdAt: 'c', updatedAt: 'u',
     })
     saveLedger(vault, ledger)
@@ -279,7 +279,8 @@ test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区�
     const text = rendered[0].text
     assert.match(text, /分支漂移/)
     assert.doesNotMatch(text, /工作区缺失/)
-    assert.match(text, /切回.*wtm\/t|wtm_finish --mode keep/)
+    assert.match(text, /git -C ".+" switch "wtm\/add-search\\\$box"/)
+    assert.match(text, /wtm_finish "Add Search Box" --mode keep/)
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
