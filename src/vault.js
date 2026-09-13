@@ -157,7 +157,7 @@ function canonicalPath(path, seen = new Set()) {
         seen.add(candidate)
         const linkTarget = readlinkSync(candidate)
         const target = splitPath(linkTarget)
-        if (isAbsolute(linkTarget)) existing = target.root
+        existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
         pending.unshift(...target.parts)
         continue
       }

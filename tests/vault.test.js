@@ -168,6 +168,24 @@ test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('isWithin：相对符号链接目标从符号链接目录解析', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const outside = join(dir, 'outside')
+  const link = join(outside, 'link')
+  mkdirSync(root)
+  mkdirSync(join(root, 'inside'))
+  mkdirSync(outside)
+  symlinkSync('../repo/inside', link)
+
+  const vault = `${link}${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(root, 'vault')), true)
+  assert.equal(existsSync(join(outside, 'vault')), false)
+  assert.equal(isWithin(root, vault), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
   const dir = makeTmp()
   const ledger = loadLedger(dir)
