@@ -366,7 +366,12 @@ export function createToolSet(opts) {
         const results = value.results ?? []
         const lines = [`批量清理完成（${results.length} 个任务）：`, '']
         for (const r of results) {
-          lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${r.note ? `（${r.note}）` : ''}`)
+          const details = []
+          if (r.note) details.push(r.note)
+          if (r.branchDeleted === true) details.push('分支已删除')
+          if (r.branchDeleted === false) details.push('分支未删除')
+          lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${details.length > 0 ? `（${details.join('；')}）` : ''}`)
+          for (const w of r.warnings ?? []) lines.push(`  ⚠️  ${w}`)
         }
         return textBlock(lines.join('\n'))
       },

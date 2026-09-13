@@ -65,6 +65,27 @@ test('createToolSet：注册 5 个工具，参数为对象 schema 且 render 返
   }
 })
 
+test('wtm_purge：渲染分支删除状态和收尾警告', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const purge = tools.find((t) => t.name === 'wtm_purge')
+  assert.ok(purge, '工具 purge 应存在')
+
+  const rendered = purge.output.render({}, {
+    ok: true,
+    results: [{
+      task: 'T',
+      ok: true,
+      branchDeleted: false,
+      warnings: ['分支删除失败（wtm/t）：branch is not fully merged'],
+    }],
+  })
+  const text = rendered[0].text
+  assert.match(text, /T/)
+  assert.match(text, /分支未删除/)
+  assert.match(text, /分支删除失败/)
+})
+
 test('createToolSet：必填参数声明在 schema.required 中', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })
