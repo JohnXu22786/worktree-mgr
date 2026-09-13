@@ -636,13 +636,14 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     return { ok: true, note: `任务“${task}”已解除管理，工作区与分支保留`, committed: false, merged: false }
   }
 
+  // commit 与 abandon 都会移除工作区和处理任务分支，必须先确认当前工作区
+  // 仍是账本记录的分支，避免误删被切换到该目录的其他工作区或分支。
+  const branchCheck = checkWorktreeBranch(wt, rec)
+  if (!branchCheck.ok) return { ok: false, error: branchCheck.error }
+
   let committed = false
   let merged = false
   if (mode === 'commit') {
-    // commit 模式会提交改动：先校验工作区当前分支与账本记录一致，
-    // 否则快照会落在错误分支并静默丢失（与 merge 路径同一防护）
-    const branchCheck = checkWorktreeBranch(wt, rec)
-    if (!branchCheck.ok) return { ok: false, error: branchCheck.error }
     // 快照提交 + 合并（abandon 模式两者都跳过）
     const snap = await snapshotCommit(opts, rec, task)
     if (!snap.ok) return { ok: false, error: snap.error }

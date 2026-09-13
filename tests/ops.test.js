@@ -371,9 +371,9 @@ test('begin：seed 文件从主仓库复制到新工作区', async () => {
 
 /**
  * @param {string} tmp
- * @param {{taskDirty?: boolean, baseDirty?: boolean}} [opts]
+ * @param {{taskDirty?: boolean, baseDirty?: boolean, taskBranch?: string}} [opts]
  */
-function mergeFixture(tmp, { taskDirty = false, baseDirty = false } = {}) {
+function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 'wtm/t' } = {}) {
   const cfg = baseCfg(tmp)
   const git = new FakeGit()
   const vault = cfg.vault
@@ -385,7 +385,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false } = {}) {
   })
   saveLedger(vault, ledger)
   mkdirSync(join(vault, 't'), { recursive: true })
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD 1'.padEnd(40, '1') + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD 2'.padEnd(40, '2') + '\nbranch refs/heads/wtm/t\n'))
+  git.on(['worktree', 'list', '--porcelain'], OK('worktree C:/repo\nHEAD 1'.padEnd(40, '1') + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD 2'.padEnd(40, '2') + '\nbranch refs/heads/' + taskBranch + '\n'))
   // status 答案按 cwd 区分：任务工作区脏与否 / 基工作区脏与否
   git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
     if (ctx.cwd === join(vault, 't')) return taskDirty ? OK(' M f.txt\n') : OK('')
@@ -542,6 +542,18 @@ test('finishTask：abandon 模式跳过提交与合并，强制删除', async ()
   assert.ok(git.called(['worktree', 'remove', '--force', join(vault, 't')]))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：abandon 模式发现工作区分支不一致时拒绝删除', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp, { taskBranch: 'other' })
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /分支与账本记录不一致/)
+  assert.equal(git.count(['worktree', 'remove', '--force', join(vault, 't')]), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  assert.deepEqual(loadLedger(vault).records.map((rec) => rec.branch), ['wtm/t'])
   rmSync(tmp, { recursive: true, force: true })
 })
 
