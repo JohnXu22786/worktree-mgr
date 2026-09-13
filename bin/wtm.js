@@ -46,7 +46,7 @@ function usage() {
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
  * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null}>} [rows]
- * @property {Array<{task: string, ok: boolean, error?: string, note?: string}>} [results]
+ * @property {Array<{task: string, ok: boolean, error?: string, note?: string, warnings?: string[]}>} [results]
  * @property {string[]} [warnings]
  */
 
@@ -107,6 +107,7 @@ function printResult(result, json) {
     for (const r of result.results) {
       process.stdout.write(`• ${r.task}：${r.ok ? '完成' : `失败：${r.error}`}${r.note ? `（${r.note}）` : ''}\n`)
       if (!r.ok) exitCode = 1
+      for (const w of r.warnings ?? []) process.stdout.write(`警告：${w}\n`)
     }
   }
   if (Array.isArray(result.rows)) {

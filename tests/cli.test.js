@@ -72,6 +72,43 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
   }
 })
 
+test('CLI：非 JSON purge 输出每个任务的收尾警告', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-warning-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-warning-vault-'))
+  let duplicateWorktree
+  try {
+    execFileSync('git', ['init', '--quiet', '-b', 'main', root])
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'wtm-test'])
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'wtm@example.test'])
+    writeFileSync(join(root, 'base.txt'), 'base\n')
+    execFileSync('git', ['-C', root, 'add', 'base.txt'])
+    execFileSync('git', ['-C', root, 'commit', '--quiet', '-m', 'init'])
+    writeFileSync(join(root, '.wtm.json'), JSON.stringify({ vault }))
+    execFileSync('git', ['-C', root, 'add', '.wtm.json'])
+    execFileSync('git', ['-C', root, 'commit', '--quiet', '-m', 'configure vault'])
+
+    const begin = runCli(['begin', 'purge-warning', '--root', root], root)
+    assert.equal(begin.status, 0, begin.stderr)
+
+    duplicateWorktree = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-warning-duplicate-'))
+    execFileSync('git', [
+      '-C', root, 'worktree', 'add', '--force', '--quiet', duplicateWorktree, 'wtm/purge-warning',
+    ])
+
+    const purge = runCli(['purge', 'purge-warning', '--root', root], root)
+
+    assert.equal(purge.status, 0, `${purge.stderr}\n${purge.stdout}`)
+    assert.match(purge.stdout, /• purge-warning：完成/)
+    assert.match(purge.stdout, /警告：分支删除失败（wtm\/purge-warning）/)
+  } finally {
+    if (duplicateWorktree) {
+      execFileSync('git', ['-C', root, 'worktree', 'remove', '--force', duplicateWorktree], { stdio: 'ignore' })
+    }
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
 test('CLI：非 JSON 失败时仍输出工作区回滚警告', { skip: process.platform === 'win32' }, () => {
   const root = mkdtempSync(join(tmpdir(), 'wtm-cli-rollback-'))
   const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-rollback-vault-'))
