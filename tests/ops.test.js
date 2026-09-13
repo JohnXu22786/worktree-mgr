@@ -367,9 +367,9 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
       queueMicrotask(() => {
         if (fail) {
           c.stderr.emit('data', Buffer.from('boom'))
-          c.emit('exit', 3, null)
+          c.emit('close', 3, null)
         } else {
-          c.emit('exit', 0, null)
+          c.emit('close', 0, null)
         }
       })
       return c
@@ -542,7 +542,7 @@ test('finishTask：commit 模式执行 on_merge 触发器', async () => {
       const child = /** @type {any} */ (new EventEmitter())
       child.stdout = new EventEmitter()
       child.stderr = new EventEmitter()
-      queueMicrotask(() => child.emit('exit', 0, null))
+      queueMicrotask(() => child.emit('close', 0, null))
       return child
     },
   })
@@ -744,7 +744,7 @@ test('purge：commit 模式执行 on_merge 触发器', async () => {
       const child = /** @type {any} */ (new EventEmitter())
       child.stdout = new EventEmitter()
       child.stderr = new EventEmitter()
-      queueMicrotask(() => child.emit('exit', 0, null))
+      queueMicrotask(() => child.emit('close', 0, null))
       return child
     },
   })
