@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createToolSet, readRepoConfig } from '../src/tools.js'
+import { createToolSet, formatRecoveryCommand, quoteShellArg, readRepoConfig } from '../src/tools.js'
 import { GitRunner } from '../src/git.js'
 import { EMPTY_LEDGER, saveLedger, upsertRecord } from '../src/vault.js'
 
@@ -65,6 +65,25 @@ test('createToolSet：注册 5 个工具，参数为对象 schema 且 render 返
     assert.equal(typeof rendered[0].text, 'string')
     assert.equal(typeof t.execute, 'function')
   }
+})
+
+test('quoteShellArg：按 POSIX、cmd 与 PowerShell 语法分别保护特殊字符', () => {
+  assert.equal(quoteShellArg('wtm/needs!bang', 'posix'), "'wtm/needs!bang'")
+  assert.equal(quoteShellArg("Add 'Search' Box", 'posix'), "'Add '\\''Search'\\'' Box'")
+  assert.equal(quoteShellArg('wtm/needs$bang', 'cmd'), '"wtm/needs$bang"')
+  assert.equal(quoteShellArg('wtm/needs$bang', 'powershell'), "'wtm/needs$bang'")
+})
+
+test('formatRecoveryCommand：Windows 同时提供 cmd 与 PowerShell 可执行提示', () => {
+  const text = formatRecoveryCommand({
+    path: 'C:\\work tree',
+    branch: 'wtm/needs$bang',
+    task: 'Add Search Box',
+    finishCommand: 'wtm finish',
+    platform: 'win32',
+  })
+  assert.match(text, /cmd\.exe: git -C "C:\\work tree" switch "wtm\/needs\$bang"/)
+  assert.match(text, /PowerShell: git -C 'C:\\work tree' switch 'wtm\/needs\$bang'/)
 })
 
 test('wtm_purge：渲染分支删除状态和收尾警告', () => {
@@ -244,6 +263,52 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   const rendered = status.output.render({}, value)
   assert.match(rendered[0].text, /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区缺失', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    const vault = join(tmp, 'vault')
+    const taskPath = join(vault, 't')
+    mkdirSync(taskPath, { recursive: true })
+    const ledger = structuredClone(EMPTY_LEDGER)
+    upsertRecord(ledger, {
+      task: 'Add Search Box', branch: 'wtm/add-search$box', base: 'main', path: taskPath,
+      createdAt: 'c', updatedAt: 'u',
+    })
+    saveLedger(vault, ledger)
+
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${tmp}\n`))
+    git.on(['worktree', 'list', '--porcelain'], OK(
+      `worktree ${tmp}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${taskPath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/other\n`,
+    ))
+    const tools = createToolSet({ config: { root: tmp, vault }, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+
+    const value = /** @type {{ok: boolean, rows?: Array<any>}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, true)
+    assert.equal(value.rows?.[0]?.branchDrift, true)
+    assert.equal(value.rows?.[0]?.currentBranch, 'other')
+    const rendered = status.output.render({}, value)
+    const text = rendered[0].text
+    assert.match(text, /分支漂移/)
+    assert.doesNotMatch(text, /工作区缺失/)
+    if (process.platform === 'win32') {
+      assert.match(text, /cmd\.exe: git -C ".+" switch "wtm\/add-search\$box"/)
+      assert.match(text, /PowerShell: git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish "Add Search Box" --mode keep/)
+    } else {
+      assert.match(text, /git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish 'Add Search Box' --mode keep/)
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('wtm_status：root 解析同步失败时返回结构化错误而非抛异常', async () => {

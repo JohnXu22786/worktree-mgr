@@ -87,7 +87,7 @@ import { runTriggers } from './triggers.js'
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
  * @property {string[]} [warnings]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, branchDrift: boolean, currentBranch: string | null, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
  * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean, branchDeleted?: boolean, warnings?: string[]}>} [results]
  */
 
@@ -392,7 +392,8 @@ export async function listStatus(opts) {
       // 存在性 = 注册表有该工作区、目录实际存在且仍在账本分支上；
       // 分支漂移后不能读取或统计错误分支的状态。
       const pathState = wt ? inspectPath(rec.path) : { exists: false }
-      const alive = Boolean(wt) && pathState.exists && wt?.branch === rec.branch
+      const branchDrift = Boolean(wt && pathState.exists && wt.branch !== rec.branch)
+      const alive = Boolean(wt) && pathState.exists && !branchDrift
       /** @type {boolean | null} */
       let dirty = pathState.error ? null : false
       if (pathState.error) {
@@ -415,6 +416,8 @@ export async function listStatus(opts) {
         base: rec.base,
         path: rec.path,
         exists: alive,
+        branchDrift,
+        currentBranch: wt?.branch ?? null,
         dirty,
         counts,
         updatedAt: rec.updatedAt,
