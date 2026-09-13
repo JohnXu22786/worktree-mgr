@@ -77,6 +77,9 @@ async function prepare({ args, exec, tool, git }) {
           ? process.env.WTM_ROOT
           : process.cwd()))
     resolved = await resolveToplevel(git, candidate, exec?.signal)
+    if (!resolved.ok && exec?.signal?.aborted) {
+      return { ok: false, error: '调用已取消（aborted）' }
+    }
   } catch (err) {
     return { ok: false, error: `解析仓库路径失败：${/** @type {Error} */ (err).message}` }
   }
