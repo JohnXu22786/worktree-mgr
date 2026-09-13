@@ -52,13 +52,22 @@ function usage() {
 
 const OPTIONS_REQUIRING_VALUES = new Set(['base', 'branch', 'note', 'mode', 'message', 'root'])
 const OPTIONS_WITHOUT_VALUES = new Set(['all', 'json'])
+/** @type {Record<string, Set<string>>} */
+const OPTIONS_BY_COMMAND = {
+  begin: new Set(['base', 'branch', 'note', 'root', 'json']),
+  merge: new Set(['mode', 'message', 'root', 'json']),
+  finish: new Set(['mode', 'message', 'root', 'json']),
+  status: new Set(['root', 'json']),
+  purge: new Set(['all', 'mode', 'message', 'root', 'json']),
+}
 
 /**
  * 简单参数解析：支持已知的 --key value 与 --flag（布尔），拒绝未知选项。
  * @param {string[]} argv
+ * @param {Set<string>} allowedOptions
  * @returns {{positional: string[], options: Record<string, string | boolean>, error?: string}}
  */
-function parseArgs(argv) {
+function parseArgs(argv, allowedOptions) {
   const positional = []
   /** @type {Record<string, string | boolean>} */
   const options = {}
@@ -68,6 +77,9 @@ function parseArgs(argv) {
       const key = a.slice(2)
       if (!OPTIONS_REQUIRING_VALUES.has(key) && !OPTIONS_WITHOUT_VALUES.has(key)) {
         return { positional, options, error: `未知选项 --${key}` }
+      }
+      if (!allowedOptions.has(key)) {
+        return { positional, options, error: `命令不支持选项 --${key}` }
       }
       if (OPTIONS_REQUIRING_VALUES.has(key)) {
         const next = argv[i + 1]
@@ -159,7 +171,7 @@ async function main() {
     process.stderr.write(`未知命令：${command}\n\n${usage()}\n`)
     return 2
   }
-  const { positional, options, error } = parseArgs(argv.slice(1))
+  const { positional, options, error } = parseArgs(argv.slice(1), OPTIONS_BY_COMMAND[command])
   if (error) {
     process.stderr.write(`错误：${error}\n`)
     return 2

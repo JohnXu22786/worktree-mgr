@@ -60,6 +60,26 @@ test('CLI：未知选项拒绝执行，不把后续参数当作任务', () => {
   }
 })
 
+test('CLI：各命令拒绝不支持的选项', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-command-options-'))
+  try {
+    for (const [command, args, option] of [
+      ['begin', ['--all', 'Task', '--json'], '--all'],
+      ['merge', ['--base', 'Task', '--json'], '--base'],
+      ['finish', ['--branch', 'Task', '--json'], '--branch'],
+      ['status', ['--all', '--json'], '--all'],
+      ['purge', ['--branch', 'Task', '--json'], '--branch'],
+    ]) {
+      const result = runCli([command, ...args], cwd)
+
+      assert.equal(result.status, 2, `${command} should reject ${option}`)
+      assert.match(result.stderr, /命令不支持选项.*--/)
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test('CLI：布尔选项不吞掉后续位置参数', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-positionals-'))
   try {
