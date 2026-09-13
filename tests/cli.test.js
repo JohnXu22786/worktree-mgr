@@ -95,7 +95,8 @@ test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作�
     assert.equal(status.status, 0, `${status.stderr}\n${status.stdout}`)
     assert.doesNotMatch(status.stdout, /工作区缺失/)
     assert.match(status.stdout, /分支漂移/)
-    assert.match(status.stdout, /git switch wtm\/branch-drift/)
+    assert.match(status.stdout, /git -C ".+" switch wtm\/branch-drift/)
+    assert.match(status.stdout, /wtm finish branch-drift --mode keep/)
   } finally {
     if (existsSync(taskPath)) {
       execFileSync('git', ['-C', root, 'worktree', 'remove', '--force', taskPath], { stdio: 'ignore' })

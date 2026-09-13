@@ -121,7 +121,8 @@ function printResult(result, json) {
           const currentBranch = r.currentBranch ?? 'detached HEAD'
           state.push(
             `分支漂移（工作区当前为 ${currentBranch}，账本记录为 ${r.branch}）。` +
-            `请在工作区切回 ${r.branch}（git switch ${r.branch}），或用 wtm_finish --mode keep 解除管理后手动处理`,
+            `请执行 git -C "${r.path}" switch ${r.branch} 切回记录分支，` +
+            `或执行 wtm finish ${r.task} --mode keep 解除管理后手动处理`,
           )
         } else if (!r.exists) state.push('工作区缺失')
         else if (r.dirty) state.push('有未提交改动')
