@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createToolSet } from '../src/tools.js'
+import { createToolSet, readRepoConfig } from '../src/tools.js'
 
 class FakeGit {
   /** @type {Array<{args: string[], cwd: string | undefined}>} */
@@ -193,6 +193,19 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   assert.ok(value.warnings.length >= 1, JSON.stringify(value.warnings))
   assert.match(value.warnings[0], /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('readRepoConfig：配置文件读取失败时传播文件系统错误', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    mkdirSync(join(tmp, '.wtm.json'))
+    assert.throws(() => readRepoConfig(tmp), (error) => {
+      assert.equal(error?.code, 'EISDIR')
+      return true
+    })
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('wtm_finish 必填参数与默认 mode', () => {

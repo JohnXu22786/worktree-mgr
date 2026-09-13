@@ -39,7 +39,8 @@ export function readRepoConfig(root) {
   let text
   try {
     text = readFileSync(join(root, '.wtm.json'), 'utf8')
-  } catch {
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'ENOENT') throw err
     return { config: null, warnings } // 无配置文件是常态
   }
   const parsed = parseRepoConfigText(text)
