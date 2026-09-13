@@ -516,6 +516,14 @@ async function mergeIntoBase(opts, rec, task) {
   if (ancestor.ok) {
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
+  if (ancestor.code !== 1) {
+    return {
+      ok: false,
+      merged: false,
+      error: `检查任务分支是否已合并失败：${ancestor.stderr.trim() || 'git merge-base 失败'}`,
+      warnings: [],
+    }
+  }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
   const merge = await git.run(['merge', '--no-ff', rec.branch, '-m', message], { cwd: root, signal: opts.signal })

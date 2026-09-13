@@ -53,7 +53,7 @@ class FakeGit {
 }
 
 const OK = (stdout = '', stderr = '') => ({ ok: true, code: 0, stdout, stderr })
-const FAIL = (stderr = 'nope') => ({ ok: false, code: 128, stdout: '', stderr })
+const FAIL = (stderr = 'nope', code = 128) => ({ ok: false, code, stdout: '', stderr })
 
 /** @returns {string} */
 function makeTmp() {
@@ -395,7 +395,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   git.on(['commit', '-m', 'snapshot T'], OK('[wtm/t 9999999] snapshot T'))
   // mergeIntoBase 的新检查：主工作区当前分支 == 账本基分支；任务分支未合并
   git.on(['branch', '--show-current'], OK('main\n'))
-  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], FAIL())
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
   return { cfg, git, vault }
 }
@@ -410,6 +410,19 @@ test('mergeTask：干净任务直接合并并更新记录', async () => {
   assert.ok(git.called(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main'], 'C:/repo'))
   const ledger = loadLedger(vault)
   assert.equal(ledger.records[0].updatedAt !== 'u', true)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：merge-base 致命失败时拒绝继续合并', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], FAIL('fatal: bad object wtm/t'))
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /fatal: bad object wtm\/t/)
+  assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(loadLedger(vault).records[0].updatedAt, 'u')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -703,8 +716,8 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   git.on(['worktree', 'list', '--porcelain'], OK(wt))
   // T1 正常，T2 的 merge 失败
   git.on(['branch', '--show-current'], OK('main\n'))
-  git.on(['merge-base', '--is-ancestor', 'wtm/t1', 'HEAD'], FAIL())
-  git.on(['merge-base', '--is-ancestor', 'wtm/t2', 'HEAD'], FAIL())
+  git.on(['merge-base', '--is-ancestor', 'wtm/t1', 'HEAD'], FAIL('not an ancestor', 1))
+  git.on(['merge-base', '--is-ancestor', 'wtm/t2', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['status', '--porcelain'], OK(''))
   git.on(['merge', '--no-ff', 'wtm/t1', '-m', 'fold T1 into main'], OK('merged'))
   git.on(['merge', '--no-ff', 'wtm/t2', '-m', 'fold T2 into main'], FAIL('conflict'))
