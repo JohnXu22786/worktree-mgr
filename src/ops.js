@@ -594,12 +594,14 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   warnings.push(...merged.warnings)
 
   // 3) on_merge 触发器（工作目录 = 主仓库）
-  const triggerWarnings = await runTriggers(
-    repo?.triggers?.on_merge,
-    { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
-  )
-  warnings.push(...triggerWarnings.warnings)
+  if (merged.merged) {
+    const triggerWarnings = await runTriggers(
+      repo?.triggers?.on_merge,
+      { task, branch: rec.branch, base: rec.base, path: rec.path, root },
+      { spawn: opts.triggerSpawn, cwd: root },
+    )
+    warnings.push(...triggerWarnings.warnings)
+  }
 
   // 4) 更新账本时间戳
   rec.updatedAt = nowIso()
@@ -674,12 +676,14 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
     warnings.push(...m.warnings)
-    const mergeTriggerWarnings = await runTriggers(
-      repo?.triggers?.on_merge,
-      { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-      { spawn: opts.triggerSpawn, cwd: root },
-    )
-    warnings.push(...mergeTriggerWarnings.warnings)
+    if (m.merged) {
+      const mergeTriggerWarnings = await runTriggers(
+        repo?.triggers?.on_merge,
+        { task, branch: rec.branch, base: rec.base, path: rec.path, root },
+        { spawn: opts.triggerSpawn, cwd: root },
+      )
+      warnings.push(...mergeTriggerWarnings.warnings)
+    }
   }
 
   // 移除工作区：commit 用安全移除，abandon 用 --force
