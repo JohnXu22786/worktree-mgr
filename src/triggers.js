@@ -71,6 +71,7 @@ function runOne(spawnFn, shell, args, opts) {
       resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}` })
       return
     }
+    child.stdin?.end()
     let stdout = ''
     let stderr = ''
     const stdoutDecoder = new StringDecoder('utf8')

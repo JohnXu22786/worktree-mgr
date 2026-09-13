@@ -62,6 +62,23 @@ test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () =>
   assert.deepEqual(warnings, [])
 })
 
+test('runTriggers：关闭子进程 stdin 以避免命令等待输入', async () => {
+  let stdinEnded = false
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdin = { end: () => { stdinEnded = true } }
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+
+  await runTriggers(['read-from-stdin'], {}, {
+    spawn: () => {
+      queueMicrotask(() => child.emit('close', 0, null))
+      return child
+    },
+  })
+
+  assert.equal(stdinEnded, true)
+})
+
 test('runTriggers：使用平台 shell（win32=cmd，其他=sh）', async () => {
   /** @type {Array<{cmd: string, args: string[], opts: object}>} */
   const captured = []
