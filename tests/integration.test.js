@@ -42,6 +42,25 @@ function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
 }
 
+class MergeRaceGit extends GitRunner {
+  /**
+   * @param {() => void} beforeMerge
+   */
+  constructor(beforeMerge) {
+    super()
+    this.beforeMerge = beforeMerge
+  }
+
+  /**
+   * @param {string[]} args
+   * @param {any} opts
+   */
+  async run(args, opts) {
+    if (args[0] === 'merge') this.beforeMerge()
+    return super.run(args, opts)
+  }
+}
+
 test('集成：非 Git 目录的未知命令先报用法错误', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-'))
   const cli = fileURLToPath(new URL('../bin/wtm.js', import.meta.url))
@@ -317,6 +336,74 @@ test('集成：merge 在基分支脏时拒绝', { skip: !HAS_GIT, timeout: 12000
     assert.match(readFileSync(join(root, 'a.txt'), 'utf8'), /dirty-main/)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('集成：merge 启动后基分支产生非冲突改动时由 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new MergeRaceGit(() => writeFileSync(join(root, 'a.txt'), 'base\n+race\n'))
+  try {
+    const b = await begin({ root, task: 'Merge Guard Edit', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Edit', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, false)
+    assert.match(m.error ?? '', /合并失败|dirty|脏|未提交/)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+    assert.match(readFileSync(join(root, 'a.txt'), 'utf8'), /race/)
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-guard-edit'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：merge 启动后主工作区切换分支时由 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new MergeRaceGit(() => {
+    assert.equal(gitOk(['checkout', '-b', 'develop'], root).status, 0)
+  })
+  try {
+    const b = await begin({ root, task: 'Merge Guard Checkout', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Checkout', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, false)
+    assert.match(m.error ?? '', /合并失败|branch|分支/)
+    assert.equal(gitOk(['branch', '--show-current'], root).stdout.trim(), 'develop')
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-guard-checkout'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
   }
 })
 

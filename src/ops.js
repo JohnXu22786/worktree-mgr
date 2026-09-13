@@ -6,8 +6,9 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   slugifyTask,
   deriveBranch,
@@ -554,16 +555,91 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
-  if (!merge.ok) {
-    return {
-      ok: false,
-      merged: false,
-      error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
-      warnings: [],
+  // The checks above are necessarily asynchronous preflights. Install a
+  // merge-time guard so Git itself refuses to create the merge commit if the
+  // branch or worktree changes in the remaining gap. `pre-merge-commit` runs
+  // inside `git merge`, after the merge is prepared but before HEAD moves.
+  const guard = createMergeGuard()
+  try {
+    const merge = await git.run(
+      ['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message],
+      {
+        cwd: root,
+        signal: opts.signal,
+        env: {
+          WTM_EXPECTED_BASE: rec.base,
+          WTM_MERGE_REF: `refs/heads/${rec.branch}`,
+          GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: 'core.hooksPath',
+          GIT_CONFIG_VALUE_0: guard.hooksPath,
+        },
+      },
+    )
+    if (!merge.ok) {
+      return {
+        ok: false,
+        merged: false,
+        error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
+        warnings: [],
+      }
     }
+    return { ok: true, merged: true, warnings: [] }
+  } finally {
+    rmSync(guard.hooksPath, { recursive: true, force: true })
   }
-  return { ok: true, merged: true, warnings: [] }
+}
+
+/**
+ * 创建一次性的 Git merge hook。Git 持有 merge/index 状态时运行该 hook，
+ * 因而分支与工作区状态的最后一道检查属于同一次 merge 操作，而不是两个
+ * 可被另一个 checkout 或写入插入的 Node.js await。
+ * @returns {{hooksPath: string}}
+ */
+function createMergeGuard() {
+  const hooksPath = mkdtempSync(join(tmpdir(), 'wtm-merge-hooks-'))
+  try {
+    const hookPath = join(hooksPath, 'pre-merge-commit')
+    writeFileSync(hookPath, `#!/bin/sh
+state=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch) || {
+  echo "wtm: unable to read base worktree state during merge" >&2
+  exit 1
+}
+branch=$(printf '%s\\n' "$state" | sed -n 's/^# branch.head //p')
+if [ "$branch" != "$WTM_EXPECTED_BASE" ]; then
+  printf 'wtm: base branch changed during merge (expected %s, got %s)\\n' "$WTM_EXPECTED_BASE" "$branch" >&2
+  exit 1
+fi
+if printf '%s\\n' "$state" | awk '
+  {
+    kind = substr($0, 1, 1)
+    worktree = substr($0, 4, 1)
+    if (kind == "?" || ((kind == "1" || kind == "2" || kind == "u") && worktree != ".")) dirty = 1
+  }
+  END { exit dirty ? 0 : 1 }
+'; then
+  echo 'wtm: base worktree became dirty during merge' >&2
+  exit 1
+fi
+actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
+  echo 'wtm: unable to read merge index during merge' >&2
+  exit 1
+}
+expected_tree=$(GIT_OPTIONAL_LOCKS=0 git merge-tree --write-tree HEAD "$WTM_MERGE_REF") || {
+  echo 'wtm: unable to calculate expected merge tree' >&2
+  exit 1
+}
+if [ "$actual_tree" != "$expected_tree" ]; then
+  echo 'wtm: base index became dirty during merge' >&2
+  exit 1
+fi
+exit 0
+`, 'utf8')
+    chmodSync(hookPath, 0o755)
+    return { hooksPath }
+  } catch (err) {
+    rmSync(hooksPath, { recursive: true, force: true })
+    throw err
+  }
 }
 
 /**
