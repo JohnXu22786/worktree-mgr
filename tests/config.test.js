@@ -69,6 +69,14 @@ test('loadConfig：未知配置键产生警告，seed/triggers 属于仓库文�
   assert.match(cfg.warnings[0], /bogusKey/)
 })
 
+test('loadConfig：非法 seed/triggers 类型产生警告', () => {
+  const cfg = loadConfig({
+    repoConfig: { seed: 'invalid', triggers: ['invalid'] },
+  })
+  assert.equal(cfg.warnings.length, 2)
+  assert.ok(cfg.warnings.every((warning) => /seed|triggers/.test(warning)))
+})
+
 test('renderTemplate：替换全部占位符，缺失占位符原样保留', () => {
   const out = renderTemplate('commit {task} on {base} {task}', { task: 'T', base: 'B' })
   assert.equal(out, 'commit T on B T')

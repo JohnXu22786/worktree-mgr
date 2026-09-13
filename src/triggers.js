@@ -29,7 +29,11 @@ import { StringDecoder } from 'node:string_decoder'
 export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd } = {}) {
   /** @type {string[]} */
   const warnings = []
-  if (!Array.isArray(commands)) return { warnings }
+  if (commands === undefined) return { warnings }
+  if (!Array.isArray(commands)) {
+    warnings.push('触发器配置类型无效，必须是命令数组，已忽略')
+    return { warnings }
+  }
   const isWin = process.platform === 'win32'
   for (const cmd of commands) {
     if (typeof cmd !== 'string' || cmd.trim() === '') continue

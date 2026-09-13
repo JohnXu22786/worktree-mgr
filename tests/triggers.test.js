@@ -32,6 +32,16 @@ test('runTriggers：无命令时跳过且不产生警告', async () => {
   assert.deepEqual(warnings, [])
 })
 
+test('runTriggers：非法命令配置类型产生警告', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const invalid = /** @type {any} */ ('invalid')
+  const { warnings } = await runTriggers(invalid, {}, { spawn: makeFakeSpawn(captured) })
+  assert.equal(captured.length, 0)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /触发器|类型/)
+})
+
 test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () => {
   /** @type {Array<{cmd: string, args: string[], opts: object}>} */
   const captured = []
@@ -148,4 +158,3 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   assert.equal(w2.warnings.length, 1)
   assert.match(w2.warnings[0], /SIGKILL/)
 })
-
