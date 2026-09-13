@@ -119,13 +119,18 @@ export function parseWorktreeList(text) {
     }
   }
 
-  // Legacy porcelain has no record delimiter. Use the stable HEAD line and
-  // its following field to keep newlines that belong to a worktree path.
-  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\nHEAD [0-9a-f]+(?=\r?\n(?:branch refs\/heads\/|detached(?:\r?\n|$)|bare(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))(?:\r?\n|$)/gm)]
+  // Legacy porcelain has no record delimiter. Use the stable HEAD or bare
+  // line and its following field to keep newlines that belong to a path.
+  // A bare marker is authoritative, so a HEAD-like path line immediately
+  // before it must remain part of the path.
+  // The /m flag makes $ line-relative; use (?![\s\S]) for true EOF checks.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\n(HEAD [0-9a-f]+(?=\r?\n(?:branch refs\/heads\/|detached(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))|bare(?=(?:(?:\r?\n(?:locked|prunable)(?: [^\r\n]*)?)*(?:\r?\n\r?\n(?=worktree |(?![\s\S]))|\r?\n(?![\s\S])|(?![\s\S])))))(?:\r?\n|$)/gm)]
   if (records.length > 0) {
     for (let i = 0; i < records.length; i += 1) {
       const record = records[i]
       consume(`worktree ${record[1]}`)
+      const parsed = out[out.length - 1]
+      if (record[2] === 'bare' && parsed) parsed.bare = true
       const start = (record.index ?? 0) + record[0].length
       const end = records[i + 1]?.index ?? text.length
       for (const line of text.slice(start, end).split(/\r?\n/)) consume(line)
