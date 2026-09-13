@@ -177,7 +177,8 @@ export async function begin(opts) {
       if (!baseName) {
         return { ok: false, error: '主工作区处于 detached HEAD 状态，请显式指定 base 分支' }
       }
-      const baseCheck = await git.run(['show-ref', '--verify', `refs/heads/${baseName}`], { cwd: root, signal: opts.signal })
+      const baseRef = `refs/heads/${baseName}`
+      const baseCheck = await git.run(['show-ref', '--verify', baseRef], { cwd: root, signal: opts.signal })
       if (!baseCheck.ok) {
         // 空仓库（无任何提交）时分支尚未诞生，show-ref 会失败——给出明确提示
         const headCheck = await git.run(['rev-parse', '--verify', 'HEAD'], { cwd: root, signal: opts.signal })
@@ -209,7 +210,7 @@ export async function begin(opts) {
       }
 
       // 核心动作：创建 worktree
-      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
+      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseRef], { cwd: root, signal: opts.signal })
       if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
       createdWorktree = true
 
@@ -406,7 +407,7 @@ export async function listStatus(opts) {
           dirty = null
           warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
         }
-        const rc = await git.run(['rev-list', '--left-right', '--count', `${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
+        const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
         counts = rc.ok ? parseAheadBehind(rc.stdout) : null
       }
       rows.push({

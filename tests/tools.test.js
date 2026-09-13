@@ -132,7 +132,7 @@ test('wtm_begin：经工具入口完成创建并落账本', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/new-task'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'new-task'), '-b', 'wtm/new-task', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'new-task'), '-b', 'wtm/new-task', 'refs/heads/main'], OK())
   const tools = createToolSet({ config: { root: 'C:/repo', vault: tmp }, git })
   const begin = tools.find((t) => t.name === 'wtm_begin')
   assert.ok(begin, '工具 begin 应存在')
@@ -156,7 +156,7 @@ test('wtm_begin：失败时合并并渲染操作警告', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK())
-  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'main'], () => {
+  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'refs/heads/main'], () => {
     // 让 worktree 创建后账本写入失败，从而进入 begin() 的回滚路径。
     mkdirSync(indexPath)
     return OK()
@@ -200,7 +200,7 @@ test('wtm_begin：显式 root 参数优先于配置', async () => {
     git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
     git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
     git.on(['status', '--porcelain'], OK(''))
-    git.on(['worktree', 'add', join(tmp, 't'), '-b', 'wtm/t', 'main'], OK())
+    git.on(['worktree', 'add', join(tmp, 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
     const tools = createToolSet({ config: { root: 'C:/wrong', vault: tmp }, git })
     const begin = tools.find((t) => t.name === 'wtm_begin')
     assert.ok(begin, '工具 begin 应存在')

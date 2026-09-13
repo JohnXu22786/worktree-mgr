@@ -132,7 +132,7 @@ test('begin：创建前检查：任务校验、重复任务、基分支存在、
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/add-search'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'vault', 'add-search'), '-b', 'wtm/add-search', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 'add-search'), '-b', 'wtm/add-search', 'refs/heads/main'], OK())
 
   // 重复任务
   const r1 = await begin({ root: 'C:/repo', task: 'Add Search', cfg, git, repo: null })
@@ -275,7 +275,7 @@ test('begin：基分支有未提交改动时产生警告但不中断', async () 
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(' M dirty.txt\n'))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.ok((r.warnings ?? []).some((w) => /未提交/i.test(w)))
@@ -290,13 +290,13 @@ test('begin：主工作区 git status 失败时终止创建', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], FAIL('fatal: index file smaller than expected'))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
 
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /主工作区.*状态失败/)
   assert.match(r.error ?? '', /index file smaller than expected/)
-  assert.equal(git.count(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main']), 0)
+  assert.equal(git.count(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -308,7 +308,7 @@ test('begin：worktree add 失败透传 stderr', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], FAIL('fatal: could not create worktree'))
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], FAIL('fatal: could not create worktree'))
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /could not create/)
@@ -324,7 +324,7 @@ test('begin：回滚命令返回失败对象时保留失败警告', async () => 
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'refs/heads/main'], OK())
   git.on(['worktree', 'remove', '--force', worktreePath], FAIL('fatal: cannot remove worktree'))
   git.on(['branch', '-D', 'wtm/t'], OK())
 
@@ -354,7 +354,7 @@ test('begin：执行 on_begin 触发器并附带警告', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
   const repo = { triggers: { on_begin: ['install.sh', 'fail.sh'] } }
   let triggerIdx = 0
   const r = await begin({
@@ -390,7 +390,7 @@ test('begin：seed 文件从主仓库复制到新工作区', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
   const repo = { seed: { files: ['docs/env.txt'] } }
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo })
   assert.equal(r.ok, true)
@@ -717,8 +717,8 @@ test('listStatus：计算存在性、脏状态与 ahead/behind', async () => {
     'worktree ' + join(cfg.vault, 't1') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t1\n',
   ))
   git.on(['status', '--porcelain'], OK(' M f.txt\n'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t1'], OK('1\t2'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t2'], FAIL())
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t1'], OK('1\t2'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t2'], FAIL())
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -749,7 +749,7 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
     'worktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
   ))
   git.on(['status', '--porcelain'], FAIL('fatal: damaged git metadata'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('0\t0'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], OK('0\t0'))
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -774,7 +774,7 @@ test('listStatus：工作区分支漂移时标记为不存在且不计算错误�
     'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n',
   ))
   git.on(['status', '--porcelain'], OK(' M wrong-branch.txt\n'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('1\t9'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], OK('1\t9'))
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -783,7 +783,7 @@ test('listStatus：工作区分支漂移时标记为不存在且不计算错误�
   assert.equal(r.rows[0].dirty, false)
   assert.equal(r.rows[0].counts, null)
   assert.equal(git.count(['status', '--porcelain']), 0, '分支漂移时不应读取错误工作区状态')
-  assert.equal(git.count(['rev-list', '--left-right', '--count', 'main...wtm/t']), 0, '分支漂移时不应计算错误分支计数')
+  assert.equal(git.count(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t']), 0, '分支漂移时不应计算错误分支计数')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -992,7 +992,7 @@ test('begin：seed 路径穿越被拦截并告警（不复制仓库外文件）'
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'vault', 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
   const repo = { seed: { files: ['../evil.txt', '/abs/evil.txt'] } }
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo })
   assert.equal(r.ok, true)
