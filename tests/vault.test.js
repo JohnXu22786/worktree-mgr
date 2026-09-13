@@ -13,6 +13,7 @@ import {
   loadLedger,
   saveLedger,
   withLock,
+  isWithin,
   findRecord,
   upsertRecord,
   removeRecord,
@@ -127,6 +128,16 @@ test('resolveVault：显式 vault 生效（相对路径以仓库路径解析）'
   assert.equal(resolveVault({ rootPath: 'C:/repo', vault: 'D:/v' }), 'D:/v')
   assert.equal(resolveVault({ rootPath, vault: './v' }), join(rootPath, 'v'))
   assert.equal(resolveVault({ rootPath, vault: '' }), null) // 空串视为未设置
+})
+
+test('isWithin：POSIX 下反斜杠是文件名字符而非路径分隔符', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const externalVault = join(dir, 'repo\\vault')
+  mkdirSync(root)
+  mkdirSync(externalVault)
+  assert.equal(isWithin(root, externalVault), false)
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test('loadLedger：缺失时返回空账本，不创建文件', () => {

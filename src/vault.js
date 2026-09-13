@@ -141,14 +141,15 @@ function canonicalPath(path) {
 
 /**
  * 判断 target 是否位于 parent 之内（或等于 parent）。
- * 比较前解析路径别名和符号链接；路径分隔符先归一化，Windows 下同时忽略大小写
- * （与 samePath 语义一致），防止路径变体绕过防护。
+ * 比较前解析路径别名和符号链接；仅在 Windows 下归一化路径分隔符并忽略大小写
+ * （与 samePath 语义一致），防止路径变体绕过防护。POSIX 下反斜杠是有效的文件名字符。
  * @param {string} parent
  * @param {string} target
  * @returns {boolean}
  */
 export function isWithin(parent, target) {
-  const norm = (/** @type {string} */ p) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  const norm = (/** @type {string} */ p) =>
+    (process.platform === 'win32' ? p.replace(/\\/g, '/') : p).replace(/\/+$/, '')
   let p = norm(canonicalPath(parent))
   let t = norm(canonicalPath(target))
   if (process.platform === 'win32') {
