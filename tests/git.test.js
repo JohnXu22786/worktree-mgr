@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, GitRunner } from '../src/git.js'
+import { EventEmitter } from 'node:events'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runGit, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -145,6 +146,26 @@ test('isDirty：porcelain 输出非空即脏', () => {
   assert.equal(isDirty(''), false)
   assert.equal(isDirty(' M file.txt\n'), true)
   assert.equal(isDirty('?? untracked.txt\n'), true)
+})
+
+test('runGit：跨 chunk 的 UTF-8 路径保持完整', async () => {
+  const spawnImpl = () => {
+    const child = /** @type {any} */ (new EventEmitter())
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    queueMicrotask(() => {
+      child.stdout.emit('data', Buffer.from([0xe4, 0xb8]))
+      child.stdout.emit('data', Buffer.from([0xad]))
+      child.stderr.emit('data', Buffer.from([0xc3]))
+      child.stderr.emit('data', Buffer.from([0xa9]))
+      child.emit('close', 0, null)
+    })
+    return child
+  }
+
+  const result = await runGit(['status'], { spawnImpl })
+  assert.equal(result.stdout, '中')
+  assert.equal(result.stderr, 'é')
 })
 
 test('GitRunner.run：真实 git 可用时返回结构 {ok, code, stdout, stderr}', { skip: !GitRunner.probe() }, async () => {

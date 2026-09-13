@@ -7,16 +7,17 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * 执行一条 git 命令。
  * @param {string[]} args
- * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>, spawnImpl?: typeof spawn}} [opts]
  * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
  */
-export function runGit(args, { cwd, signal, env } = {}) {
+export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(
+    const child = spawnImpl(
       'git',
       ['--no-pager', '-c', 'core.quotepath=false', ...args],
       {
@@ -29,24 +30,38 @@ export function runGit(args, { cwd, signal, env } = {}) {
     )
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    child.stdout.on('data', (d) => { stdout += stdoutDecoder.write(d) })
+    child.stderr.on('data', (d) => { stderr += stderrDecoder.write(d) })
     let settled = false
     /**
-     * @param {{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}} result
+     * @param {{ok: boolean, code: number | null, stdout?: string, stderr?: string, aborted: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
         settled = true
-        resolve(result)
+        resolve({
+          ...result,
+          stdout: result.stdout ?? stdout + stdoutDecoder.end(),
+          stderr: result.stderr ?? stderr + stderrDecoder.end(),
+        })
       }
     }
     child.on('error', (err) => {
       const aborted = err.name === 'AbortError'
-      done({ ok: false, code: -1, stdout, stderr: aborted ? '' : stderr || err.message, aborted })
+      const decodedStdout = stdout + stdoutDecoder.end()
+      const decodedStderr = stderr + stderrDecoder.end()
+      done({
+        ok: false,
+        code: -1,
+        stdout: decodedStdout,
+        stderr: aborted ? '' : decodedStderr || err.message,
+        aborted,
+      })
     })
     child.on('close', (code, codeSig) => {
-      done({ ok: code === 0, code, stdout, stderr, aborted: codeSig !== null })
+      done({ ok: code === 0, code, aborted: codeSig !== null })
     })
   })
 }
