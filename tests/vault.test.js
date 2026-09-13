@@ -312,6 +312,32 @@ test('withLock：等待期间 signal 中止时立即抛出 AbortError', async ()
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：锁获取后 signal 中止时不执行临界区并释放锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const ac = new AbortController()
+  const originalLinkSync = fs.linkSync
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = originalLinkSync(source, target)
+    ac.abort()
+    return result
+  })
+  syncBuiltinESMExports()
+  let ran = false
+  try {
+    await assert.rejects(
+      withLock(dir, async () => { ran = true }, { signal: ac.signal }),
+      (error) => error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(ran, false)
+  assert.equal(existsSync(lockPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：超时抛出 VaultError', async () => {
   const dir = makeTmp()
   mkdirSync(dir, { recursive: true })
