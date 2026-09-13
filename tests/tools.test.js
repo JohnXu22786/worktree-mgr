@@ -213,7 +213,28 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   assert.ok(value.warnings, '应有 warnings')
   assert.ok(value.warnings.length >= 1, JSON.stringify(value.warnings))
   assert.match(value.warnings[0], /\.wtm\.json/i)
+  assert.deepEqual(value.rows, [])
+  const rendered = status.output.render({}, value)
+  assert.match(rendered[0].text, /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('wtm_merge/wtm_finish/wtm_purge：失败时渲染操作警告', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const warning = '仓库配置 .wtm.json 解析失败，已忽略'
+
+  for (const name of ['wtm_merge', 'wtm_finish', 'wtm_purge']) {
+    const tool = tools.find((t) => t.name === name)
+    assert.ok(tool, `${name} 工具应存在`)
+    const rendered = tool.output.render({}, {
+      ok: false,
+      error: '操作失败',
+      warnings: [warning],
+    })
+    assert.match(rendered[0].text, /操作失败/)
+    assert.match(rendered[0].text, /\.wtm\.json/)
+  }
 })
 
 test('readRepoConfig：配置文件读取失败时传播文件系统错误', () => {
