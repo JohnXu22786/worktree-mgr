@@ -162,10 +162,17 @@ async function main() {
     return 2
   }
   const json = options.json === true
-  const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
-
   const git = new GitRunner()
-  const resolved = await resolveToplevel(git, root, undefined)
+  let resolved
+  try {
+    const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
+    resolved = await resolveToplevel(git, root, undefined)
+  } catch (err) {
+    return printResult({
+      ok: false,
+      error: `解析仓库路径失败：${/** @type {Error} */ (err).message}`,
+    }, json)
+  }
   if (!resolved.ok) {
     return printResult(resolved, json)
   }
