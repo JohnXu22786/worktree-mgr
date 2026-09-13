@@ -87,7 +87,7 @@ test('集成：base 只接受真实分支名，拒绝 revision expression', { sk
   }
 })
 
-test('集成：base 为 @ 时按字面分支创建工作区', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+test('集成：base 为 @ 时按字面分支创建工作区并统计状态', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()
   const cfg = {
@@ -103,6 +103,9 @@ test('集成：base 为 @ 时按字面分支创建工作区', { skip: !HAS_GIT, 
     writeFileSync(join(root, 'second.txt'), 'second\n')
     assert.equal(gitOk(['add', 'second.txt'], root).status, 0)
     assert.equal(gitOk(['commit', '-m', 'second'], root).status, 0)
+    writeFileSync(join(root, 'third.txt'), 'third\n')
+    assert.equal(gitOk(['add', 'third.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'third'], root).status, 0)
 
     const baseHead = gitOk(['rev-parse', 'refs/heads/@'], root).stdout.trim()
     const currentHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
@@ -113,6 +116,18 @@ test('集成：base 为 @ 时按字面分支创建工作区', { skip: !HAS_GIT, 
     created = true
     const worktreePath = /** @type {string} */ (b.path)
     assert.equal(gitOk(['rev-parse', 'HEAD'], worktreePath).stdout.trim(), baseHead)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+
+    const advancedBaseHead = gitOk(['rev-parse', 'main^'], root).stdout.trim()
+    assert.notEqual(advancedBaseHead, baseHead)
+    assert.equal(gitOk(['update-ref', 'refs/heads/@', advancedBaseHead], root).status, 0)
+
+    const s = await listStatus({ root, cfg, git, repo: null })
+    const row = s.rows?.find((x) => x.task === 'At Base')
+    assert.deepEqual(row?.counts, { ahead: 1, behind: 1 })
   } finally {
     if (created) {
       const f = await finishTask({ root, task: 'At Base', mode: 'abandon', cfg, git, repo: null })

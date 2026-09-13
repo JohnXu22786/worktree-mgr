@@ -717,8 +717,8 @@ test('listStatus：计算存在性、脏状态与 ahead/behind', async () => {
     'worktree ' + join(cfg.vault, 't1') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t1\n',
   ))
   git.on(['status', '--porcelain'], OK(' M f.txt\n'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t1'], OK('1\t2'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t2'], FAIL())
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t1'], OK('1\t2'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t2'], FAIL())
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -749,7 +749,7 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
     'worktree ' + join(cfg.vault, 't') + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
   ))
   git.on(['status', '--porcelain'], FAIL('fatal: damaged git metadata'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('0\t0'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], OK('0\t0'))
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -774,7 +774,7 @@ test('listStatus：工作区分支漂移时标记为不存在且不计算错误�
     'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n',
   ))
   git.on(['status', '--porcelain'], OK(' M wrong-branch.txt\n'))
-  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('1\t9'))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], OK('1\t9'))
 
   const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
   assert.equal(r.ok, true)
@@ -783,7 +783,7 @@ test('listStatus：工作区分支漂移时标记为不存在且不计算错误�
   assert.equal(r.rows[0].dirty, false)
   assert.equal(r.rows[0].counts, null)
   assert.equal(git.count(['status', '--porcelain']), 0, '分支漂移时不应读取错误工作区状态')
-  assert.equal(git.count(['rev-list', '--left-right', '--count', 'main...wtm/t']), 0, '分支漂移时不应计算错误分支计数')
+  assert.equal(git.count(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t']), 0, '分支漂移时不应计算错误分支计数')
   rmSync(tmp, { recursive: true, force: true })
 })
 

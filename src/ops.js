@@ -407,7 +407,7 @@ export async function listStatus(opts) {
           dirty = null
           warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
         }
-        const rc = await git.run(['rev-list', '--left-right', '--count', `${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
+        const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
         counts = rc.ok ? parseAheadBehind(rc.stdout) : null
       }
       rows.push({
