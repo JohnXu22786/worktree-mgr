@@ -43,6 +43,18 @@ test('runTriggers：非法命令配置类型产生警告', async () => {
   assert.match(warnings[0], /触发器|类型/)
 })
 
+test('runTriggers：非法命令条目产生警告且不阻止合法命令', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const invalidEntries = /** @type {any} */ ([42, null, { command: 'not-a-string' }, 'valid-cmd'])
+  const { warnings } = await runTriggers(invalidEntries, {}, { spawn: makeFakeSpawn(captured) })
+
+  assert.equal(captured.length, 1)
+  assert.equal(captured[0].args.at(-1), 'valid-cmd')
+  assert.equal(warnings.length, 3)
+  assert.ok(warnings.every((warning) => /索引/.test(warning) && /字符串/.test(warning)))
+})
+
 test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () => {
   /** @type {Array<{cmd: string, args: string[], opts: object}>} */
   const captured = []
