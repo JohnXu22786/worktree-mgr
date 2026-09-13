@@ -83,7 +83,7 @@ function runOne(spawnFn, shell, args, opts) {
     child.on('error', (/** @type {any} */ err) => {
       done({ ok: false, detail: `${stderr.trim() || err.message}` })
     })
-    child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
+    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
       if (code === 0) {
         done({ ok: true, detail: '' })
       } else {

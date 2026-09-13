@@ -18,7 +18,7 @@ function makeFakeSpawn(captured, behaviors = {}) {
     queueMicrotask(() => {
       if (b.stderr) child.stderr.emit('data', Buffer.from(b.stderr))
       if (b.stdout) child.stdout.emit('data', Buffer.from(b.stdout))
-      child.emit('exit', b.code ?? 0, null)
+      child.emit('close', b.code ?? 0, null)
     })
     return child
   }
@@ -77,6 +77,30 @@ test('runTriggers：命令失败产生警告，其余命令继续执行', async 
   assert.match(warnings[0], /boom/)
 })
 
+test('runTriggers：等待 close 事件后再读取失败输出', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  let closeSeen = false
+
+  const { warnings } = await runTriggers(['delayed-failure'], {}, {
+    spawn: () => {
+      queueMicrotask(() => {
+        child.emit('exit', 2, null)
+        queueMicrotask(() => {
+          child.stderr.emit('data', Buffer.from('late boom'))
+          closeSeen = true
+          child.emit('close', 2, null)
+        })
+      })
+      return child
+    },
+  })
+
+  assert.equal(closeSeen, true)
+  assert.match(warnings[0], /late boom/)
+})
+
 test('runTriggers：进程信号（非 0 code）与错误事件都归为警告', async () => {
   /** @type {Array<any>} */
   const captured = []
@@ -97,12 +121,11 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   child2.stderr = new EventEmitter()
   const w2 = await runTriggers(['sig-cmd2'], {}, {
     spawn: () => {
-      queueMicrotask(() => child2.emit('exit', null, 'SIGKILL'))
+      queueMicrotask(() => child2.emit('close', null, 'SIGKILL'))
       return child2
     },
   })
   assert.equal(w2.warnings.length, 1)
   assert.match(w2.warnings[0], /SIGKILL/)
 })
-
 
