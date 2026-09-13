@@ -87,6 +87,42 @@ test('集成：base 只接受真实分支名，拒绝 revision expression', { sk
   }
 })
 
+test('集成：base 为 @ 时按字面分支创建工作区', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let created = false
+  try {
+    assert.equal(gitOk(['branch', '@'], root).status, 0)
+    writeFileSync(join(root, 'second.txt'), 'second\n')
+    assert.equal(gitOk(['add', 'second.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'second'], root).status, 0)
+
+    const baseHead = gitOk(['rev-parse', 'refs/heads/@'], root).stdout.trim()
+    const currentHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.notEqual(baseHead, currentHead)
+
+    const b = await begin({ root, task: 'At Base', base: '@', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    created = true
+    const worktreePath = /** @type {string} */ (b.path)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], worktreePath).stdout.trim(), baseHead)
+  } finally {
+    if (created) {
+      const f = await finishTask({ root, task: 'At Base', mode: 'abandon', cfg, git, repo: null })
+      assert.equal(f.ok, true, f.error ?? '')
+    }
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
 test('集成：完整生命周期 begin → 修改 → status → finish(commit)', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()
