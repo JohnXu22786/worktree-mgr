@@ -167,7 +167,15 @@ async function main() {
   if (!resolved.ok) {
     return printResult(resolved, json)
   }
-  const repo = readRepoConfig(resolved.root)
+  let repo
+  try {
+    repo = readRepoConfig(resolved.root)
+  } catch (err) {
+    return printResult({
+      ok: false,
+      error: `读取仓库配置失败：${/** @type {Error} */ (err).message}`,
+    }, json)
+  }
   const cfg = loadConfig({ pluginConfig: {}, env: process.env, repoConfig: repo.config })
 
   /** @type {OpResult} */

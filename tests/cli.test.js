@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -52,5 +52,22 @@ test('CLI：begin 的 --root 缺少值时拒绝回退到当前目录', () => {
     assert.match(result.stderr, /--root.*缺少值/)
   } finally {
     rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-cli-config-'))
+  try {
+    execFileSync('git', ['init', '--quiet', root], { stdio: 'ignore' })
+    mkdirSync(join(root, '.wtm.json'))
+    const result = runCli(['status', '--root', root, '--json'], root)
+
+    assert.equal(result.status, 1)
+    assert.equal(result.stderr, '')
+    const payload = JSON.parse(result.stdout)
+    assert.equal(payload.ok, false)
+    assert.match(payload.error, /EISDIR/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
