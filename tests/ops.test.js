@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { begin, mergeTask, finishTask, listStatus, purge } from '../src/ops.js'
-import { EMPTY_LEDGER, loadLedger, saveLedger, upsertRecord } from '../src/vault.js'
+import { EMPTY_LEDGER, loadLedger, saveLedger, upsertRecord, withLock } from '../src/vault.js'
 import { resolveToplevel } from '../src/git.js'
 
 // ---- 假 git 执行器 ---------------------------------------------------------
@@ -93,6 +93,34 @@ test('resolveToplevel：返回规范化顶层路径', async () => {
 })
 
 // ---- begin -----------------------------------------------------------------
+
+test('begin：等待 vault 锁期间取消时返回取消错误', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const root = join(tmp, 'repo')
+  let firstInside = false
+  /** @type {((value?: unknown) => void) | undefined} */
+  let release
+  const gate = new Promise((r) => { release = r })
+  const p1 = withLock(cfg.vault, async () => {
+    firstInside = true
+    await gate
+  })
+  while (!firstInside) await new Promise((r) => setTimeout(r, 5))
+
+  const ac = new AbortController()
+  const p2 = begin({ root, task: 'T', cfg, git: new FakeGit(), repo: null, signal: ac.signal })
+  await new Promise((r) => setTimeout(r, 50))
+  ac.abort()
+  assert.ok(release, 'release 应已赋值')
+  release()
+
+  await p1
+  const result = await p2
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? '', /取消|abort/i)
+  rmSync(tmp, { recursive: true, force: true })
+})
 
 test('begin：创建前检查：任务校验、重复任务、基分支存在、分支不冲突', async () => {
   const tmp = makeTmp()

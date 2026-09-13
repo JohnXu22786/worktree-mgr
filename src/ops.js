@@ -244,7 +244,7 @@ export async function begin(opts) {
       upsertRecord(ledger, record)
       saveLedger(vault, ledger)
       return { ok: true, base: baseName, path: wtPath }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && typeof result === 'undefined') {
@@ -263,6 +263,7 @@ export async function begin(opts) {
         warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
+    if (isAborted(opts.signal)) return { ok: false, error: '操作已取消（aborted）', warnings }
     if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
@@ -310,8 +311,9 @@ export async function mergeTask(opts) { // eslint-disable-line
         merged: core.merged,
         warnings: core.warnings,
       }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `同步失败：${/** @type {Error} */ (err).message}` }
   }
@@ -340,8 +342,9 @@ export async function finishTask(opts) {
       const rec = findRecord(ledger, task)
       if (!rec) return { ok: false, error: `任务不存在：${task}（可用 wtm_status 查看）` }
       return await finishCore(opts, { vault, ledger, rec, mode })
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `收尾失败：${/** @type {Error} */ (err).message}` }
   }
@@ -447,8 +450,9 @@ export async function purge(opts) {
         })
       }
       return { ok: true, results }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `批量清理失败：${/** @type {Error} */ (err).message}` }
   }

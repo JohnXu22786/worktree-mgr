@@ -225,11 +225,38 @@ export function saveLedger(vaultDir, ledger) {
  * @template T
  * @param {string} vaultDir
  * @param {() => Promise<T>} fn
- * @param {{timeoutMs?: number, staleMs?: number, heartbeatMs?: number}} [opts]
+ * @param {{timeoutMs?: number, staleMs?: number, heartbeatMs?: number, signal?: AbortSignal}} [opts]
  * @returns {Promise<T>}
  * @throws {VaultError} 等待超时
  */
-export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_000, heartbeatMs = 30_000 } = {}) {
+export async function withLock(vaultDir, fn, {
+  timeoutMs = 5000,
+  staleMs = 300_000,
+  heartbeatMs = 30_000,
+  signal,
+} = {}) {
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+  }
+  const waitForRetry = () => {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, 100))
+    return new Promise((resolve, reject) => {
+      let timer
+      const onAbort = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+      }
+      timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, 100)
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    })
+  }
+
+  throwIfAborted()
   mkdirSync(vaultDir, { recursive: true })
   const lockPath = join(vaultDir, '.lock')
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
@@ -238,6 +265,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
   let fd = null
   let owned = false
   for (;;) {
+    throwIfAborted()
     try {
       fd = openSync(tempLockPath, 'wx')
       writeFileSync(fd, token, 'utf8')
@@ -262,10 +290,11 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       } catch {
         // 对方可能刚好释放，也可能是持久的 I/O、权限错误或悬空符号链接；统一走超时检查。
       }
+      throwIfAborted()
       if (Date.now() >= deadline) {
         throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
       }
-      await new Promise((r) => setTimeout(r, 100))
+      await waitForRetry()
     }
   }
   // 心跳：定期刷新 mtime，防止长任务期间被误判陈旧
