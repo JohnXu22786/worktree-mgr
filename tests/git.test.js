@@ -96,6 +96,23 @@ test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留
   assert.equal(list[1].locked, false)
 })
 
+test('parseWorktreeList：保留旧版 porcelain 中路径内的换行', () => {
+  const text = [
+    'worktree /tmp/worktree',
+    'with-newline',
+    'HEAD 3333333333333333333333333333333333333333',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
 test('parseAheadBehind：按 base...branch 语义映射 rev-list 计数', () => {
   // rev-list 的第一个计数是基分支独有提交（任务落后），第二个是任务分支独有提交（任务领先）。
   assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 5, behind: 3 })
