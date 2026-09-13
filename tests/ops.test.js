@@ -1,6 +1,8 @@
 ﻿import { test } from 'node:test'
+import { mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
+import fs, { mkdtempSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
@@ -1057,6 +1059,34 @@ test('finishTask：工作区目录被外部删除时清理记录（stale 清理�
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('finishTask：工作区暂时不可访问时失败并保留记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  const realStatSync = fs.statSync
+  const inaccessible = Object.assign(new Error('permission denied'), { code: 'EACCES' })
+  mock.method(fs, 'statSync', (/** @type {string} */ target) => {
+    if (target === taskPath) throw inaccessible
+    return realStatSync(target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /工作区/)
+    assert.match(r.error ?? '', /permission denied/)
+    assert.equal(loadLedger(vault).records.length, 1)
+    assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
+    assert.equal(git.count(['merge', '--no-ff', 'wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(git.count(['worktree', 'remove', taskPath]), 0)
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('listStatus：工作区目录被外部删除时 exists=false（不谎报健康）', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
@@ -1072,6 +1102,44 @@ test('listStatus：工作区目录被外部删除时 exists=false（不谎报健
   assert.equal(r.rows[0].exists, false)
   assert.equal(git.count(['status', '--porcelain']), 0)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('listStatus：工作区暂时不可访问时标记未知并返回警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+
+  const realStatSync = fs.statSync
+  const inaccessible = Object.assign(new Error('I/O error'), { code: 'EIO' })
+  mock.method(fs, 'statSync', (/** @type {string} */ target) => {
+    if (target === taskPath) throw inaccessible
+    return realStatSync(target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+    assert.equal(r.ok, true)
+    assert.ok(r.rows, '应有 rows')
+    assert.equal(r.rows[0].exists, false)
+    assert.equal(r.rows[0].dirty, null)
+    assert.equal(r.rows[0].counts, null)
+    assert.ok(r.warnings?.some((w) => /T/.test(w) && /I\/O error/.test(w)), JSON.stringify(r.warnings))
+    assert.equal(git.count(['status', '--porcelain']), 0)
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('purge：all 与 tasks 同时指定时报错', async () => {

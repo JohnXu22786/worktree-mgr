@@ -6,7 +6,7 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
   slugifyTask,
@@ -107,6 +107,25 @@ function isAborted(signal) {
 
 function abortResult() {
   return { ok: false, error: '操作已取消（aborted）' }
+}
+
+/**
+ * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
+ * @param {string} path
+ * @returns {{exists: boolean, error?: string}}
+ */
+function inspectPath(path) {
+  try {
+    statSync(path)
+    return { exists: true }
+  } catch (err) {
+    const error = /** @type {{code?: string, message?: string}} */ (err)
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { exists: false }
+    return {
+      exists: false,
+      error: error.message || String(err),
+    }
+  }
 }
 
 /**
@@ -372,9 +391,13 @@ export async function listStatus(opts) {
       let counts = null
       // 存在性 = 注册表有该工作区、目录实际存在且仍在账本分支上；
       // 分支漂移后不能读取或统计错误分支的状态。
-      const alive = Boolean(wt) && existsSync(rec.path) && wt?.branch === rec.branch
+      const pathState = wt ? inspectPath(rec.path) : { exists: false }
+      const alive = Boolean(wt) && pathState.exists && wt?.branch === rec.branch
       /** @type {boolean | null} */
-      let dirty = false
+      let dirty = pathState.error ? null : false
+      if (pathState.error) {
+        warnings.push(`读取任务工作区失败（${rec.task}）：${pathState.error}`)
+      }
       if (alive) {
         const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
         if (st.ok) {
@@ -567,7 +590,14 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
   // stale：注册表没有该工作区，或目录已被外部删除
   // （目录被删后注册表仍会列出 prunable 条目，必须用目录实存判定）
-  if (!wt || !existsSync(rec.path)) {
+  if (!wt) {
+    return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
+  }
+  const pathState = inspectPath(rec.path)
+  if (pathState.error) {
+    return { ok: false, error: `读取任务工作区失败（${rec.path}）：${pathState.error}` }
+  }
+  if (!pathState.exists) {
     return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
   }
 
@@ -647,7 +677,16 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
-  if (!wt || !existsSync(rec.path)) {
+  if (!wt) {
+    removeRecord(ledger, task)
+    saveLedger(vault, ledger)
+    return { ok: true, note: `任务工作区已不存在，已清理账本记录（任务：${task}）`, committed: false, merged: false }
+  }
+  const pathState = inspectPath(rec.path)
+  if (pathState.error) {
+    return { ok: false, error: `读取任务工作区失败（${rec.path}）：${pathState.error}` }
+  }
+  if (!pathState.exists) {
     removeRecord(ledger, task)
     saveLedger(vault, ledger)
     return { ok: true, note: `任务工作区已不存在，已清理账本记录（任务：${task}）`, committed: false, merged: false }
