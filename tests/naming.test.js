@@ -169,6 +169,8 @@ test('validateBranch：长度上限 255', () => {
 
 test('validatePrefix：必须为单段合法 ref', () => {
   assert.equal(validatePrefix('wtm').ok, true)
+  assert.equal(validatePrefix('HEAD').ok, true)
+  assert.equal(validateBranch(deriveBranch('task', 'HEAD')).ok, true)
   assert.equal(validatePrefix('a/b').ok, false)
   assert.equal(validatePrefix('-x').ok, false)
   assert.equal(validatePrefix('').ok, false)
