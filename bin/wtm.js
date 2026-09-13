@@ -65,12 +65,13 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
-      const next = argv[i + 1]
-      if (next !== undefined && !next.startsWith('--')) {
+      if (OPTIONS_REQUIRING_VALUES.has(key)) {
+        const next = argv[i + 1]
+        if (next === undefined || next.startsWith('--')) {
+          return { positional, options, error: `选项 --${key} 缺少值` }
+        }
         options[key] = next
         i++
-      } else if (OPTIONS_REQUIRING_VALUES.has(key)) {
-        return { positional, options, error: `选项 --${key} 缺少值` }
       } else {
         options[key] = true
       }

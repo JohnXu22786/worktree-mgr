@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,8 @@ test('CLI：单任务命令拒绝多余的位置参数', () => {
       ['merge', ['Task A', 'typo']],
       ['finish', ['Task A', 'typo']],
       ['status', ['unexpected']],
+      ['finish', ['Task A', '--json', 'typo']],
+      ['status', ['--json', 'unexpected']],
     ]) {
       const result = runCli([command, ...args], cwd)
 
@@ -43,13 +45,23 @@ test('CLI：单任务命令拒绝多余的位置参数', () => {
   }
 })
 
-test('CLI：purge 保留多任务位置参数', () => {
+test('CLI：布尔选项不吞掉后续位置参数', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-positionals-'))
   try {
-    const result = runCli(['purge', 'Task A', 'Task B'], cwd)
+    execFileSync('git', ['init', '--quiet', cwd], { stdio: 'ignore' })
+    writeFileSync(join(cwd, '.wtm.json'), JSON.stringify({ vault: join(cwd, 'vault') }))
 
-    assert.notEqual(result.status, 2)
-    assert.doesNotMatch(result.stderr, /位置参数/)
+    const result = runCli(['purge', 'Task A', '--json', 'Task B'], cwd)
+
+    assert.equal(result.status, 1)
+    const payload = JSON.parse(result.stdout)
+    assert.deepEqual(payload.results.map((item) => item.task), ['Task A', 'Task B'])
+
+    const allResult = runCli(['purge', '--all', 'Task B', '--json'], cwd)
+
+    assert.equal(allResult.status, 1)
+    const allPayload = JSON.parse(allResult.stdout)
+    assert.match(allPayload.error, /all 与 tasks 不能同时指定/)
   } finally {
     rmSync(cwd, { recursive: true, force: true })
   }
