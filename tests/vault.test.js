@@ -140,6 +140,16 @@ test('isWithin：POSIX 下反斜杠是文件名字符而非路径分隔符', { s
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('isWithin：指向仓库内缺失路径的悬空符号链接仍视为位于仓库内', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const link = join(dir, 'vault-link')
+  mkdirSync(root)
+  symlinkSync(join(root, 'future-vault'), link)
+  assert.equal(isWithin(root, link), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
   const dir = makeTmp()
   const ledger = loadLedger(dir)
