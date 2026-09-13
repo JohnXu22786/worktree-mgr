@@ -386,6 +386,7 @@ export function createToolSet(opts) {
           lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${details.length > 0 ? `（${details.join('；')}）` : ''}`)
           for (const w of r.warnings ?? []) lines.push(`  ⚠️  ${w}`)
         }
+        for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
         return textBlock(lines.join('\n'))
       },
     },
