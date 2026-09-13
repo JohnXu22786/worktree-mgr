@@ -26,7 +26,7 @@ function normalizeTruncatedSlug(slug) {
     .filter((seg) => seg !== '')
     .join('/')
     .replace(/-+/g, '-')
-    .replace(/^[-.]+|[-.]+$/g, '')
+    .replace(/^[-./]+|[-./]+$/g, '')
 }
 
 /**

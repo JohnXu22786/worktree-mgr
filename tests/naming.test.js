@@ -106,6 +106,16 @@ test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => 
   assert.equal(slug.endsWith('.'), false)
 })
 
+test('slugifyTask：截断移除段尾连字符时也移除前面的斜杠', () => {
+  const task = 'a'.repeat(58) + '/..a'
+  const slug = slugifyTask(task)
+  const branch = deriveBranch(task)
+
+  assert.equal(slug, 'a'.repeat(58))
+  assert.equal(branch, `wtm/${'a'.repeat(58)}`)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
 test('deriveBranch：默认前缀 wtm，支持自定义前缀', () => {
   assert.equal(deriveBranch('Dark Mode'), 'wtm/dark-mode')
   assert.equal(deriveBranch('Dark Mode', 'sandbox'), 'sandbox/dark-mode')
