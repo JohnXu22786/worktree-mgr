@@ -408,7 +408,13 @@ export async function listStatus(opts) {
           warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
         }
         const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
-        counts = rc.ok ? parseAheadBehind(rc.stdout) : null
+        const parsedCounts = rc.ok ? parseAheadBehind(rc.stdout) : null
+        if (parsedCounts) {
+          counts = parsedCounts
+        } else {
+          const detail = rc.ok ? 'git rev-list 输出格式无效' : rc.stderr.trim() || 'git rev-list 失败'
+          warnings.push(`读取任务领先/落后计数失败（${rec.task}）：${detail}`)
+        }
       }
       rows.push({
         task: rec.task,
