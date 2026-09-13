@@ -138,6 +138,74 @@ test('集成：base 为 @ 时按字面分支创建工作区并统计状态', { s
   }
 })
 
+test('集成：status 对任务分支使用完整 refs/heads 引用（避免同名 tag）', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let worktreePath
+  try {
+    const b = await begin({ root, task: 'Literal Ref Status', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    assert.equal(gitOk(['tag', 'wtm/literal-ref-status'], root).status, 0)
+
+    const s = await listStatus({ root, cfg, git, repo: null })
+    assert.equal(s.ok, true, s.error ?? '')
+    const row = s.rows?.find((x) => x.task === 'Literal Ref Status')
+    assert.deepEqual(row?.counts, { ahead: 1, behind: 0 })
+  } finally {
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['update-ref', '-d', 'refs/heads/wtm/literal-ref-status'], root)
+    gitOk(['tag', '-d', 'wtm/literal-ref-status'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：merge 对任务分支使用完整 refs/heads 引用（避免同名 tag）', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let worktreePath
+  try {
+    const b = await begin({ root, task: 'Literal Ref Merge', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    assert.equal(gitOk(['tag', 'wtm/literal-ref-merge'], root).status, 0)
+
+    const m = await mergeTask({ root, task: 'Literal Ref Merge', mode: 'commit', cfg, git, repo: null })
+    assert.equal(m.ok, true, m.error ?? '')
+    assert.equal(m.merged, true)
+    assert.equal(readFileSync(join(root, 'task.txt'), 'utf8'), 'task\n')
+  } finally {
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['update-ref', '-d', 'refs/heads/wtm/literal-ref-merge'], root)
+    gitOk(['tag', '-d', 'wtm/literal-ref-merge'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
 test('集成：完整生命周期 begin → 修改 → status → finish(commit)', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
   const vault = makeVault()

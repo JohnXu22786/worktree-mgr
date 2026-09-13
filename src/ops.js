@@ -407,7 +407,7 @@ export async function listStatus(opts) {
           dirty = null
           warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
         }
-        const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
+        const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...refs/heads/${rec.branch}`], { cwd: root, signal: opts.signal })
         const parsedCounts = rc.ok ? parseAheadBehind(rc.stdout) : null
         if (parsedCounts) {
           counts = parsedCounts
@@ -556,7 +556,7 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
-  const ancestor = await git.run(['merge-base', '--is-ancestor', rec.branch, 'HEAD'], { cwd: root, signal: opts.signal })
+  const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
   if (ancestor.ok) {
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
@@ -570,7 +570,7 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', rec.branch, '-m', message], { cwd: root, signal: opts.signal })
+  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
   if (!merge.ok) {
     return {
       ok: false,
