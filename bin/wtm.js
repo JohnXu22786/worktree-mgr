@@ -51,9 +51,10 @@ function usage() {
  */
 
 const OPTIONS_REQUIRING_VALUES = new Set(['base', 'branch', 'note', 'mode', 'message', 'root'])
+const OPTIONS_WITHOUT_VALUES = new Set(['all', 'json'])
 
 /**
- * 简单参数解析：支持 --key value 与 --flag（布尔）。
+ * 简单参数解析：支持已知的 --key value 与 --flag（布尔），拒绝未知选项。
  * @param {string[]} argv
  * @returns {{positional: string[], options: Record<string, string | boolean>, error?: string}}
  */
@@ -65,6 +66,9 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
+      if (!OPTIONS_REQUIRING_VALUES.has(key) && !OPTIONS_WITHOUT_VALUES.has(key)) {
+        return { positional, options, error: `未知选项 --${key}` }
+      }
       if (OPTIONS_REQUIRING_VALUES.has(key)) {
         const next = argv[i + 1]
         if (next === undefined || next.startsWith('--')) {

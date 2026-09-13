@@ -45,6 +45,21 @@ test('CLI：单任务命令拒绝多余的位置参数', () => {
   }
 })
 
+test('CLI：未知选项拒绝执行，不把后续参数当作任务', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-unknown-option-'))
+  try {
+    execFileSync('git', ['init', '--quiet', cwd], { stdio: 'ignore' })
+    writeFileSync(join(cwd, '.wtm.json'), JSON.stringify({ vault: join(cwd, 'vault') }))
+
+    const result = runCli(['purge', '--typo', 'ExistingTask', '--mode', 'abandon', '--json'], cwd)
+
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /未知选项.*--typo/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test('CLI：布尔选项不吞掉后续位置参数', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-positionals-'))
   try {
