@@ -112,11 +112,11 @@ function abortResult() {
 /**
  * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
  * @param {string} path
- * @returns {{exists: boolean, error?: string}}
+ * @returns {{exists: boolean, isDirectory?: boolean, error?: string}}
  */
 function inspectPath(path) {
   try {
-    return { exists: statSync(path).isDirectory() }
+    return { exists: true, isDirectory: statSync(path).isDirectory() }
   } catch (err) {
     const error = /** @type {{code?: string, message?: string}} */ (err)
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { exists: false }
@@ -393,7 +393,7 @@ export async function listStatus(opts) {
       // 存在性 = 注册表有该工作区、目录实际存在且仍在账本分支上；
       // 分支漂移后不能读取或统计错误分支的状态。
       const pathState = wt ? inspectPath(rec.path) : { exists: false }
-      const alive = Boolean(wt) && pathState.exists && wt?.branch === rec.branch
+      const alive = Boolean(wt) && pathState.exists && pathState.isDirectory === true && wt?.branch === rec.branch
       /** @type {boolean | null} */
       let dirty = pathState.error ? null : false
       if (pathState.error) {
@@ -610,6 +610,9 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   if (!pathState.exists) {
     return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
   }
+  if (pathState.isDirectory !== true) {
+    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
+  }
 
   /** @type {string[]} */
   const warnings = []
@@ -707,6 +710,10 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     removeRecord(ledger, task)
     saveLedger(vault, ledger)
     return { ok: true, note: `任务“${task}”已解除管理，工作区与分支保留`, committed: false, merged: false }
+  }
+
+  if (pathState.isDirectory !== true) {
+    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
   }
 
   // commit 与 abandon 都会移除工作区和处理任务分支，必须先确认当前工作区
