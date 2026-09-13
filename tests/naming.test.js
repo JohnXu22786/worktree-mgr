@@ -78,17 +78,31 @@ test('deriveBranch：前缀较长时仍限制分支总长度', () => {
   const task = '𐐀'.repeat(60)
   const branch = deriveBranch(task, prefix)
 
-  assert.equal(branch.length, 255)
+  assert.equal(Buffer.byteLength(branch), 255)
   assert.equal(validateBranch(branch).ok, true)
 })
 
 test('validatePrefix：为非 BMP slug 预留最小分支空间', () => {
-  assert.equal(validatePrefix('p'.repeat(253)).ok, false)
+  assert.equal(validatePrefix('p'.repeat(251)).ok, false)
 
-  const prefix = 'p'.repeat(252)
+  const prefix = 'p'.repeat(250)
   const branch = deriveBranch('𐐀', prefix)
-  assert.equal(branch.length, 255)
+  assert.equal(Buffer.byteLength(branch), 255)
   assert.equal(validateBranch(branch).ok, true)
+})
+
+test('deriveBranch：按 UTF-8 字节限制 Unicode 前缀与分支总长度', () => {
+  const prefix = '前'.repeat(80)
+  const branch = deriveBranch('x'.repeat(60), prefix)
+
+  assert.equal(Buffer.byteLength(prefix), 240)
+  assert.equal(Buffer.byteLength(branch), 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
+test('validatePrefix：按 UTF-8 字节为 slug 预留空间', () => {
+  assert.equal(validatePrefix('前'.repeat(83)).ok, true)
+  assert.equal(validatePrefix('前'.repeat(84)).ok, false)
 })
 
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
@@ -162,9 +176,11 @@ test('validateBranch：拒绝保留的 HEAD 分支名', () => {
   assert.equal(validateBranch('HEAD').ok, false)
 })
 
-test('validateBranch：长度上限 255', () => {
+test('validateBranch：长度上限 255 字节', () => {
   assert.equal(validateBranch('x'.repeat(255)).ok, true)
   assert.equal(validateBranch('x'.repeat(256)).ok, false)
+  assert.equal(validateBranch('前'.repeat(85)).ok, true)
+  assert.equal(validateBranch('前'.repeat(86)).ok, false)
 })
 
 test('validatePrefix：必须为单段合法 ref', () => {
