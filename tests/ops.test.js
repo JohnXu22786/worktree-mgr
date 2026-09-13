@@ -1044,6 +1044,43 @@ test('mergeTask：主工作区不在账本基分支时拒绝（防合入错误�
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('mergeTask：合并前重新校验主工作区分支，拒绝并发切换后的错误合并', async () => {
+  const tmp = makeTmp()
+  const { cfg, git } = mergeFixture(tmp)
+  let branchChecks = 0
+  git.on(['branch', '--show-current'], () => {
+    branchChecks += 1
+    return branchChecks === 1 ? OK('main\n') : OK('develop\n')
+  })
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /develop/)
+  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：合并前重新校验基分支状态，拒绝并发改动后的合并', async () => {
+  const tmp = makeTmp()
+  const { cfg, git } = mergeFixture(tmp)
+  let baseStatusChecks = 0
+  git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === 'C:/repo') {
+      baseStatusChecks += 1
+      return baseStatusChecks === 1 ? OK('') : OK(' M race.txt\n')
+    }
+    return OK('')
+  })
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /基分支|未提交/)
+  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('mergeTask：任务分支已合并时跳过重复合并（重试不再产生空 merge 提交）', async () => {
   const tmp = makeTmp()
   const { cfg, git } = mergeFixture(tmp)
