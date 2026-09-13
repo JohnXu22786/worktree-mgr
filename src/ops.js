@@ -116,8 +116,7 @@ function abortResult() {
  */
 function inspectPath(path) {
   try {
-    statSync(path)
-    return { exists: true }
+    return { exists: statSync(path).isDirectory() }
   } catch (err) {
     const error = /** @type {{code?: string, message?: string}} */ (err)
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { exists: false }

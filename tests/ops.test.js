@@ -1214,6 +1214,29 @@ test('listStatus：工作区目录被外部删除时 exists=false（不谎报健
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('listStatus：工作区路径被普通文件替换时 exists=false（不在文件上运行 git）', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  fs.writeFileSync(taskPath, 'not a directory')
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, true)
+  assert.equal(r.rows?.[0].exists, false)
+  assert.equal(r.rows?.[0].dirty, false)
+  assert.equal(r.rows?.[0].counts, null)
+  assert.equal(git.count(['status', '--porcelain']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('listStatus：工作区暂时不可访问时标记未知并返回警告', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
