@@ -1,5 +1,6 @@
 ﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { runTriggers } from '../src/triggers.js'
 
@@ -60,6 +61,40 @@ test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () =>
     assert.equal(env.WTM_ROOT, 'R')
   }
   assert.deepEqual(warnings, [])
+})
+
+test('runTriggers：关闭真实子进程 stdin 后等待其正常退出', async () => {
+  /** @type {import('node:child_process').ChildProcess[]} */
+  const children = []
+  const script = 'require("node:fs").readFileSync(0)'
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer
+
+  try {
+    const result = /** @type {Promise<{warnings: string[]}>} */ (Promise.race([
+      runTriggers(['read-from-stdin'], {}, {
+        spawn: (_shell, _args, opts) => {
+          const child = spawn(process.execPath, ['--input-type=commonjs', '-e', script], opts)
+          children.push(child)
+          return child
+        },
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          for (const child of children) child.kill()
+          reject(new Error('runTriggers 未在 stdin EOF 后完成'))
+        }, 2000)
+      }),
+    ]))
+    const { warnings } = await result
+
+    assert.deepEqual(warnings, [])
+    assert.equal(children.length, 1)
+    assert.equal(children[0].exitCode, 0)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    for (const child of children) child.kill()
+  }
 })
 
 test('runTriggers：使用平台 shell（win32=cmd，其他=sh）', async () => {
