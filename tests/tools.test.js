@@ -246,6 +246,45 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区缺失', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    const vault = join(tmp, 'vault')
+    const taskPath = join(vault, 't')
+    mkdirSync(taskPath, { recursive: true })
+    const ledger = structuredClone(EMPTY_LEDGER)
+    upsertRecord(ledger, {
+      task: 'T', branch: 'wtm/t', base: 'main', path: taskPath,
+      createdAt: 'c', updatedAt: 'u',
+    })
+    saveLedger(vault, ledger)
+
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${tmp}\n`))
+    git.on(['worktree', 'list', '--porcelain'], OK(
+      `worktree ${tmp}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${taskPath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/other\n`,
+    ))
+    const tools = createToolSet({ config: { root: tmp, vault }, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+
+    const value = /** @type {{ok: boolean, rows?: Array<any>}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, true)
+    assert.equal(value.rows?.[0]?.branchDrift, true)
+    assert.equal(value.rows?.[0]?.currentBranch, 'other')
+    const rendered = status.output.render({}, value)
+    const text = rendered[0].text
+    assert.match(text, /分支漂移/)
+    assert.doesNotMatch(text, /工作区缺失/)
+    assert.match(text, /切回.*wtm\/t|wtm_finish --mode keep/)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('wtm_status：root 解析同步失败时返回结构化错误而非抛异常', async () => {
   const tools = createToolSet({ config: {}, git: new GitRunner() })
   const status = tools.find((t) => t.name === 'wtm_status')
