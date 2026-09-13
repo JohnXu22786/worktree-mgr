@@ -658,6 +658,34 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('listStatus：工作区分支漂移时标记为不存在且不计算错误分支状态', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/other\n',
+  ))
+  git.on(['status', '--porcelain'], OK(' M wrong-branch.txt\n'))
+  git.on(['rev-list', '--left-right', '--count', 'main...wtm/t'], OK('1\t9'))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, true)
+  assert.ok(r.rows, '应有 rows')
+  assert.equal(r.rows[0].exists, false)
+  assert.equal(r.rows[0].dirty, false)
+  assert.equal(r.rows[0].counts, null)
+  assert.equal(git.count(['status', '--porcelain']), 0, '分支漂移时不应读取错误工作区状态')
+  assert.equal(git.count(['rev-list', '--left-right', '--count', 'main...wtm/t']), 0, '分支漂移时不应计算错误分支计数')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 // ---- purge -----------------------------------------------------------------
 
 test('purge：commit 模式执行 on_merge 触发器', async () => {
