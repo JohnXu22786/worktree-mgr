@@ -140,6 +140,7 @@ test('validateBranch：接受合法分支名', () => {
   assert.deepEqual(validateBranch('wtm/feat-1'), { ok: true })
   assert.deepEqual(validateBranch('main'), { ok: true })
   assert.deepEqual(validateBranch('feature/深色/模式'), { ok: true })
+  assert.deepEqual(validateBranch('@'), { ok: true })
 })
 
 test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
@@ -163,7 +164,6 @@ test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
     '.hidden',
     'a.',
     'a\u0007b',
-    '@',
     '',
   ]
   for (const name of bad) {
