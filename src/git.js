@@ -99,7 +99,7 @@ export function parseWorktreeList(text) {
   const consume = (/** @type {string} */ line) => {
     if (line.startsWith('worktree ')) {
       current = {
-        path: line.slice('worktree '.length).trim(),
+        path: line.slice('worktree '.length),
         branch: null,
         detached: false,
         bare: false,
@@ -119,9 +119,9 @@ export function parseWorktreeList(text) {
     }
   }
 
-  // Legacy porcelain has no record delimiter. Use the stable HEAD line to
-  // keep newlines that belong to a worktree path before parsing its fields.
-  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\nHEAD [0-9a-f]+(?:\r?\n|$)/gm)]
+  // Legacy porcelain has no record delimiter. Use the stable HEAD line and
+  // its following field to keep newlines that belong to a worktree path.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\r?\nHEAD [0-9a-f]+(?=\r?\n(?:branch refs\/heads\/|detached(?:\r?\n|$)|bare(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))(?:\r?\n|$)/gm)]
   if (records.length > 0) {
     for (let i = 0; i < records.length; i += 1) {
       const record = records[i]

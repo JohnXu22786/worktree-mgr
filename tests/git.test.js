@@ -113,6 +113,26 @@ test('parseWorktreeList：保留旧版 porcelain 中路径内的换行', () => {
   }])
 })
 
+test('parseWorktreeList：路径内类似 HEAD 字段时不提前截断', () => {
+  const text = [
+    'worktree /tmp/worktree\nHEAD 4444444444444444444444444444444444444444',
+    'HEAD 5555555555555555555555555555555555555555',
+    'branch refs/heads/task-with-head-line',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\nHEAD 4444444444444444444444444444444444444444')
+})
+
+test('parseWorktreeList：保留路径末尾的换行', () => {
+  const text = [
+    'worktree /tmp/worktree\n',
+    'HEAD 6666666666666666666666666666666666666666',
+    'branch refs/heads/task-with-trailing-newline',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\n')
+})
+
 test('parseAheadBehind：按 base...branch 语义映射 rev-list 计数', () => {
   // rev-list 的第一个计数是基分支独有提交（任务落后），第二个是任务分支独有提交（任务领先）。
   assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 5, behind: 3 })
