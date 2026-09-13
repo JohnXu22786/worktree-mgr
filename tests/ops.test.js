@@ -553,6 +553,37 @@ test('finishTask：commit 模式执行 on_merge 触发器', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('finishTask：移除工作区失败时保留 on_merge 触发器警告', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  git.on(['worktree', 'remove', join(vault, 't')], FAIL('cannot remove worktree'))
+
+  const r = await finishTask({
+    root: 'C:/repo',
+    task: 'T',
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['broken-merge-hook'] } },
+    triggerSpawn: () => {
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => {
+        child.stderr.emit('data', Buffer.from('merge hook failed'))
+        child.emit('close', 1, null)
+      })
+      return child
+    },
+  })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /cannot remove worktree/)
+  assert.ok(r.warnings?.some((w) => /broken-merge-hook/.test(w)), JSON.stringify(r))
+  assert.ok(r.warnings?.some((w) => /merge hook failed/.test(w)), JSON.stringify(r))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 清记录', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })

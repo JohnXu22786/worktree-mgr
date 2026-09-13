@@ -691,6 +691,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     return {
       ok: false,
       error: `移除工作区失败：${remove.stderr.trim()}（如存在未跟踪文件，可改用 abandon 模式强制清理）`,
+      warnings,
     }
   }
 
