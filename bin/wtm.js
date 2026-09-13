@@ -51,6 +51,13 @@ function usage() {
  */
 
 const OPTIONS_REQUIRING_VALUES = new Set(['base', 'branch', 'note', 'mode', 'message', 'root'])
+const OPTIONS_BY_COMMAND = {
+  begin: new Set(['base', 'branch', 'note', 'root', 'json']),
+  merge: new Set(['mode', 'message', 'root', 'json']),
+  finish: new Set(['mode', 'message', 'root', 'json']),
+  status: new Set(['root', 'json']),
+  purge: new Set(['all', 'mode', 'message', 'root', 'json']),
+}
 
 /**
  * 简单参数解析：支持 --key value 与 --flag（布尔）。
@@ -157,6 +164,11 @@ async function main() {
   const { positional, options, error } = parseArgs(argv.slice(1))
   if (error) {
     process.stderr.write(`错误：${error}\n`)
+    return 2
+  }
+  const unknownOption = Object.keys(options).find((key) => !OPTIONS_BY_COMMAND[command].has(key))
+  if (unknownOption) {
+    process.stderr.write(`错误：未知选项：--${unknownOption}\n`)
     return 2
   }
   const json = options.json === true
