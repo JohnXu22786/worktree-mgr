@@ -208,6 +208,25 @@ test('readRepoConfig：配置文件读取失败时传播文件系统错误', () 
   }
 })
 
+test('工具调用：仓库配置读取失败时返回结构化错误', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    mkdirSync(join(tmp, '.wtm.json'))
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${tmp}\n`))
+    const tools = createToolSet({ config: {}, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+    const value = /** @type {{ok: boolean, error?: string}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /EISDIR/)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('wtm_finish 必填参数与默认 mode', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })

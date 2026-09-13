@@ -76,7 +76,12 @@ async function prepare({ args, exec, tool, git }) {
         : process.cwd()))
   const resolved = await resolveToplevel(git, candidate, exec?.signal)
   if (!resolved.ok) return { ok: false, error: resolved.error }
-  const repo = readRepoConfig(resolved.root)
+  let repo
+  try {
+    repo = readRepoConfig(resolved.root)
+  } catch (err) {
+    return { ok: false, error: `读取仓库配置失败：${/** @type {Error} */ (err).message}` }
+  }
   const cfg = loadConfig({
     pluginConfig: tool.config,
     env: process.env,
