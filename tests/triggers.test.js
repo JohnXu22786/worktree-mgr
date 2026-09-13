@@ -101,6 +101,26 @@ test('runTriggers：等待 close 事件后再读取失败输出', async () => {
   assert.match(warnings[0], /late boom/)
 })
 
+test('runTriggers：stderr 跨 chunk 的 UTF-8 字符保持完整', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+
+  const { warnings } = await runTriggers(['split-utf8-failure'], {}, {
+    spawn: () => {
+      queueMicrotask(() => {
+        child.stderr.emit('data', Buffer.from([0xe4]))
+        child.stderr.emit('data', Buffer.from([0xb8, 0xad]))
+        child.emit('close', 1, null)
+      })
+      return child
+    },
+  })
+
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /退出码 1: 中/)
+})
+
 test('runTriggers：进程信号（非 0 code）与错误事件都归为警告', async () => {
   /** @type {Array<any>} */
   const captured = []

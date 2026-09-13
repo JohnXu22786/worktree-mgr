@@ -7,6 +7,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * @typedef {object} TriggerContext
@@ -68,7 +69,16 @@ function runOne(spawnFn, shell, args, opts) {
     }
     let stdout = ''
     let stderr = ''
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    let outputFlushed = false
     let settled = false
+    const flushOutput = () => {
+      if (outputFlushed) return
+      outputFlushed = true
+      stdout += stdoutDecoder.end()
+      stderr += stderrDecoder.end()
+    }
     /**
      * @param {{ok: boolean, detail: string}} result
      */
@@ -78,12 +88,14 @@ function runOne(spawnFn, shell, args, opts) {
         resolve(result)
       }
     }
-    child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
-    child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
+    child.stdout?.on('data', (/** @type {any} */ d) => { stdout += stdoutDecoder.write(d) })
+    child.stderr?.on('data', (/** @type {any} */ d) => { stderr += stderrDecoder.write(d) })
     child.on('error', (/** @type {any} */ err) => {
+      flushOutput()
       done({ ok: false, detail: `${stderr.trim() || err.message}` })
     })
     child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      flushOutput()
       if (code === 0) {
         done({ ok: true, detail: '' })
       } else {
