@@ -500,7 +500,7 @@ export async function purge(opts) {
  * @param {LedgerRecord} rec
  * @param {string} task
  * @param {string} [mode='commit']
- * @returns {Promise<{ok: boolean, committed: boolean, error?: string}>}
+ * @returns {Promise<{ok: boolean, committed: boolean, sourceRef?: string, error?: string}>}
  */
 async function snapshotCommit(opts, rec, task, mode = 'commit') {
   const { git, cfg } = opts
@@ -510,12 +510,26 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
   if (mode === 'refuse') {
     return { ok: false, committed: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
   }
+
+  // status 读取可能与外部切分支并发；在任何快照写操作前重新确认绑定。
+  const beforeAddBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!beforeAddBranchCheck.ok) return { ok: false, committed: false, error: beforeAddBranchCheck.error }
+
   const message = opts.message ?? renderTemplate(cfg.commitMessage, { task, branch: rec.branch, base: rec.base })
   const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
   if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
+
+  // git add 也可能让出执行权；不要在已漂移的工作区执行 commit。
+  const beforeCommitBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!beforeCommitBranchCheck.ok) return { ok: false, committed: false, error: beforeCommitBranchCheck.error }
+
   const commit = await git.run(['commit', '-m', message], { cwd: rec.path, signal: opts.signal })
   if (!commit.ok) return { ok: false, committed: false, error: `快照提交失败：${commit.stderr.trim()}` }
-  return { ok: true, committed: true }
+  const head = await git.run(['rev-parse', 'HEAD'], { cwd: rec.path, signal: opts.signal })
+  if (!head.ok || !head.stdout.trim()) {
+    return { ok: false, committed: false, error: `读取快照提交失败：${head.stderr.trim() || 'git rev-parse 失败'}` }
+  }
+  return { ok: true, committed: true, sourceRef: head.stdout.trim() }
 }
 
 /**
@@ -523,10 +537,12 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
+ * @param {string} [sourceRef] Immutable snapshot commit to merge when a snapshot was created.
  * @returns {Promise<{ok: boolean, merged: boolean, error?: string, warnings: string[]}>}
  */
-async function mergeIntoBase(opts, rec, task) {
+async function mergeIntoBase(opts, rec, task, sourceRef) {
   const { root, git, cfg } = opts
+  const taskRef = sourceRef ?? `refs/heads/${rec.branch}`
 
   // 合并目标必须与账本记录的基分支一致：主工作区可能已被切到其他分支
   // （或处于 detached HEAD），此时继续会把改动合入错误目标
@@ -560,7 +576,7 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
-  const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
+  const ancestor = await git.run(['merge-base', '--is-ancestor', taskRef, 'HEAD'], { cwd: root, signal: opts.signal })
   if (ancestor.ok) {
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
@@ -573,8 +589,14 @@ async function mergeIntoBase(opts, rec, task) {
     }
   }
 
+  // 基分支检查与 merge-base 读取都可能让出执行权；合并前再次确认任务工作区绑定。
+  const latestBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!latestBranchCheck.ok) {
+    return { ok: false, merged: false, error: latestBranchCheck.error, warnings: [] }
+  }
+
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
+  const merge = await git.run(['merge', '--no-ff', taskRef, '-m', message], { cwd: root, signal: opts.signal })
   if (!merge.ok) {
     return {
       ok: false,
@@ -641,7 +663,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   if (!afterSnapshotBranchCheck.ok) return { ok: false, error: afterSnapshotBranchCheck.error }
 
   // 2) 合并回基分支
-  const merged = await mergeIntoBase(opts, rec, task)
+  const merged = await mergeIntoBase(opts, rec, task, snap.sourceRef)
   if (!merged.ok) return { ok: false, error: merged.error }
   warnings.push(...merged.warnings)
 
@@ -755,7 +777,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     const afterSnapshotBranchCheck = await revalidateWorktreeBranch(opts, rec)
     if (!afterSnapshotBranchCheck.ok) return { ok: false, error: afterSnapshotBranchCheck.error }
 
-    const m = await mergeIntoBase(opts, rec, task)
+    const m = await mergeIntoBase(opts, rec, task, snap.sourceRef)
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
     warnings.push(...m.warnings)
