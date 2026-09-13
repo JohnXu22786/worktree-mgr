@@ -18,8 +18,10 @@ import {
   existsSync,
   futimesSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readlinkSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -121,21 +123,31 @@ export function computeVault(rootPath, vault) {
  * @param {string} path
  * @returns {string}
  */
-function canonicalPath(path) {
+function canonicalPath(path, seen = new Set()) {
   const absolute = resolve(path)
   let existing = absolute
   /** @type {string[]} */
   const suffix = []
-  while (!existsSync(existing)) {
-    const parent = dirname(existing)
-    if (parent === existing) return absolute
-    suffix.unshift(basename(existing))
-    existing = parent
-  }
-  try {
-    return join(realpathSync(existing), ...suffix)
-  } catch {
-    return absolute
+
+  while (true) {
+    try {
+      const stat = lstatSync(existing)
+      if (stat.isSymbolicLink()) {
+        if (seen.has(existing)) return absolute
+        seen.add(existing)
+        const linkTarget = readlinkSync(existing)
+        const resolvedTarget = isAbsolute(linkTarget)
+          ? linkTarget
+          : resolve(dirname(existing), linkTarget)
+        return canonicalPath(join(resolvedTarget, ...suffix), seen)
+      }
+      return join(realpathSync(existing), ...suffix)
+    } catch {
+      const parent = dirname(existing)
+      if (parent === existing) return absolute
+      suffix.unshift(basename(existing))
+      existing = parent
+    }
   }
 }
 
