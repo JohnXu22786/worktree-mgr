@@ -1033,6 +1033,30 @@ test('mergeTask：工作区分支与账本不一致时拒绝（防静默错分�
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('mergeTask：快照前重新校验任务工作区分支，防止并发漂移后错分支提交', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
+  const taskPath = join(vault, 't')
+  let worktreeListCalls = 0
+  git.on(['worktree', 'list', '--porcelain'], () => {
+    worktreeListCalls += 1
+    const taskBranch = worktreeListCalls === 1 ? 'wtm/t' : 'other'
+    return OK(
+      'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+      'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + taskBranch + '\n',
+    )
+  })
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /分支与账本记录不一致/)
+  assert.equal(worktreeListCalls, 2)
+  assert.equal(git.count(['commit', '-m', 'snapshot T']), 0, '分支漂移后不应提交快照')
+  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0, '分支漂移后不应合并记录分支')
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('mergeTask：主工作区不在账本基分支时拒绝（防合入错误分支）', async () => {
   const tmp = makeTmp()
   const { cfg, git } = mergeFixture(tmp)

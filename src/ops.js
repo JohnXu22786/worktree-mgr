@@ -626,8 +626,19 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
       return { ok: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
     }
   }
+
+  // 状态检查可能让出执行权，期间任务工作区可能被切换到其他分支；
+  // 快照前必须重新确认当前工作区仍绑定到账本分支。
+  const beforeSnapshotBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!beforeSnapshotBranchCheck.ok) return { ok: false, error: beforeSnapshotBranchCheck.error }
+
   const snap = await snapshotCommit(opts, rec, task, mode)
   if (!snap.ok) return { ok: false, error: snap.error }
+
+  // 快照提交本身也可能与外部切分支并发，合并前再次确认，避免把成功
+  // 报告建立在“提交到了其他分支、却合并了账本分支”的错误结果上。
+  const afterSnapshotBranchCheck = await revalidateWorktreeBranch(opts, rec)
+  if (!afterSnapshotBranchCheck.ok) return { ok: false, error: afterSnapshotBranchCheck.error }
 
   // 2) 合并回基分支
   const merged = await mergeIntoBase(opts, rec, task)
@@ -668,6 +679,21 @@ function checkWorktreeBranch(wt, rec) {
     }
   }
   return { ok: true }
+}
+
+/**
+ * 重新读取任务工作区绑定并校验其分支，避免复用快照前的旧 worktree 列表。
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true} | {ok: false, error: string}>}
+ */
+async function revalidateWorktreeBranch(opts, rec) {
+  const { root, git } = opts
+  const wl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
+  if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
+  const wt = parseWorktreeList(wl.stdout).find((w) => samePath(w.path, rec.path))
+  if (!wt) return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
+  return checkWorktreeBranch(wt, rec)
 }
 
 /**
@@ -718,10 +744,17 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   let committed = false
   let merged = false
   if (mode === 'commit') {
+    const beforeSnapshotBranchCheck = await revalidateWorktreeBranch(opts, rec)
+    if (!beforeSnapshotBranchCheck.ok) return { ok: false, error: beforeSnapshotBranchCheck.error }
+
     // 快照提交 + 合并（abandon 模式两者都跳过）
     const snap = await snapshotCommit(opts, rec, task)
     if (!snap.ok) return { ok: false, error: snap.error }
     committed = snap.committed
+
+    const afterSnapshotBranchCheck = await revalidateWorktreeBranch(opts, rec)
+    if (!afterSnapshotBranchCheck.ok) return { ok: false, error: afterSnapshotBranchCheck.error }
+
     const m = await mergeIntoBase(opts, rec, task)
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
