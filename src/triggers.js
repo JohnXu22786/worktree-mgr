@@ -20,7 +20,7 @@ import { StringDecoder } from 'node:string_decoder'
 
 /**
  * 顺序执行一组触发器命令。
- * @param {string[] | undefined} commands
+ * @param {unknown[] | undefined} commands
  * @param {TriggerContext} ctx
  * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string}} [opts]
  *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）
@@ -35,8 +35,12 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd }
     return { warnings }
   }
   const isWin = process.platform === 'win32'
-  for (const cmd of commands) {
-    if (typeof cmd !== 'string' || cmd.trim() === '') continue
+  for (const [index, cmd] of commands.entries()) {
+    if (typeof cmd !== 'string') {
+      warnings.push(`触发器配置项无效（索引 ${index}），必须是字符串，已忽略`)
+      continue
+    }
+    if (cmd.trim() === '') continue
     const shell = isWin ? 'cmd' : 'sh'
     const args = isWin ? ['/d', '/s', '/c', cmd] : ['-c', cmd]
     const env = {
