@@ -201,6 +201,19 @@ test('isWithin：重复解析符号链接时仍处理后续 ..，拒绝仓库外
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('isWithin：符号链接循环时拒绝未解析路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const first = join(root, 'first')
+  const second = join(root, 'second')
+  mkdirSync(root)
+  symlinkSync('second', first)
+  symlinkSync('first', second)
+
+  assert.equal(isWithin(root, `${first}${sep}vault`), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
   const dir = makeTmp()
   const ledger = loadLedger(dir)
