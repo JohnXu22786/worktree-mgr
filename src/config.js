@@ -46,6 +46,12 @@ export function loadConfig({ pluginConfig = {}, env = process.env, repoConfig = 
   ) => {
     if (source === null || typeof source !== 'object' || Array.isArray(source)) return
     for (const [key, value] of Object.entries(/** @type {Record<string, unknown>} */ (source))) {
+      if (key === 'root' && label === '插件配置') {
+        if (value !== undefined && (value === null || typeof value !== 'string')) {
+          warnings.push(`${label}存在未知或类型不符的配置键: ${key}`)
+        }
+        continue
+      }
       if (key === 'seed' || key === 'triggers') {
         if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value))) {
           warnings.push(`${label}存在未知或类型不符的配置键: ${key}`)
@@ -57,9 +63,7 @@ export function loadConfig({ pluginConfig = {}, env = process.env, repoConfig = 
       else if (key === 'vault' && typeof value === 'string') cfg.vault = value
       else if (key === 'commitMessage' && typeof value === 'string') cfg.commitMessage = value
       else if (key === 'mergeMessage' && typeof value === 'string') cfg.mergeMessage = value
-      else if (key === 'root' && label === '插件配置') {
-        // 工具层消费，这里忽略
-      } else {
+      else {
         warnings.push(`${label}存在未知或类型不符的配置键: ${key}`)
       }
     }

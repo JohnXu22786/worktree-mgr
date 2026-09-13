@@ -61,6 +61,16 @@ test('loadConfig：非法前缀与非法消息产生警告而非崩溃', () => {
   assert.ok(cfg.warnings.length >= 2, `应有警告，实际: ${JSON.stringify(cfg.warnings)}`)
 })
 
+test('loadConfig：插件 root 类型无效时产生警告', () => {
+  for (const root of [null, 42, false, {}, []]) {
+    const cfg = loadConfig({ pluginConfig: { root } })
+    assert.equal(cfg.warnings.length, 1, `root=${JSON.stringify(root)} 应产生一条警告`)
+    assert.match(cfg.warnings[0], /root/)
+  }
+
+  assert.deepEqual(loadConfig({ pluginConfig: { root: '/repo' } }).warnings, [])
+})
+
 test('loadConfig：未知配置键产生警告，seed/triggers 属于仓库文件合法键', () => {
   const cfg = loadConfig({
     repoConfig: { seed: { files: ['a'] }, triggers: { on_begin: ['x'] }, bogusKey: 1 },
