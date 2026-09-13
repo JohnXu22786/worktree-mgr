@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createToolSet, readRepoConfig } from '../src/tools.js'
+import { GitRunner } from '../src/git.js'
 
 class FakeGit {
   /** @type {Array<{args: string[], cwd: string | undefined}>} */
@@ -242,6 +243,18 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   const rendered = status.output.render({}, value)
   assert.match(rendered[0].text, /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('wtm_status：root 解析同步失败时返回结构化错误而非抛异常', async () => {
+  const tools = createToolSet({ config: {}, git: new GitRunner() })
+  const status = tools.find((t) => t.name === 'wtm_status')
+  assert.ok(status, '工具 status 应存在')
+
+  const value = /** @type {{ok: boolean, error?: string}} */ (
+    await status.execute({ root: 'bad\0path' }, { signal: makeSignal() })
+  )
+  assert.equal(value.ok, false)
+  assert.match(value.error ?? '', /invalid|argument|path/i)
 })
 
 test('wtm_merge/wtm_finish/wtm_purge：失败时渲染操作警告', () => {
