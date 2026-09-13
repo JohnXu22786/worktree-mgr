@@ -7,8 +7,20 @@ import {
   parseRepoConfigText,
 } from '../src/config.js'
 
+function isolatedEnv() {
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('WTM_')) delete env[key]
+  }
+  return env
+}
+
+function loadTestConfig(options = {}) {
+  return loadConfig({ env: isolatedEnv(), ...options })
+}
+
 test('loadConfig：默认值', () => {
-  const cfg = loadConfig({})
+  const cfg = loadTestConfig({})
   assert.equal(cfg.prefix, 'wtm')
   assert.equal(cfg.vault, null)
   assert.match(cfg.commitMessage, /\{task\}/)
@@ -17,7 +29,7 @@ test('loadConfig：默认值', () => {
 })
 
 test('loadConfig：优先级 默认 < 插件配置 < 仓库文件 < 环境变量', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     pluginConfig: { prefix: 'from-plugin', vault: 'P' },
     repoConfig: { prefix: 'from-repo', vault: 'R' },
     env: { WTM_PREFIX: 'from-env' },
@@ -27,7 +39,7 @@ test('loadConfig：优先级 默认 < 插件配置 < 仓库文件 < 环境变量
 })
 
 test('loadConfig：仓库文件覆盖插件配置', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     pluginConfig: { prefix: 'plugin', vault: 'P' },
     repoConfig: { prefix: 'repo' },
   })
@@ -36,7 +48,7 @@ test('loadConfig：仓库文件覆盖插件配置', () => {
 })
 
 test('loadConfig：环境变量直接映射', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     env: {
       WTM_VAULT: 'D:/vault',
       WTM_PREFIX: 'iso',
@@ -51,7 +63,7 @@ test('loadConfig：环境变量直接映射', () => {
 })
 
 test('loadConfig：非法前缀与非法消息产生警告而非崩溃', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     pluginConfig: { prefix: '-bad' },
     repoConfig: { prefix: 'a/b', commitMessage: 42 },
     env: { WTM_PREFIX: 'x y' },
@@ -63,16 +75,16 @@ test('loadConfig：非法前缀与非法消息产生警告而非崩溃', () => {
 
 test('loadConfig：插件 root 类型无效时产生警告', () => {
   for (const root of [null, 42, false, {}, []]) {
-    const cfg = loadConfig({ pluginConfig: { root } })
+    const cfg = loadTestConfig({ pluginConfig: { root } })
     assert.equal(cfg.warnings.length, 1, `root=${JSON.stringify(root)} 应产生一条警告`)
     assert.match(cfg.warnings[0], /root/)
   }
 
-  assert.deepEqual(loadConfig({ pluginConfig: { root: '/repo' } }).warnings, [])
+  assert.deepEqual(loadTestConfig({ pluginConfig: { root: '/repo' } }).warnings, [])
 })
 
 test('loadConfig：未知配置键产生警告，seed/triggers 属于仓库文件合法键', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     repoConfig: { seed: { files: ['a'] }, triggers: { on_begin: ['x'] }, bogusKey: 1 },
   })
   assert.equal(cfg.warnings.length, 1)
@@ -80,7 +92,7 @@ test('loadConfig：未知配置键产生警告，seed/triggers 属于仓库文�
 })
 
 test('loadConfig：非法 seed/triggers 类型产生警告', () => {
-  const cfg = loadConfig({
+  const cfg = loadTestConfig({
     repoConfig: { seed: 'invalid', triggers: ['invalid'] },
   })
   assert.equal(cfg.warnings.length, 2)

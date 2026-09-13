@@ -8,15 +8,21 @@ import { test } from 'node:test'
 
 const CLI = fileURLToPath(new URL('../bin/wtm.js', import.meta.url))
 
+function isolatedEnv() {
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('WTM_')) delete env[key]
+  }
+  return env
+}
+
 /**
  * @param {string[]} args
  * @param {string} cwd
  * @returns {import('node:child_process').SpawnSyncReturns<string>}
  */
 function runCli(args, cwd) {
-  const env = { ...process.env }
-  delete env.WTM_ROOT
-  delete env.WTM_VAULT
+  const env = isolatedEnv()
   return spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: 'utf8',
@@ -74,9 +80,7 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
 
 test('CLI：当前目录被删除时 --json 返回结构化 root 解析错误', { skip: process.platform === 'win32' }, () => {
   const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-missing-cwd-'))
-  const env = { ...process.env }
-  delete env.WTM_ROOT
-  delete env.WTM_VAULT
+  const env = isolatedEnv()
   try {
     const script = [
       "import { rmSync } from 'node:fs'",
