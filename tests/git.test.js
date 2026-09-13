@@ -134,6 +134,16 @@ test('parseWorktreeList：保留路径末尾的换行', () => {
   assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\n')
 })
 
+test('parseWorktreeList：保留 POSIX 路径末尾的回车符', () => {
+  const text = [
+    'worktree /tmp/worktree\r',
+    'HEAD 7777777777777777777777777777777777777777',
+    'branch refs/heads/task-with-trailing-carriage-return',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\r')
+})
+
 test('parseAheadBehind：按 base...branch 语义映射 rev-list 计数', () => {
   // rev-list 的第一个计数是基分支独有提交（任务落后），第二个是任务分支独有提交（任务领先）。
   assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 5, behind: 3 })
