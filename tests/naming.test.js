@@ -158,6 +158,10 @@ test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
   }
 })
 
+test('validateBranch：拒绝保留的 HEAD 分支名', () => {
+  assert.equal(validateBranch('HEAD').ok, false)
+})
+
 test('validateBranch：长度上限 255', () => {
   assert.equal(validateBranch('x'.repeat(255)).ok, true)
   assert.equal(validateBranch('x'.repeat(256)).ok, false)

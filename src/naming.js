@@ -118,6 +118,8 @@ export function validateBranch(branch) {
   if (branch.includes('@{')) return { ok: false, reason: '分支名不能包含 @{' }
   // git check-ref-format 拒绝整个 refname 为单独的 @（它是 HEAD 的简写）
   if (branch === '@') return { ok: false, reason: '分支名不能是单独的 @' }
+  // HEAD 是 Git 的保留伪引用，不能作为分支名
+  if (branch === 'HEAD') return { ok: false, reason: '分支名不能是保留的 HEAD' }
   // 逐字符黑名单：空格、~ ^ : ? * [ \、控制字符
   for (const ch of branch) {
     if (/\s/u.test(ch)) return { ok: false, reason: `分支名不能包含空白字符: ${JSON.stringify(ch)}` }
