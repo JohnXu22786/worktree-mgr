@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   VaultError,
@@ -147,6 +147,70 @@ test('isWithin：指向仓库内缺失路径的悬空符号链接仍视为位于
   mkdirSync(root)
   symlinkSync(join(root, 'future-vault'), link)
   assert.equal(isWithin(root, link), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过包含检查', () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const outside = join(dir, 'outside')
+  const link = join(outside, 'link')
+  mkdirSync(root)
+  mkdirSync(join(root, 'inside'))
+  mkdirSync(outside)
+  symlinkSync(join(root, 'inside'), link, process.platform === 'win32' ? 'junction' : 'dir')
+
+  const vault = `${link}${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(root, 'vault')), true)
+  assert.equal(existsSync(join(outside, 'vault')), false)
+  assert.equal(isWithin(root, vault), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：相对符号链接目标从符号链接目录解析', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const outside = join(dir, 'outside')
+  const link = join(outside, 'link')
+  mkdirSync(root)
+  mkdirSync(join(root, 'inside'))
+  mkdirSync(outside)
+  symlinkSync('../repo/inside', link)
+
+  const vault = `${link}${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(root, 'vault')), true)
+  assert.equal(existsSync(join(outside, 'vault')), false)
+  assert.equal(isWithin(root, vault), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：重复解析符号链接时仍处理后续 ..，拒绝仓库外路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const link = join(root, 'link')
+  mkdirSync(root)
+  symlinkSync(root, link)
+
+  const vault = `${link}${sep}link${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(dir, 'vault')), true)
+  assert.equal(existsSync(join(root, 'vault')), false)
+  assert.equal(isWithin(root, vault), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：符号链接循环时拒绝未解析路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const first = join(root, 'first')
+  const second = join(root, 'second')
+  mkdirSync(root)
+  symlinkSync('second', first)
+  symlinkSync('first', second)
+
+  assert.equal(isWithin(root, `${first}${sep}vault`), false)
   rmSync(dir, { recursive: true, force: true })
 })
 
