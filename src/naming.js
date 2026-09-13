@@ -118,6 +118,8 @@ export function validateBranch(branch) {
   if (branch.includes('@{')) return { ok: false, reason: '分支名不能包含 @{' }
   // git check-ref-format 拒绝整个 refname 为单独的 @（它是 HEAD 的简写）
   if (branch === '@') return { ok: false, reason: '分支名不能是单独的 @' }
+  // HEAD 是 Git 的保留伪引用，不能作为分支名
+  if (branch === 'HEAD') return { ok: false, reason: '分支名不能是保留的 HEAD' }
   // 逐字符黑名单：空格、~ ^ : ? * [ \、控制字符
   for (const ch of branch) {
     if (/\s/u.test(ch)) return { ok: false, reason: `分支名不能包含空白字符: ${JSON.stringify(ch)}` }
@@ -139,7 +141,8 @@ export function validateBranch(branch) {
  */
 export function validatePrefix(prefix) {
   const r = validateBranch(prefix)
-  if (!r.ok) return r
+  // HEAD is reserved only as a complete branch name, not as a prefix such as HEAD/task.
+  if (!r.ok && prefix !== 'HEAD') return r
   if (prefix.includes('/')) return { ok: false, reason: '前缀必须是单段，不能包含 /' }
   if (prefix.length > MAX_BRANCH_LENGTH - 1 - MIN_SLUG_UTF16_LENGTH) {
     return { ok: false, reason: '前缀过长，无法为派生 slug 留出空间' }
