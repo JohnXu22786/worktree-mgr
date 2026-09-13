@@ -305,6 +305,7 @@ export async function withLock(vaultDir, fn, {
     }
   }, heartbeatMs)
   try {
+    throwIfAborted()
     return await fn()
   } finally {
     clearInterval(heartbeat)
