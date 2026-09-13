@@ -759,6 +759,54 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('listStatus：rev-list 失败时保留未知计数并返回警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], FAIL('fatal: bad object'))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, true)
+  assert.equal(r.rows?.[0].counts, null)
+  assert.ok(r.warnings?.some((w) => /T/.test(w) && /bad object/.test(w)), JSON.stringify(r.warnings))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('listStatus：rev-list 输出格式异常时保留未知计数并返回警告', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...wtm/t'], OK('not a count'))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, true)
+  assert.equal(r.rows?.[0].counts, null)
+  assert.ok(r.warnings?.some((w) => /T/.test(w) && /格式|计数|rev-list/i.test(w)), JSON.stringify(r.warnings))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('listStatus：工作区分支漂移时标记为不存在且不计算错误分支状态', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
