@@ -705,15 +705,15 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     return { ok: true, note: `任务工作区已不存在，已清理账本记录（任务：${task}）`, committed: false, merged: false }
   }
 
+  if (pathState.isDirectory !== true) {
+    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
+  }
+
   // keep：仅解除管理
   if (mode === 'keep') {
     removeRecord(ledger, task)
     saveLedger(vault, ledger)
     return { ok: true, note: `任务“${task}”已解除管理，工作区与分支保留`, committed: false, merged: false }
-  }
-
-  if (pathState.isDirectory !== true) {
-    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
   }
 
   // commit 与 abandon 都会移除工作区和处理任务分支，必须先确认当前工作区

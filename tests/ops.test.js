@@ -713,6 +713,24 @@ test('finishTask：工作区路径被普通文件替换时失败并保留记录'
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('finishTask：keep 模式工作区路径被普通文件替换时失败并保留记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  rmSync(taskPath, { recursive: true, force: true })
+  fs.writeFileSync(taskPath, 'not a directory')
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'keep', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /工作区|目录/)
+  assert.equal(loadLedger(vault).records.length, 1)
+  assert.equal(git.count(['worktree', 'remove', taskPath]), 0)
+  assert.equal(git.count(['branch', '-d', 'wtm/t']), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('finishTask：记录不存在报错；非法 mode 报错', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
@@ -1048,6 +1066,25 @@ test('purge：工作区路径被普通文件替换时报告失败并保留记录
   assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   assert.equal(git.count(['worktree', 'remove', taskPath]), 0)
   assert.equal(git.count(['branch', '-d', 'wtm/t']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('purge：keep 模式工作区路径被普通文件替换时报告失败并保留记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  rmSync(taskPath, { recursive: true, force: true })
+  fs.writeFileSync(taskPath, 'not a directory')
+
+  const r = await purge({ root: 'C:/repo', tasks: ['T'], mode: 'keep', cfg, git, repo: null })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.results?.[0].ok, false)
+  assert.match(r.results?.[0].error ?? '', /工作区|目录/)
+  assert.equal(loadLedger(vault).records.length, 1)
+  assert.equal(git.count(['worktree', 'remove', taskPath]), 0)
+  assert.equal(git.count(['branch', '-d', 'wtm/t']), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
