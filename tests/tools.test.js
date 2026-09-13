@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createToolSet, readRepoConfig } from '../src/tools.js'
 import { GitRunner } from '../src/git.js'
+import { EMPTY_LEDGER, saveLedger, upsertRecord } from '../src/vault.js'
 
 class FakeGit {
   /** @type {Array<{args: string[], cwd: string | undefined}>} */
@@ -347,6 +348,51 @@ test('wtm_finish 必填参数与默认 mode', () => {
   assert.equal(fp.properties.mode?.enum?.includes('commit'), true)
   assert.equal(fp.properties.mode?.enum?.includes('abandon'), true)
   assert.equal(fp.properties.mode?.enum?.includes('keep'), true)
+})
+
+test('wtm_finish：移除工作区失败时保留操作警告', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    const root = join(tmp, 'repo')
+    const vault = join(tmp, 'vault')
+    const worktreePath = join(vault, 't')
+    mkdirSync(root, { recursive: true })
+    mkdirSync(worktreePath, { recursive: true })
+    const triggerCommand = 'wtm-test-missing-merge-hook'
+    writeFileSync(join(root, '.wtm.json'), JSON.stringify({ triggers: { on_merge: [triggerCommand] } }))
+
+    const ledger = structuredClone(EMPTY_LEDGER)
+    upsertRecord(ledger, {
+      task: 'T', branch: 'wtm/t', base: 'main', path: worktreePath,
+      createdAt: 'c', updatedAt: 'u',
+    })
+    saveLedger(vault, ledger)
+
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
+    git.on(['worktree', 'list', '--porcelain'], OK(
+      `worktree ${root}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${worktreePath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/wtm/t\n`,
+    ))
+    git.on(['status', '--porcelain'], OK())
+    git.on(['branch', '--show-current'], OK('main\n'))
+    git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
+    git.on(['merge', '--no-ff', 'wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
+    git.on(['worktree', 'remove', worktreePath], FAIL('cannot remove worktree'))
+
+    const tools = createToolSet({ config: { root, vault }, git })
+    const finish = tools.find((t) => t.name === 'wtm_finish')
+    assert.ok(finish, '工具 finish 应存在')
+    const value = /** @type {{ok: boolean, error?: string, warnings?: string[]}} */ (
+      await finish.execute({ task: 'T' }, { signal: makeSignal() })
+    )
+
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /cannot remove worktree/)
+    assert.ok(value.warnings?.some((w) => w.includes(triggerCommand)), JSON.stringify(value))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('wtm_status：无任务时返回空总览', async () => {

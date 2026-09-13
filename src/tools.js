@@ -289,7 +289,7 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, mode: a.mode, message: a.message,
         cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
+      if (!r.ok) return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
