@@ -272,6 +272,35 @@ test('withLock：竞争时等待对方释放（并发交错）', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：等待期间 signal 中止时立即抛出 AbortError', async () => {
+  const dir = makeTmp()
+  let firstInside = false
+  /** @type {((value?: unknown) => void) | undefined} */
+  let release
+  const gate = new Promise((r) => { release = r })
+  const p1 = withLock(dir, async () => {
+    firstInside = true
+    await gate
+  })
+  while (!firstInside) await new Promise((r) => setTimeout(r, 5))
+
+  const ac = new AbortController()
+  let p2Ran = false
+  const p2 = withLock(dir, async () => { p2Ran = true }, {
+    timeoutMs: 5000,
+    signal: ac.signal,
+  })
+  await new Promise((r) => setTimeout(r, 50))
+  ac.abort()
+
+  await assert.rejects(p2, (error) => error?.name === 'AbortError')
+  assert.equal(p2Ran, false)
+  assert.ok(release, 'release 应已赋值')
+  release()
+  await p1
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：超时抛出 VaultError', async () => {
   const dir = makeTmp()
   mkdirSync(dir, { recursive: true })
