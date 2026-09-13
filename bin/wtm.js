@@ -45,7 +45,7 @@ function usage() {
  * @property {boolean} [merged]
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null}>} [rows]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, branchDrift: boolean, currentBranch: string | null, dirty: boolean | null, counts: {ahead: number, behind: number} | null}>} [rows]
  * @property {Array<{task: string, ok: boolean, error?: string, note?: string, warnings?: string[]}>} [results]
  * @property {string[]} [warnings]
  */
@@ -117,7 +117,13 @@ function printResult(result, json) {
       process.stdout.write(`进行中的任务（${result.rows.length}）：\n`)
       for (const r of result.rows) {
         const state = []
-        if (!r.exists) state.push('工作区缺失')
+        if (r.branchDrift) {
+          const currentBranch = r.currentBranch ?? 'detached HEAD'
+          state.push(
+            `分支漂移（工作区当前为 ${currentBranch}，账本记录为 ${r.branch}）。` +
+            `请在工作区切回 ${r.branch}（git switch ${r.branch}），或用 wtm_finish --mode keep 解除管理后手动处理`,
+          )
+        } else if (!r.exists) state.push('工作区缺失')
         else if (r.dirty) state.push('有未提交改动')
         if (r.counts) {
           if (r.counts.ahead > 0) state.push(`领先 ${r.counts.ahead}`)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -69,6 +69,39 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
     assert.match(payload.error, /EISDIR/)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('CLI：status 将工作区分支漂移渲染为可操作提示而非工作区缺失', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-branch-drift-vault-'))
+  const taskPath = join(vault, 'branch-drift')
+  try {
+    execFileSync('git', ['init', '--quiet', '-b', 'main', root])
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'wtm-test'])
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'wtm@example.test'])
+    writeFileSync(join(root, 'base.txt'), 'base\n')
+    execFileSync('git', ['-C', root, 'add', 'base.txt'])
+    execFileSync('git', ['-C', root, 'commit', '--quiet', '-m', 'init'])
+    writeFileSync(join(root, '.wtm.json'), JSON.stringify({ vault }))
+
+    const begin = runCli(['begin', 'branch-drift', '--root', root], root)
+    assert.equal(begin.status, 0, begin.stderr)
+    assert.equal(existsSync(taskPath), true)
+
+    execFileSync('git', ['-C', taskPath, 'switch', '--create', 'other'])
+    const status = runCli(['status', '--root', root], root)
+
+    assert.equal(status.status, 0, `${status.stderr}\n${status.stdout}`)
+    assert.doesNotMatch(status.stdout, /工作区缺失/)
+    assert.match(status.stdout, /分支漂移/)
+    assert.match(status.stdout, /git switch wtm\/branch-drift/)
+  } finally {
+    if (existsSync(taskPath)) {
+      execFileSync('git', ['-C', root, 'worktree', 'remove', '--force', taskPath], { stdio: 'ignore' })
+    }
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
   }
 })
 
