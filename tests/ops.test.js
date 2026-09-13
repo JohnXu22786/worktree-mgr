@@ -658,6 +658,33 @@ test('finishTask：abandon 模式发现工作区分支不一致时拒绝删除',
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('finishTask：abandon 模式在 destructive 清理前发现分支漂移时拒绝删除', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  let worktreeListCalls = 0
+  git.on(['worktree', 'list', '--porcelain'], () => {
+    worktreeListCalls += 1
+    const taskBranch = worktreeListCalls === 1 ? 'wtm/t' : 'other'
+    return OK(
+      'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+      'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + taskBranch + '\n',
+    )
+  })
+  git.on(['worktree', 'remove', '--force', taskPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /分支与账本记录不一致/)
+  assert.equal(worktreeListCalls, 2)
+  assert.equal(git.count(['worktree', 'remove', '--force', taskPath]), 0)
+  assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+  assert.deepEqual(loadLedger(vault).records.map((rec) => rec.branch), ['wtm/t'])
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('finishTask：keep 模式仅解除管理，不触碰工作区与分支', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp)

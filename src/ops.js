@@ -725,6 +725,20 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     }
   }
 
+  // 提交、合并及触发器都可能让工作区在上一次检查后发生分支漂移。
+  // destructive 操作必须绑定到收尾前仍在账本分支上的同一个工作区，
+  // 否则按路径移除可能误删其他分支，随后按账本分支名删除也会扩大损害。
+  const latestWl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
+  if (!latestWl.ok) {
+    return { ok: false, error: `读取 worktree 列表失败：${latestWl.stderr.trim()}`, warnings }
+  }
+  const latestWt = parseWorktreeList(latestWl.stdout).find((w) => samePath(w.path, rec.path))
+  if (!latestWt) {
+    return { ok: false, error: `任务工作区在收尾前已不存在（${rec.path}），已拒绝 destructive 清理`, warnings }
+  }
+  const latestBranchCheck = checkWorktreeBranch(latestWt, rec)
+  if (!latestBranchCheck.ok) return { ok: false, error: latestBranchCheck.error, warnings }
+
   // 移除工作区：commit 用安全移除，abandon 用 --force
   const removeArgs = mode === 'abandon'
     ? ['worktree', 'remove', '--force', rec.path]
