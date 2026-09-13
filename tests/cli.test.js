@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 
 const CLI = fileURLToPath(new URL('../bin/wtm.js', import.meta.url))
@@ -69,6 +69,36 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
     assert.match(payload.error, /EISDIR/)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('CLI：当前目录被删除时 --json 返回结构化 root 解析错误', { skip: process.platform === 'win32' }, () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-missing-cwd-'))
+  const env = { ...process.env }
+  delete env.WTM_ROOT
+  delete env.WTM_VAULT
+  try {
+    const script = [
+      "import { rmSync } from 'node:fs'",
+      `process.argv = [process.argv[0], ${JSON.stringify(CLI)}, 'status', '--json']`,
+      `process.chdir(${JSON.stringify(cwd)})`,
+      `rmSync(${JSON.stringify(cwd)}, { recursive: true, force: true })`,
+      `await import(${JSON.stringify(pathToFileURL(CLI).href)})`,
+    ].join('\n')
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd,
+      encoding: 'utf8',
+      env,
+    })
+
+    assert.equal(result.status, 1, result.stderr)
+    assert.equal(result.stderr, '')
+    const payload = JSON.parse(result.stdout)
+    assert.equal(payload.ok, false)
+    assert.match(payload.error, /解析仓库路径失败/)
+    assert.match(payload.error, /cwd|ENOENT|no such file/i)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
   }
 })
 
