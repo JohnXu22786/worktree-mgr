@@ -127,8 +127,6 @@ export function validateBranch(branch) {
   if (branch.includes('//')) return { ok: false, reason: '分支名不能包含连续 /' }
   if (branch.includes('..')) return { ok: false, reason: '分支名不能包含 ..' }
   if (branch.includes('@{')) return { ok: false, reason: '分支名不能包含 @{' }
-  // git check-ref-format 拒绝整个 refname 为单独的 @（它是 HEAD 的简写）
-  if (branch === '@') return { ok: false, reason: '分支名不能是单独的 @' }
   // HEAD 是 Git 的保留伪引用，不能作为分支名
   if (branch === 'HEAD') return { ok: false, reason: '分支名不能是保留的 HEAD' }
   // 逐字符黑名单：空格、~ ^ : ? * [ \、控制字符
