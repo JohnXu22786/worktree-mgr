@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -69,5 +69,36 @@ test('CLI：仓库配置读取失败时 --json 返回结构化错误', () => {
     assert.match(payload.error, /EISDIR/)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('CLI：非 JSON 失败时仍输出工作区回滚警告', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'wtm-cli-rollback-'))
+  const vault = mkdtempSync(join(tmpdir(), 'wtm-cli-rollback-vault-'))
+  try {
+    execFileSync('git', ['init', '--quiet', '-b', 'main', root])
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'wtm-test'])
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'wtm@example.test'])
+    writeFileSync(join(root, 'base.txt'), 'base\n')
+    execFileSync('git', ['-C', root, 'add', 'base.txt'])
+    execFileSync('git', ['-C', root, 'commit', '--quiet', '-m', 'init'])
+    writeFileSync(join(root, '.wtm.json'), JSON.stringify({
+      vault,
+      triggers: {
+        on_begin: [
+          `rm -rf "$WTM_PATH" && touch "$WTM_PATH" && rm -f '${join(vault, 'index.json')}' && mkdir '${join(vault, 'index.json')}'`,
+        ],
+      },
+    }))
+
+    const result = runCli(['begin', 'rollback-warning', '--root', root], root)
+
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /错误：创建失败/)
+    assert.match(result.stdout, /警告：工作区创建未完成，且回滚失败/)
+    assert.match(result.stdout, /请手动执行 git worktree remove \/ branch -D/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
   }
 })

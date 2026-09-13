@@ -96,6 +96,7 @@ function printResult(result, json) {
   }
   if (!result.ok) {
     process.stderr.write(`错误：${result.error}\n`)
+    for (const w of result.warnings ?? []) process.stdout.write(`警告：${w}\n`)
     return 1
   }
   let exitCode = 0
