@@ -382,6 +382,7 @@ export async function listStatus(opts) {
   try {
     const ledger = loadLedger(vault)
     const wl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
+    if (wl.aborted || isAborted(opts.signal)) return abortResult()
     if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
     const worktrees = parseWorktreeList(wl.stdout)
     /** @type {string[]} */
@@ -401,6 +402,7 @@ export async function listStatus(opts) {
       }
       if (alive) {
         const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
+        if (st.aborted || isAborted(opts.signal)) return abortResult()
         if (st.ok) {
           dirty = isDirty(st.stdout)
         } else {
@@ -408,6 +410,7 @@ export async function listStatus(opts) {
           warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
         }
         const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...refs/heads/${rec.branch}`], { cwd: root, signal: opts.signal })
+        if (rc.aborted || isAborted(opts.signal)) return abortResult()
         const parsedCounts = rc.ok ? parseAheadBehind(rc.stdout) : null
         if (parsedCounts) {
           counts = parsedCounts
@@ -427,6 +430,7 @@ export async function listStatus(opts) {
         updatedAt: rec.updatedAt,
       })
     }
+    if (isAborted(opts.signal)) return abortResult()
     return { ok: true, rows, warnings }
   } catch (err) {
     if (err instanceof VaultError) return { ok: false, error: err.message }

@@ -759,6 +759,57 @@ test('listStatus：git status 失败时标记状态未知并返回警告', async
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('listStatus：任务状态 Git 调用中止时返回取消结果而不继续统计', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['status', '--porcelain'], { ok: false, code: -1, stdout: '', stderr: '', aborted: true })
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...refs/heads/wtm/t'], OK('0\t0'))
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  assert.equal(git.count(['rev-list', '--left-right', '--count', 'refs/heads/main...refs/heads/wtm/t']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('listStatus：最后一次 Git 调用后 signal 中止时不返回部分结果', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const git = new FakeGit()
+  const taskPath = join(cfg.vault, 't')
+  const ledger = structuredClone(EMPTY_LEDGER)
+  upsertRecord(ledger, { task: 'T', branch: 'wtm/t', base: 'main', path: taskPath, createdAt: 'c', updatedAt: 'u' })
+  saveLedger(cfg.vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+
+  const ac = new AbortController()
+  git.on(['worktree', 'list', '--porcelain'], OK(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+  ))
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['rev-list', '--left-right', '--count', 'refs/heads/main...refs/heads/wtm/t'], () => {
+    ac.abort()
+    return OK('0\t0')
+  })
+
+  const r = await listStatus({ root: 'C:/repo', cfg, git, repo: null, signal: ac.signal })
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /取消|abort/i)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('listStatus：rev-list 失败时保留未知计数并返回警告', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
