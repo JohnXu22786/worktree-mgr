@@ -121,7 +121,7 @@ export function computeVault(rootPath, vault) {
  * 按路径段解析别名和符号链接，确保符号链接先于后续的 .. 处理。
  * 目标目录可能尚未创建，因此遇到不存在的路径段后继续拼接剩余路径。
  * @param {string} path
- * @returns {string}
+ * @returns {string | null}
  */
 function canonicalPath(path, seen = new Set()) {
   const separatorPattern = process.platform === 'win32' ? /[\\/]+/ : /\/+/
@@ -138,11 +138,18 @@ function canonicalPath(path, seen = new Set()) {
     : `${resolve('.')}${process.platform === 'win32' ? '\\' : '/'}${path}`
   const parsed = splitPath(absolute)
   let existing = parsed.root
-  const pending = parsed.parts
+  /** @type {(string | { done: string })[]} */
+  const pending = [...parsed.parts]
 
   while (pending.length > 0) {
-    const component = pending.shift()
-    if (component === undefined || component === '.') continue
+    const item = pending.shift()
+    if (item === undefined) continue
+    if (typeof item !== 'string') {
+      seen.delete(item.done)
+      continue
+    }
+    const component = item
+    if (component === '.') continue
     if (component === '..') {
       const parent = dirname(existing)
       if (parent !== existing) existing = parent
@@ -153,12 +160,12 @@ function canonicalPath(path, seen = new Set()) {
     try {
       const stat = lstatSync(candidate)
       if (stat.isSymbolicLink()) {
-        if (seen.has(candidate)) return absolute
+        if (seen.has(candidate)) return null
         seen.add(candidate)
         const linkTarget = readlinkSync(candidate)
         const target = splitPath(linkTarget)
         existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
-        pending.unshift(...target.parts)
+        pending.unshift(...target.parts, { done: candidate })
         continue
       }
       existing = realpathSync(candidate)
@@ -180,8 +187,11 @@ function canonicalPath(path, seen = new Set()) {
 export function isWithin(parent, target) {
   const norm = (/** @type {string} */ p) =>
     (process.platform === 'win32' ? p.replace(/\\/g, '/') : p).replace(/\/+$/, '')
-  let p = norm(canonicalPath(parent))
-  let t = norm(canonicalPath(target))
+  const canonicalParent = canonicalPath(parent)
+  const canonicalTarget = canonicalPath(target)
+  if (canonicalParent === null || canonicalTarget === null) return false
+  let p = norm(canonicalParent)
+  let t = norm(canonicalTarget)
   if (process.platform === 'win32') {
     p = p.toLowerCase()
     t = t.toLowerCase()

@@ -186,6 +186,21 @@ test('isWithin：相对符号链接目标从符号链接目录解析', { skip: p
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('isWithin：重复解析符号链接时仍处理后续 ..，拒绝仓库外路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const link = join(root, 'link')
+  mkdirSync(root)
+  symlinkSync(root, link)
+
+  const vault = `${link}${sep}link${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(dir, 'vault')), true)
+  assert.equal(existsSync(join(root, 'vault')), false)
+  assert.equal(isWithin(root, vault), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
   const dir = makeTmp()
   const ledger = loadLedger(dir)
