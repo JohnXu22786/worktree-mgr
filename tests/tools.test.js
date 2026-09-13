@@ -257,6 +257,34 @@ test('wtm_status：root 解析同步失败时返回结构化错误而非抛异�
   assert.match(value.error ?? '', /invalid|argument|path/i)
 })
 
+test('wtm_status：默认 root 的 cwd 不可用时返回结构化错误而非抛异常', async () => {
+  const originalCwd = process.cwd()
+  const unavailableCwd = mkdtempSync(join(tmpdir(), 'wtm-tools-cwd-'))
+  const hadWtmRoot = Object.hasOwn(process.env, 'WTM_ROOT')
+  const originalWtmRoot = process.env.WTM_ROOT
+  delete process.env.WTM_ROOT
+  process.chdir(unavailableCwd)
+  rmSync(unavailableCwd, { recursive: true, force: true })
+
+  try {
+    const git = new FakeGit()
+    const tools = createToolSet({ config: {}, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+
+    const value = /** @type {{ok: boolean, error?: string}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /cwd|ENOENT|no such file/i)
+    assert.equal(git.calls.length, 0)
+  } finally {
+    process.chdir(originalCwd)
+    if (hadWtmRoot) process.env.WTM_ROOT = originalWtmRoot
+    else delete process.env.WTM_ROOT
+  }
+})
+
 test('wtm_merge/wtm_finish/wtm_purge：失败时渲染操作警告', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })

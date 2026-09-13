@@ -67,15 +67,15 @@ export function readRepoConfig(root) {
  */
 async function prepare({ args, exec, tool, git }) {
   if (exec?.signal?.aborted) return { ok: false, error: '调用已取消（aborted）' }
-  const candidate = typeof args.root === 'string'
-    ? args.root
-    : (typeof tool.config.root === 'string'
-      ? tool.config.root
-      : (typeof process.env.WTM_ROOT === 'string' && process.env.WTM_ROOT !== ''
-        ? process.env.WTM_ROOT
-        : process.cwd()))
   let resolved
   try {
+    const candidate = typeof args.root === 'string'
+      ? args.root
+      : (typeof tool.config.root === 'string'
+        ? tool.config.root
+        : (typeof process.env.WTM_ROOT === 'string' && process.env.WTM_ROOT !== ''
+          ? process.env.WTM_ROOT
+          : process.cwd()))
     resolved = await resolveToplevel(git, candidate, exec?.signal)
   } catch (err) {
     return { ok: false, error: `解析仓库路径失败：${/** @type {Error} */ (err).message}` }
