@@ -258,10 +258,9 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
         const st = statSync(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
           unlinkSync(lockPath)
-          continue
         }
       } catch {
-        continue // 对方刚好释放，重试
+        // 对方可能刚好释放，也可能是持久的 I/O、权限错误或悬空符号链接；统一走超时检查。
       }
       if (Date.now() >= deadline) {
         throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
