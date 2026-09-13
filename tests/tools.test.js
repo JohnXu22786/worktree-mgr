@@ -86,6 +86,31 @@ test('wtm_purge：渲染分支删除状态和收尾警告', () => {
   assert.match(text, /分支删除失败/)
 })
 
+test('wtm_purge：无任务时渲染顶层仓库配置警告', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    writeFileSync(join(tmp, '.wtm.json'), '{broken')
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
+    const tools = createToolSet({ config: { root: tmp, vault: join(tmp, 'vault') }, git })
+    const purge = tools.find((t) => t.name === 'wtm_purge')
+    assert.ok(purge, '工具 purge 应存在')
+
+    const value = /** @type {{ok: boolean, results?: Array<object>, warnings?: string[]}} */ (
+      await purge.execute({ all: true }, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, true)
+    assert.deepEqual(value.results, [])
+    assert.ok(value.warnings?.some((w) => /\.wtm\.json/i.test(w)), JSON.stringify(value))
+
+    const rendered = purge.output.render({}, value)
+    assert.match(rendered[0].text, /批量清理完成（0 个任务）/)
+    assert.match(rendered[0].text, /\.wtm\.json/i)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('createToolSet：必填参数声明在 schema.required 中', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })
@@ -213,7 +238,28 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   assert.ok(value.warnings, '应有 warnings')
   assert.ok(value.warnings.length >= 1, JSON.stringify(value.warnings))
   assert.match(value.warnings[0], /\.wtm\.json/i)
+  assert.deepEqual(value.rows, [])
+  const rendered = status.output.render({}, value)
+  assert.match(rendered[0].text, /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('wtm_merge/wtm_finish/wtm_purge：失败时渲染操作警告', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const warning = '仓库配置 .wtm.json 解析失败，已忽略'
+
+  for (const name of ['wtm_merge', 'wtm_finish', 'wtm_purge']) {
+    const tool = tools.find((t) => t.name === name)
+    assert.ok(tool, `${name} 工具应存在`)
+    const rendered = tool.output.render({}, {
+      ok: false,
+      error: '操作失败',
+      warnings: [warning],
+    })
+    assert.match(rendered[0].text, /操作失败/)
+    assert.match(rendered[0].text, /\.wtm\.json/)
+  }
 })
 
 test('readRepoConfig：配置文件读取失败时传播文件系统错误', () => {

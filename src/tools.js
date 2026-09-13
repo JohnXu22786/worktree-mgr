@@ -102,6 +102,16 @@ function textBlock(text) {
 }
 
 /**
+ * @param {string} text
+ * @param {string[] | undefined} warnings
+ */
+function textBlockWithWarnings(text, warnings) {
+  const lines = [text]
+  for (const w of warnings ?? []) lines.push(`⚠️  ${w}`)
+  return textBlock(lines.join('\n'))
+}
+
+/**
  * 组装全部工具定义。
  * @param {{config: Record<string, unknown>, git: {run: Function}}} opts
  * @returns {ToolDef[]}
@@ -202,7 +212,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 同步失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 同步失败：${value.error}`, value.warnings)
         const parts = [`✅ 已同步任务 ${value.task} → ${value.base}`]
         if (value.committed) parts.push(`已自动快照提交任务工作区的改动`)
         if (value.merged) parts.push(`已合并分支 ${value.branch} 回 ${value.base}`)
@@ -256,8 +266,8 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 收尾失败：${value.error}`)
-        if (value.note) return textBlock(`✅ ${value.note}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 收尾失败：${value.error}`, value.warnings)
+        if (value.note) return textBlockWithWarnings(`✅ ${value.note}`, value.warnings)
         const parts = [`✅ 任务 ${value.task} 已收尾`]
         if (value.committed) parts.push(`已快照提交任务改动`)
         if (value.merged) parts.push(`已合并回基分支`)
@@ -303,10 +313,13 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 总览失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 总览失败：${value.error}`, value.warnings)
         const rows = value.rows ?? []
         if (rows.length === 0) {
-          return textBlock(`暂无进行中的任务。可用 wtm_begin 为任务创建隔离工作区。`)
+          return textBlockWithWarnings(
+            `暂无进行中的任务。可用 wtm_begin 为任务创建隔离工作区。`,
+            value.warnings,
+          )
         }
         const lines = [`进行中的任务（${rows.length}）：`, '']
         for (const r of rows) {
@@ -362,7 +375,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 批量清理失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 批量清理失败：${value.error}`, value.warnings)
         const results = value.results ?? []
         const lines = [`批量清理完成（${results.length} 个任务）：`, '']
         for (const r of results) {
@@ -373,6 +386,7 @@ export function createToolSet(opts) {
           lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${details.length > 0 ? `（${details.join('；')}）` : ''}`)
           for (const w of r.warnings ?? []) lines.push(`  ⚠️  ${w}`)
         }
+        for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
         return textBlock(lines.join('\n'))
       },
     },
