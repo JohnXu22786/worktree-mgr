@@ -367,8 +367,9 @@ export async function listStatus(opts) {
     for (const rec of ledger.records) {
       const wt = worktrees.find((w) => samePath(w.path, rec.path))
       let counts = null
-      // 存在性 = 注册表有该工作区 且 目录实际存在（目录被外部删除后注册表仍会列出）
-      const alive = Boolean(wt) && existsSync(rec.path)
+      // 存在性 = 注册表有该工作区、目录实际存在且仍在账本分支上；
+      // 分支漂移后不能读取或统计错误分支的状态。
+      const alive = Boolean(wt) && existsSync(rec.path) && wt?.branch === rec.branch
       /** @type {boolean | null} */
       let dirty = false
       if (alive) {
