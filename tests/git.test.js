@@ -178,6 +178,35 @@ test('runGit：跨 chunk 的 UTF-8 路径保持完整', async () => {
   assert.equal(result.stderr, 'é')
 })
 
+test('runGit：AbortError 后等待 close 再完成', async () => {
+  let child = /** @type {any} */ (null)
+  const spawnImpl = () => {
+    child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    return child
+  }
+
+  const resultPromise = runGit(['status'], { spawnImpl })
+  let settled = false
+  resultPromise.then(() => { settled = true })
+
+  const error = new Error('The operation was aborted')
+  error.name = 'AbortError'
+  child.emit('error', error)
+  await Promise.resolve()
+  assert.equal(settled, false)
+
+  child.emit('close', null, 'SIGTERM')
+  assert.deepEqual(await resultPromise, {
+    ok: false,
+    code: -1,
+    stdout: '',
+    stderr: '',
+    aborted: true,
+  })
+})
+
 test('GitRunner.run：真实 git 可用时返回结构 {ok, code, stdout, stderr}', { skip: !GitRunner.probe() }, async () => {
   const git = new GitRunner()
   const r = await git.run(['--version'], { cwd: process.cwd() })

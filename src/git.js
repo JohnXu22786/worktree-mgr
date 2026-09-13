@@ -48,8 +48,13 @@ export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
         })
       }
     }
+    let abortPending = false
     child.on('error', (err) => {
       const aborted = err.name === 'AbortError'
+      if (aborted) {
+        abortPending = true
+        return
+      }
       const decodedStdout = stdout + stdoutDecoder.end()
       const decodedStderr = stderr + stderrDecoder.end()
       done({
@@ -61,6 +66,10 @@ export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
       })
     })
     child.on('close', (code, codeSig) => {
+      if (abortPending) {
+        done({ ok: false, code: -1, aborted: true })
+        return
+      }
       done({ ok: code === 0, code, aborted: codeSig !== null })
     })
   })
