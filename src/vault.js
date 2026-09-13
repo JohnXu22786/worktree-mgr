@@ -30,7 +30,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path'
 
 export class VaultError extends Error {
   /**
@@ -118,37 +118,55 @@ export function computeVault(rootPath, vault) {
 }
 
 /**
- * 解析路径中的别名和已存在路径段中的符号链接。
- * 目标目录可能尚未创建，因此从最近的已存在父目录开始解析，再拼回尾部。
+ * 按路径段解析别名和符号链接，确保符号链接先于后续的 .. 处理。
+ * 目标目录可能尚未创建，因此遇到不存在的路径段后继续拼接剩余路径。
  * @param {string} path
  * @returns {string}
  */
 function canonicalPath(path, seen = new Set()) {
-  const absolute = resolve(path)
-  let existing = absolute
-  /** @type {string[]} */
-  const suffix = []
+  const separatorPattern = process.platform === 'win32' ? /[\\/]+/ : /\/+/
+  /**
+   * @param {string} value
+   * @returns {{root: string, parts: string[]}}
+   */
+  const splitPath = (value) => {
+    const root = parse(value).root
+    return { root, parts: value.slice(root.length).split(separatorPattern).filter(Boolean) }
+  }
+  const absolute = isAbsolute(path)
+    ? path
+    : `${resolve('.')}${process.platform === 'win32' ? '\\' : '/'}${path}`
+  const parsed = splitPath(absolute)
+  let existing = parsed.root
+  const pending = parsed.parts
 
-  while (true) {
-    try {
-      const stat = lstatSync(existing)
-      if (stat.isSymbolicLink()) {
-        if (seen.has(existing)) return absolute
-        seen.add(existing)
-        const linkTarget = readlinkSync(existing)
-        const resolvedTarget = isAbsolute(linkTarget)
-          ? linkTarget
-          : resolve(dirname(existing), linkTarget)
-        return canonicalPath(join(resolvedTarget, ...suffix), seen)
-      }
-      return join(realpathSync(existing), ...suffix)
-    } catch {
+  while (pending.length > 0) {
+    const component = pending.shift()
+    if (component === undefined || component === '.') continue
+    if (component === '..') {
       const parent = dirname(existing)
-      if (parent === existing) return absolute
-      suffix.unshift(basename(existing))
-      existing = parent
+      if (parent !== existing) existing = parent
+      continue
+    }
+
+    const candidate = join(existing, component)
+    try {
+      const stat = lstatSync(candidate)
+      if (stat.isSymbolicLink()) {
+        if (seen.has(candidate)) return absolute
+        seen.add(candidate)
+        const linkTarget = readlinkSync(candidate)
+        const target = splitPath(linkTarget)
+        if (isAbsolute(linkTarget)) existing = target.root
+        pending.unshift(...target.parts)
+        continue
+      }
+      existing = realpathSync(candidate)
+    } catch {
+      existing = candidate
     }
   }
+  return existing
 }
 
 /**
