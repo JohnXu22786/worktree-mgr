@@ -226,6 +226,25 @@ test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 
   assert.equal(git.calls.length, 0)
 })
 
+test('wtm_begin：root 解析期间中止时返回取消错误而非非 git 仓库错误', async () => {
+  const git = new FakeGit()
+  const ac = new AbortController()
+  git.on(['rev-parse', '--show-toplevel'], () => {
+    ac.abort()
+    return FAIL('rev-parse aborted')
+  })
+  const tools = createToolSet({ config: {}, git })
+  const begin = tools.find((t) => t.name === 'wtm_begin')
+  assert.ok(begin, '工具 begin 应存在')
+
+  const value = /** @type {{ok: boolean, error?: string}} */ (
+    await begin.execute({ task: 'T' }, { signal: ac.signal })
+  )
+  assert.equal(value.ok, false)
+  assert.match(value.error ?? '', /取消|abort/i)
+  assert.doesNotMatch(value.error ?? '', /不是 git 仓库/)
+})
+
 test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
   writeFileSync(join(tmp, '.wtm.json'), '{broken')
