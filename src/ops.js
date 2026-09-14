@@ -6,8 +6,9 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   slugifyTask,
   deriveBranch,
@@ -527,43 +528,14 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
 async function mergeIntoBase(opts, rec, task) {
   const { root, git, cfg } = opts
 
-  // 合并目标必须与账本记录的基分支一致：主工作区可能已被切到其他分支
-  // （或处于 detached HEAD），此时继续会把改动合入错误目标
-  const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
-  if (!cur.ok) {
-    return { ok: false, merged: false, error: `读取主工作区分支失败：${cur.stderr.trim()}`, warnings: [] }
-  }
-  const currentBase = cur.stdout.trim()
-  if (currentBase !== rec.base) {
-    const hint = currentBase ? `当前在 ${currentBase}` : '当前处于 detached HEAD'
-    return {
-      ok: false,
-      merged: false,
-      error: `主工作区当前分支与任务基分支不一致（账本：${rec.base}，${hint}）。` +
-        `请先在主工作区切回 ${rec.base} 再重试（git checkout ${rec.base}）`,
-      warnings: [],
-    }
-  }
-
-  const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
-  if (!baseStatus.ok) {
-    return { ok: false, merged: false, error: `读取基分支状态失败：${baseStatus.stderr.trim()}`, warnings: [] }
-  }
-  if (isDirty(baseStatus.stdout)) {
-    return {
-      ok: false,
-      merged: false,
-      error: '基分支工作区存在未提交改动，请先提交或暂存（防止合并混入未完成的工作）',
-      warnings: [],
-    }
+  const initialBaseCheck = await checkBaseState(opts, rec)
+  if (!initialBaseCheck.ok) {
+    return { ok: false, merged: false, error: initialBaseCheck.error, warnings: [] }
   }
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
-  if (ancestor.ok) {
-    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
-  }
-  if (ancestor.code !== 1) {
+  if (!ancestor.ok && ancestor.code !== 1) {
     return {
       ok: false,
       merged: false,
@@ -572,17 +544,323 @@ async function mergeIntoBase(opts, rec, task) {
     }
   }
 
+  // merge-base 等待期间主工作区可能被切换分支或产生未提交改动，合并前必须重新校验。
+  const finalBaseCheck = await checkBaseState(opts, rec)
+  if (!finalBaseCheck.ok) {
+    return { ok: false, merged: false, error: finalBaseCheck.error, warnings: [] }
+  }
+  if (ancestor.ok) {
+    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+  }
+
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
-  if (!merge.ok) {
+  // The checks above are necessarily asynchronous preflights. Install
+  // merge-time guards so Git itself refuses to create the merge commit if the
+  // branch or worktree changes in the remaining gap. The reference-transaction
+  // hook runs during the prepared phase while Git holds the ref transaction
+  // locks, immediately before it updates HEAD and the base branch.
+  let guard
+  try {
+    guard = await createMergeGuard(root, git, opts.signal, rec.base)
+  } catch (err) {
     return {
       ok: false,
       merged: false,
-      error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
+      error: `准备合并保护钩子失败：${/** @type {Error} */ (err).message}`,
       warnings: [],
     }
   }
-  return { ok: true, merged: true, warnings: [] }
+  try {
+    // mergeTask must finish with a merge commit. Explicit --commit overrides a
+    // branch mergeOptions=--no-commit; --squash remains a Git error instead of
+    // being mistaken for a successful merge.
+    const merge = await git.run(
+      ['merge', '--no-ff', '--commit', `refs/heads/${rec.branch}`, '-m', message],
+      {
+        cwd: root,
+        signal: opts.signal,
+        env: {
+          WTM_EXPECTED_BASE: rec.base,
+          WTM_MERGE_REF: `refs/heads/${rec.branch}`,
+          GIT_CONFIG_COUNT: guard.configCount,
+          [`GIT_CONFIG_KEY_${guard.configIndex}`]: 'core.hooksPath',
+          [`GIT_CONFIG_VALUE_${guard.configIndex}`]: guard.hooksPath,
+        },
+      },
+    )
+    if (!merge.ok) {
+      return {
+        ok: false,
+        merged: false,
+        error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
+        warnings: [],
+      }
+    }
+    return { ok: true, merged: true, warnings: [] }
+  } finally {
+    rmSync(guard.hooksPath, { recursive: true, force: true })
+  }
+}
+
+/**
+ * 创建一次性的 Git merge hooks。Git 的 reference-transaction hook 在
+ * prepared 阶段执行最终校验；其他 wrapper 则把仓库原有 hooks 链接回来，
+ * 避免临时 core.hooksPath 改变仓库行为。
+ * @param {string} root
+ * @param {{run: Function}} git
+ * @param {AbortSignal | undefined} signal
+ * @param {string} expectedBase
+ * @returns {Promise<{hooksPath: string, configIndex: number, configCount: string}>}
+ */
+async function createMergeGuard(root, git, signal, expectedBase) {
+  const hooks = await git.run(['rev-parse', '--git-path', 'hooks'], { cwd: root, signal })
+  if (!hooks.ok) {
+    throw new Error(`读取仓库 hooks 路径失败：${hooks.stderr.trim() || 'git rev-parse 失败'}`)
+  }
+  const originalHooksPath = resolve(root, hooks.stdout.trim())
+  const hooksPath = mkdtempSync(join(tmpdir(), 'wtm-merge-hooks-'))
+  try {
+    const guardPath = join(hooksPath, 'wtm-merge-guard')
+    const baseRef = `refs/heads/${expectedBase}`
+    /** @param {string} value */
+    const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`
+    /** @param {string} name */
+    const originalHook = (name) => quote(join(originalHooksPath, name))
+    // The temporary core.hooksPath is injected through GIT_CONFIG_COUNT. Clear
+    // only that override when chaining the repository hook; GIT_CONFIG_PARAMETERS
+    // may carry caller-supplied `-c` settings that the original hook relies on.
+    const inheritedConfigCount = process.env.GIT_CONFIG_COUNT
+    const parsedConfigCount = Number.parseInt(inheritedConfigCount ?? '', 10)
+    const configIndex = Number.isInteger(parsedConfigCount) && parsedConfigCount >= 0 ? parsedConfigCount : 0
+    const restoreConfigCount = inheritedConfigCount === undefined
+      ? '-u GIT_CONFIG_COUNT'
+      : `GIT_CONFIG_COUNT=${quote(inheritedConfigCount)}`
+    const cleanConfig = `env -u GIT_CONFIG_KEY_${configIndex} -u GIT_CONFIG_VALUE_${configIndex} ${restoreConfigCount}`
+    /** @param {string} name @param {string} body */
+    const writeHook = (name, body) => {
+      const hookPath = join(hooksPath, name)
+      writeFileSync(hookPath, body, 'utf8')
+      chmodSync(hookPath, 0o755)
+    }
+
+    writeHook('wtm-merge-guard', `#!/bin/sh
+check_state() {
+  state=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch) || {
+    echo "wtm: unable to read base worktree state during merge" >&2
+    return 1
+  }
+  branch=$(printf '%s\\n' "$state" | sed -n 's/^# branch.head //p')
+  if [ "$branch" != "$WTM_EXPECTED_BASE" ]; then
+    printf 'wtm: base branch changed during merge (expected %s, got %s)\\n' "$WTM_EXPECTED_BASE" "$branch" >&2
+    return 1
+  fi
+  if printf '%s\\n' "$state" | awk '
+    {
+      kind = substr($0, 1, 1)
+      worktree = substr($0, 4, 1)
+      if (kind == "?" || ((kind == "1" || kind == "2" || kind == "u") && worktree != ".")) dirty = 1
+    }
+    END { exit dirty ? 0 : 1 }
+  '; then
+    echo 'wtm: base worktree became dirty during merge' >&2
+    return 1
+  fi
+}
+
+merge_options=$(GIT_OPTIONAL_LOCKS=0 git config --get "branch.$WTM_EXPECTED_BASE.mergeOptions" 2>/dev/null || true)
+merge_tree_options=
+strategy_ours=false
+allow_unrelated=false
+set -f
+for option in $merge_options; do
+  case "$option" in
+    --strategy=ours|-sours|-s=ours)
+      strategy_ours=true
+      ;;
+    --strategy=*|-s*)
+      strategy_ours=false
+      ;;
+    --allow-unrelated-histories)
+      allow_unrelated=true
+      ;;
+    --no-allow-unrelated-histories)
+      allow_unrelated=false
+      ;;
+    -X*|--strategy-option=*)
+      merge_tree_options="$merge_tree_options $option"
+      ;;
+  esac
+done
+
+if [ "$allow_unrelated" = true ]; then
+  merge_tree_options="$merge_tree_options --allow-unrelated-histories"
+fi
+
+expected_left=HEAD
+expected_right="$WTM_MERGE_REF"
+if [ -n "$1" ]; then
+  expected_left=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^1") || {
+    echo 'wtm: unable to read proposed merge commit parent' >&2
+    exit 1
+  }
+  expected_right=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^2") || {
+    echo 'wtm: proposed reference update is not a merge commit' >&2
+    exit 1
+  }
+  if [ -n "$2" ] && [ "$expected_left" != "$2" ]; then
+    echo 'wtm: proposed merge commit does not update the expected base tip' >&2
+    exit 1
+  fi
+fi
+
+if [ "$strategy_ours" = true ]; then
+  expected_tree=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$expected_left^{tree}") || {
+    echo 'wtm: unable to calculate expected ours merge tree' >&2
+    exit 1
+  }
+else
+  expected_tree=$(GIT_OPTIONAL_LOCKS=0 git merge-tree --write-tree $merge_tree_options "$expected_left" "$expected_right") || {
+    echo 'wtm: unable to calculate expected merge tree' >&2
+    exit 1
+  }
+fi
+
+if [ -n "$1" ]; then
+  proposed_tree=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^{tree}") || {
+    echo 'wtm: unable to read proposed merge commit tree' >&2
+    exit 1
+  }
+  if [ "$proposed_tree" != "$expected_tree" ]; then
+    echo 'wtm: proposed merge commit tree differs from the guarded merge result' >&2
+    exit 1
+  fi
+else
+  actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
+    echo 'wtm: unable to read merge index during merge' >&2
+    exit 1
+  }
+  if [ "$actual_tree" != "$expected_tree" ]; then
+    echo 'wtm: base index became dirty during merge' >&2
+    exit 1
+  fi
+fi
+
+# Recheck after computing the expected tree. This closes the interval in
+# which a concurrent staged edit would be invisible to write-tree alone.
+check_state || exit $?
+if [ -z "$1" ]; then
+  actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
+    echo 'wtm: unable to read merge index during merge' >&2
+    exit 1
+  }
+  if [ "$actual_tree" != "$expected_tree" ]; then
+    echo 'wtm: base index became dirty during merge' >&2
+    exit 1
+  fi
+  if ! GIT_OPTIONAL_LOCKS=0 git diff-files --quiet; then
+    echo 'wtm: base worktree became dirty during merge' >&2
+    exit 1
+  fi
+  if [ -n "$(GIT_OPTIONAL_LOCKS=0 git ls-files --others --exclude-standard)" ]; then
+    echo 'wtm: base worktree gained an untracked file during merge' >&2
+    exit 1
+  fi
+fi
+exit 0
+`)
+
+    // Git's built-in fallback runs pre-commit when pre-merge-commit is absent.
+    // Preserve that behavior through the wrapper as well.
+    writeHook('pre-merge-commit', `#!/bin/sh
+guard=${quote(guardPath)}
+"$guard" "$@" || exit $?
+hook=${originalHook('pre-merge-commit')}
+if [ ! -x "$hook" ]; then hook=${originalHook('pre-commit')}; fi
+if [ -x "$hook" ]; then ${cleanConfig} "$hook" "$@" || exit $?; fi
+exit 0
+`)
+
+    writeHook('prepare-commit-msg', `#!/bin/sh
+hook=${originalHook('prepare-commit-msg')}
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
+exit 0
+`)
+
+    writeHook('commit-msg', `#!/bin/sh
+hook=${originalHook('commit-msg')}
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
+exit 0
+`)
+
+    writeHook('post-merge', `#!/bin/sh
+hook=${originalHook('post-merge')}
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
+exit 0
+`)
+
+    // reference-transaction receives its input on stdin. Save it so the
+    // repository hook sees the exact same stream before the final guard runs.
+    writeHook('reference-transaction', `#!/bin/sh
+input=$(mktemp "\${TMPDIR:-/tmp}/wtm-reference-transaction.XXXXXX") || {
+  echo 'wtm: unable to create reference transaction input' >&2
+  exit 1
+}
+cleanup() { rm -f "$input"; }
+trap cleanup 0 HUP INT TERM
+cat >"$input" || exit 1
+hook=${originalHook('reference-transaction')}
+if [ -x "$hook" ]; then
+  ${cleanConfig} "$hook" "$@" <"$input" || exit $?
+fi
+if [ "$1" = prepared ] && update=$(awk -v ref=${quote(baseRef)} '$3 == ref { print $1 " " $2; found = 1 } END { exit found ? 0 : 1 }' "$input"); then
+  guard=${quote(guardPath)}
+  set -- $update
+  "$guard" "$2" "$1" || exit $?
+fi
+exit 0
+`)
+
+    return { hooksPath, configIndex, configCount: String(configIndex + 1) }
+  } catch (err) {
+    rmSync(hooksPath, { recursive: true, force: true })
+    throw err
+  }
+}
+
+/**
+ * 校验合并目标仍是账本记录的基分支且工作区保持干净。
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true} | {ok: false, error: string}>}
+ */
+async function checkBaseState(opts, rec) {
+  const { root, git } = opts
+
+  // 合并目标必须与账本记录的基分支一致：主工作区可能已被切到其他分支
+  // （或处于 detached HEAD），此时继续会把改动合入错误目标
+  const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
+  if (!cur.ok) return { ok: false, error: `读取主工作区分支失败：${cur.stderr.trim()}` }
+
+  const currentBase = cur.stdout.trim()
+  if (currentBase !== rec.base) {
+    const hint = currentBase ? `当前在 ${currentBase}` : '当前处于 detached HEAD'
+    return {
+      ok: false,
+      error: `主工作区当前分支与任务基分支不一致（账本：${rec.base}，${hint}）。` +
+        `请先在主工作区切回 ${rec.base} 再重试（git checkout ${rec.base}）`,
+    }
+  }
+
+  const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
+  if (!baseStatus.ok) return { ok: false, error: `读取基分支状态失败：${baseStatus.stderr.trim()}` }
+  if (isDirty(baseStatus.stdout)) {
+    return {
+      ok: false,
+      error: '基分支工作区存在未提交改动，请先提交或暂存（防止合并混入未完成的工作）',
+    }
+  }
+
+  return { ok: true }
 }
 
 /**

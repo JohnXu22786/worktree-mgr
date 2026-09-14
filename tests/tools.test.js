@@ -395,8 +395,9 @@ test('wtm_finish：移除工作区失败时保留操作警告', async () => {
     ))
     git.on(['status', '--porcelain'], OK())
     git.on(['branch', '--show-current'], OK('main\n'))
-    git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
-    git.on(['merge', '--no-ff', 'wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
+    git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
+    git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
+    git.on(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
     git.on(['worktree', 'remove', worktreePath], FAIL('cannot remove worktree'))
 
     const tools = createToolSet({ config: { root, vault }, git })
