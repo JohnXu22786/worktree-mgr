@@ -437,7 +437,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   // mergeIntoBase 的新检查：主工作区当前分支 == 账本基分支；任务分支未合并
   git.on(['branch', '--show-current'], OK('main\n'))
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], FAIL('not an ancestor', 1))
-  git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
+  git.on(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
   git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   return { cfg, git, vault }
 }
@@ -449,7 +449,7 @@ test('mergeTask：干净任务直接合并并更新记录', async () => {
   assert.equal(r.ok, true)
   assert.equal(r.committed, false)
   assert.equal(r.merged, true)
-  assert.ok(git.called(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], 'C:/repo'))
+  assert.ok(git.called(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main'], 'C:/repo'))
   const ledger = loadLedger(vault)
   assert.equal(ledger.records[0].updatedAt !== 'u', true)
   rmSync(tmp, { recursive: true, force: true })
@@ -463,7 +463,7 @@ test('mergeTask：merge-base 致命失败时拒绝继续合并', async () => {
   const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /fatal: bad object wtm\/t/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   assert.equal(loadLedger(vault).records[0].updatedAt, 'u')
   rmSync(tmp, { recursive: true, force: true })
 })
@@ -485,7 +485,7 @@ test('mergeTask：refuse 模式下脏任务拒绝合并', async () => {
   const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'refuse', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /未提交/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -508,7 +508,7 @@ test('mergeTask：refuse 模式第二次状态检查发现改动时拒绝快照�
   assert.match(r.error ?? '', /未提交/)
   assert.equal(git.count(['add', '-A']), 0)
   assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -651,7 +651,7 @@ test('finishTask：abandon 模式跳过提交与合并，强制删除', async ()
   assert.equal(r.ok, true)
   assert.equal(r.merged, false)
   assert.equal(r.committed, false)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   assert.ok(git.called(['worktree', 'remove', '--force', join(vault, 't')]))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   assert.equal(loadLedger(vault).records.length, 0)
@@ -962,8 +962,8 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t1', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t2', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['merge', '--no-ff', 'refs/heads/wtm/t1', '-m', 'fold T1 into main'], OK('merged'))
-  git.on(['merge', '--no-ff', 'refs/heads/wtm/t2', '-m', 'fold T2 into main'], FAIL('conflict'))
+  git.on(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t1', '-m', 'fold T1 into main'], OK('merged'))
+  git.on(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t2', '-m', 'fold T2 into main'], FAIL('conflict'))
   git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   git.on(['worktree', 'remove', join(cfg.vault, 't1')], OK())
   git.on(['worktree', 'remove', join(cfg.vault, 't2')], OK())
@@ -1031,7 +1031,7 @@ test('mergeTask：工作区分支与账本不一致时拒绝（防静默错分�
   const r = await mergeTask({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /不一致/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0, '不应执行合并')
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0, '不应执行合并')
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -1042,7 +1042,7 @@ test('mergeTask：主工作区不在账本基分支时拒绝（防合入错误�
   const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /develop/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -1059,7 +1059,7 @@ test('mergeTask：合并前重新校验主工作区分支，拒绝并发切换�
 
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /develop/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -1079,7 +1079,7 @@ test('mergeTask：合并前重新校验基分支状态，拒绝并发改动后�
 
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /基分支|未提交/)
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -1091,7 +1091,24 @@ test('mergeTask：任务分支已合并时跳过重复合并（重试不再产�
   assert.equal(r.ok, true)
   assert.equal(r.merged, false)
   assert.ok((r.warnings ?? []).some((w) => /已包含/.test(w)))
-  assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：已合并快速路径仍重新校验主工作区', async () => {
+  const tmp = makeTmp()
+  const { cfg, git } = mergeFixture(tmp)
+  let branchChecks = 0
+  git.on(['branch', '--show-current'], () => {
+    branchChecks += 1
+    return branchChecks === 1 ? OK('main\n') : OK('develop\n')
+  })
+  git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], OK())
+
+  const r = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /develop/)
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -1227,7 +1244,7 @@ test('finishTask：工作区暂时不可访问时失败并保留记录', async (
     assert.match(r.error ?? '', /permission denied/)
     assert.equal(loadLedger(vault).records.length, 1)
     assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
-    assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(git.count(['merge', '--no-ff', '--commit', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
     assert.equal(git.count(['worktree', 'remove', taskPath]), 0)
   } finally {
     mock.restoreAll()

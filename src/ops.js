@@ -536,10 +536,7 @@ async function mergeIntoBase(opts, rec, task) {
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
-  if (ancestor.ok) {
-    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
-  }
-  if (ancestor.code !== 1) {
+  if (!ancestor.ok && ancestor.code !== 1) {
     return {
       ok: false,
       merged: false,
@@ -552,6 +549,9 @@ async function mergeIntoBase(opts, rec, task) {
   const finalBaseCheck = await checkBaseState(opts, rec)
   if (!finalBaseCheck.ok) {
     return { ok: false, merged: false, error: finalBaseCheck.error, warnings: [] }
+  }
+  if (ancestor.ok) {
+    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
@@ -572,17 +572,20 @@ async function mergeIntoBase(opts, rec, task) {
     }
   }
   try {
+    // mergeTask must finish with a merge commit. Explicit --commit overrides a
+    // branch mergeOptions=--no-commit; --squash remains a Git error instead of
+    // being mistaken for a successful merge.
     const merge = await git.run(
-      ['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message],
+      ['merge', '--no-ff', '--commit', `refs/heads/${rec.branch}`, '-m', message],
       {
         cwd: root,
         signal: opts.signal,
         env: {
           WTM_EXPECTED_BASE: rec.base,
           WTM_MERGE_REF: `refs/heads/${rec.branch}`,
-          GIT_CONFIG_COUNT: '1',
-          GIT_CONFIG_KEY_0: 'core.hooksPath',
-          GIT_CONFIG_VALUE_0: guard.hooksPath,
+          GIT_CONFIG_COUNT: guard.configCount,
+          [`GIT_CONFIG_KEY_${guard.configIndex}`]: 'core.hooksPath',
+          [`GIT_CONFIG_VALUE_${guard.configIndex}`]: guard.hooksPath,
         },
       },
     )
@@ -608,7 +611,7 @@ async function mergeIntoBase(opts, rec, task) {
  * @param {{run: Function}} git
  * @param {AbortSignal | undefined} signal
  * @param {string} expectedBase
- * @returns {Promise<{hooksPath: string}>}
+ * @returns {Promise<{hooksPath: string, configIndex: number, configCount: string}>}
  */
 async function createMergeGuard(root, git, signal, expectedBase) {
   const hooks = await git.run(['rev-parse', '--git-path', 'hooks'], { cwd: root, signal })
@@ -624,6 +627,16 @@ async function createMergeGuard(root, git, signal, expectedBase) {
     const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`
     /** @param {string} name */
     const originalHook = (name) => quote(join(originalHooksPath, name))
+    // The temporary core.hooksPath is injected through GIT_CONFIG_COUNT. Clear
+    // only that override when chaining the repository hook; GIT_CONFIG_PARAMETERS
+    // may carry caller-supplied `-c` settings that the original hook relies on.
+    const inheritedConfigCount = process.env.GIT_CONFIG_COUNT
+    const parsedConfigCount = Number.parseInt(inheritedConfigCount ?? '', 10)
+    const configIndex = Number.isInteger(parsedConfigCount) && parsedConfigCount >= 0 ? parsedConfigCount : 0
+    const restoreConfigCount = inheritedConfigCount === undefined
+      ? '-u GIT_CONFIG_COUNT'
+      : `GIT_CONFIG_COUNT=${quote(inheritedConfigCount)}`
+    const cleanConfig = `env -u GIT_CONFIG_KEY_${configIndex} -u GIT_CONFIG_VALUE_${configIndex} ${restoreConfigCount}`
     /** @param {string} name @param {string} body */
     const writeHook = (name, body) => {
       const hookPath = join(hooksPath, name)
@@ -632,37 +645,127 @@ async function createMergeGuard(root, git, signal, expectedBase) {
     }
 
     writeHook('wtm-merge-guard', `#!/bin/sh
-state=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch) || {
-  echo "wtm: unable to read base worktree state during merge" >&2
-  exit 1
-}
-branch=$(printf '%s\\n' "$state" | sed -n 's/^# branch.head //p')
-if [ "$branch" != "$WTM_EXPECTED_BASE" ]; then
-  printf 'wtm: base branch changed during merge (expected %s, got %s)\\n' "$WTM_EXPECTED_BASE" "$branch" >&2
-  exit 1
-fi
-if printf '%s\\n' "$state" | awk '
-  {
-    kind = substr($0, 1, 1)
-    worktree = substr($0, 4, 1)
-    if (kind == "?" || ((kind == "1" || kind == "2" || kind == "u") && worktree != ".")) dirty = 1
+check_state() {
+  state=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch) || {
+    echo "wtm: unable to read base worktree state during merge" >&2
+    return 1
   }
-  END { exit dirty ? 0 : 1 }
-'; then
-  echo 'wtm: base worktree became dirty during merge' >&2
-  exit 1
+  branch=$(printf '%s\\n' "$state" | sed -n 's/^# branch.head //p')
+  if [ "$branch" != "$WTM_EXPECTED_BASE" ]; then
+    printf 'wtm: base branch changed during merge (expected %s, got %s)\\n' "$WTM_EXPECTED_BASE" "$branch" >&2
+    return 1
+  fi
+  if printf '%s\\n' "$state" | awk '
+    {
+      kind = substr($0, 1, 1)
+      worktree = substr($0, 4, 1)
+      if (kind == "?" || ((kind == "1" || kind == "2" || kind == "u") && worktree != ".")) dirty = 1
+    }
+    END { exit dirty ? 0 : 1 }
+  '; then
+    echo 'wtm: base worktree became dirty during merge' >&2
+    return 1
+  fi
+}
+
+merge_options=$(GIT_OPTIONAL_LOCKS=0 git config --get "branch.$WTM_EXPECTED_BASE.mergeOptions" 2>/dev/null || true)
+merge_tree_options=
+strategy_ours=false
+allow_unrelated=false
+set -f
+for option in $merge_options; do
+  case "$option" in
+    --strategy=ours|-sours|-s=ours)
+      strategy_ours=true
+      ;;
+    --strategy=*|-s*)
+      strategy_ours=false
+      ;;
+    --allow-unrelated-histories)
+      allow_unrelated=true
+      ;;
+    --no-allow-unrelated-histories)
+      allow_unrelated=false
+      ;;
+    -X*|--strategy-option=*)
+      merge_tree_options="$merge_tree_options $option"
+      ;;
+  esac
+done
+
+if [ "$allow_unrelated" = true ]; then
+  merge_tree_options="$merge_tree_options --allow-unrelated-histories"
 fi
-actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
-  echo 'wtm: unable to read merge index during merge' >&2
-  exit 1
-}
-expected_tree=$(GIT_OPTIONAL_LOCKS=0 git merge-tree --write-tree HEAD "$WTM_MERGE_REF") || {
-  echo 'wtm: unable to calculate expected merge tree' >&2
-  exit 1
-}
-if [ "$actual_tree" != "$expected_tree" ]; then
-  echo 'wtm: base index became dirty during merge' >&2
-  exit 1
+
+expected_left=HEAD
+expected_right="$WTM_MERGE_REF"
+if [ -n "$1" ]; then
+  expected_left=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^1") || {
+    echo 'wtm: unable to read proposed merge commit parent' >&2
+    exit 1
+  }
+  expected_right=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^2") || {
+    echo 'wtm: proposed reference update is not a merge commit' >&2
+    exit 1
+  }
+  if [ -n "$2" ] && [ "$expected_left" != "$2" ]; then
+    echo 'wtm: proposed merge commit does not update the expected base tip' >&2
+    exit 1
+  fi
+fi
+
+if [ "$strategy_ours" = true ]; then
+  expected_tree=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$expected_left^{tree}") || {
+    echo 'wtm: unable to calculate expected ours merge tree' >&2
+    exit 1
+  }
+else
+  expected_tree=$(GIT_OPTIONAL_LOCKS=0 git merge-tree --write-tree $merge_tree_options "$expected_left" "$expected_right") || {
+    echo 'wtm: unable to calculate expected merge tree' >&2
+    exit 1
+  }
+fi
+
+if [ -n "$1" ]; then
+  proposed_tree=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$1^{tree}") || {
+    echo 'wtm: unable to read proposed merge commit tree' >&2
+    exit 1
+  }
+  if [ "$proposed_tree" != "$expected_tree" ]; then
+    echo 'wtm: proposed merge commit tree differs from the guarded merge result' >&2
+    exit 1
+  fi
+else
+  actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
+    echo 'wtm: unable to read merge index during merge' >&2
+    exit 1
+  }
+  if [ "$actual_tree" != "$expected_tree" ]; then
+    echo 'wtm: base index became dirty during merge' >&2
+    exit 1
+  fi
+fi
+
+# Recheck after computing the expected tree. This closes the interval in
+# which a concurrent staged edit would be invisible to write-tree alone.
+check_state || exit $?
+if [ -z "$1" ]; then
+  actual_tree=$(GIT_OPTIONAL_LOCKS=0 git write-tree) || {
+    echo 'wtm: unable to read merge index during merge' >&2
+    exit 1
+  }
+  if [ "$actual_tree" != "$expected_tree" ]; then
+    echo 'wtm: base index became dirty during merge' >&2
+    exit 1
+  fi
+  if ! GIT_OPTIONAL_LOCKS=0 git diff-files --quiet; then
+    echo 'wtm: base worktree became dirty during merge' >&2
+    exit 1
+  fi
+  if [ -n "$(GIT_OPTIONAL_LOCKS=0 git ls-files --others --exclude-standard)" ]; then
+    echo 'wtm: base worktree gained an untracked file during merge' >&2
+    exit 1
+  fi
 fi
 exit 0
 `)
@@ -674,19 +777,25 @@ guard=${quote(guardPath)}
 "$guard" "$@" || exit $?
 hook=${originalHook('pre-merge-commit')}
 if [ ! -x "$hook" ]; then hook=${originalHook('pre-commit')}; fi
-if [ -x "$hook" ]; then "$hook" "$@" || exit $?; fi
+if [ -x "$hook" ]; then ${cleanConfig} "$hook" "$@" || exit $?; fi
+exit 0
+`)
+
+    writeHook('prepare-commit-msg', `#!/bin/sh
+hook=${originalHook('prepare-commit-msg')}
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
 exit 0
 `)
 
     writeHook('commit-msg', `#!/bin/sh
 hook=${originalHook('commit-msg')}
-if [ -x "$hook" ]; then exec "$hook" "$@"; fi
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
 exit 0
 `)
 
     writeHook('post-merge', `#!/bin/sh
 hook=${originalHook('post-merge')}
-if [ -x "$hook" ]; then exec "$hook" "$@"; fi
+if [ -x "$hook" ]; then exec ${cleanConfig} "$hook" "$@"; fi
 exit 0
 `)
 
@@ -702,16 +811,17 @@ trap cleanup 0 HUP INT TERM
 cat >"$input" || exit 1
 hook=${originalHook('reference-transaction')}
 if [ -x "$hook" ]; then
-  "$hook" "$@" <"$input" || exit $?
+  ${cleanConfig} "$hook" "$@" <"$input" || exit $?
 fi
-if [ "$1" = prepared ] && awk -v ref=${quote(baseRef)} '$3 == ref { found = 1 } END { exit found ? 0 : 1 }' "$input"; then
+if [ "$1" = prepared ] && update=$(awk -v ref=${quote(baseRef)} '$3 == ref { print $1 " " $2; found = 1 } END { exit found ? 0 : 1 }' "$input"); then
   guard=${quote(guardPath)}
-  "$guard" || exit $?
+  set -- $update
+  "$guard" "$2" "$1" || exit $?
 fi
 exit 0
 `)
 
-    return { hooksPath }
+    return { hooksPath, configIndex, configCount: String(configIndex + 1) }
   } catch (err) {
     rmSync(hooksPath, { recursive: true, force: true })
     throw err
