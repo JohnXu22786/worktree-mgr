@@ -1,10 +1,10 @@
 ﻿import { test } from 'node:test'
 import { mock } from 'node:test'
 import assert from 'node:assert/strict'
-import fs, { mkdtempSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
+import fs, { mkdtempSync, rmSync, mkdirSync, symlinkSync, existsSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { begin, mergeTask, finishTask, listStatus, purge } from '../src/ops.js'
 import { EMPTY_LEDGER, loadLedger, saveLedger, upsertRecord, withLock } from '../src/vault.js'
@@ -191,6 +191,36 @@ test('begin：指向仓库内目录的 vault 符号链接时拒绝', async () =>
     assert.equal(r.ok, false)
     assert.match(r.error ?? '', /vault/)
     assert.equal(git.calls.length, 0)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('begin：相对 vault 配置保留符号链接与 .. 的文件系统语义', { skip: process.platform === 'win32' }, async () => {
+  const tmp = makeTmp()
+  try {
+    const root = join(tmp, 'repo')
+    const outside = join(tmp, 'outside')
+    const link = join(root, 'link')
+    const vault = join(tmp, 'vault')
+    const worktreePath = join(vault, 'task')
+    mkdirSync(root, { recursive: true })
+    mkdirSync(outside, { recursive: true })
+    symlinkSync('../outside', link)
+    const cfg = { ...baseCfg(tmp), vault: `link${sep}..${sep}vault` }
+    const git = new FakeGit()
+    git.on(['branch', '--show-current'], OK('main\n'))
+    git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+    git.on(['show-ref', '--verify', 'refs/heads/wtm/task'], FAIL())
+    git.on(['status', '--porcelain'], OK())
+    git.on(['worktree', 'add', worktreePath, '-b', 'wtm/task', 'refs/heads/main'], OK())
+
+    const r = await begin({ root, task: 'Task', cfg, git, repo: null })
+    assert.equal(r.ok, true)
+    assert.equal(r.path, worktreePath)
+    assert.equal(git.called(['worktree', 'add', worktreePath, '-b', 'wtm/task', 'refs/heads/main']), true)
+    assert.equal(existsSync(join(root, 'vault')), false)
+    assert.equal(loadLedger(vault).records[0].path, worktreePath)
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
