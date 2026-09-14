@@ -104,7 +104,13 @@ export function resolveVault({ rootPath, vault }) {
   if (typeof vault !== 'string' || vault.trim() === '') return null
   const v = vault.trim()
   if (isAbsolute(v) || /^[A-Za-z]:[\\/]/.test(v)) return v
-  return resolve(rootPath, v)
+  if (/^[A-Za-z]:[^\\/]/.test(v)) return resolve(rootPath, v)
+  const root = resolve(rootPath)
+  const separator = process.platform === 'win32' ? '\\' : '/'
+  const separatorPattern = process.platform === 'win32' ? /[\\/]+/ : /\/+/
+  const relative = v.split(separatorPattern).filter((part) => part && part !== '.').join(separator)
+  if (relative === '') return root
+  return root.endsWith(separator) ? `${root}${relative}` : `${root}${separator}${relative}`
 }
 
 /**
@@ -169,11 +175,21 @@ function canonicalPath(path, seen = new Set()) {
         continue
       }
       existing = realpathSync(candidate)
-    } catch {
+    } catch (err) {
+      if (/** @type {{code?: string}} */ (err).code === 'ELOOP') return null
       existing = candidate
     }
   }
   return existing
+}
+
+/**
+ * 返回按文件系统语义解析后的路径；符号链接循环时返回 null。
+ * @param {string} path
+ * @returns {string | null}
+ */
+export function canonicalizePath(path) {
+  return canonicalPath(path)
 }
 
 /**

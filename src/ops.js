@@ -17,6 +17,7 @@ import {
 import { renderTemplate } from './config.js'
 import {
   VaultError,
+  canonicalizePath,
   computeVault,
   isWithin,
   loadLedger,
@@ -110,6 +111,21 @@ function abortResult() {
 }
 
 /**
+ * 计算并规范化操作使用的 vault 路径，确保后续拼接子路径时不会改变文件系统语义。
+ * @param {string} root
+ * @param {PluginConfig} cfg
+ * @returns {{vault: string} | {vault: null, error: string}}
+ */
+function resolveOperationVault(root, cfg) {
+  const configuredVault = computeVault(root, cfg.vault)
+  const vault = canonicalizePath(configuredVault)
+  if (vault === null) {
+    return { vault: null, error: `vault 路径无法解析（${configuredVault}）：存在符号链接循环` }
+  }
+  return { vault }
+}
+
+/**
  * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
  * @param {string} path
  * @returns {{exists: boolean, isDirectory?: boolean, error?: string}}
@@ -151,7 +167,9 @@ export async function begin(opts) {
   const branchCheck = validateBranch(branchName)
   if (!branchCheck.ok) return { ok: false, error: `分支名非法（${branchName}）：${branchCheck.reason}` }
 
-  const vault = computeVault(root, cfg.vault)
+  const vaultResult = resolveOperationVault(root, cfg)
+  if (vaultResult.vault === null) return { ok: false, error: vaultResult.error }
+  const vault = vaultResult.vault
   // 防护：vault 位于仓库工作树内会让主工作区持续处于未跟踪状态，
   // 进而阻塞后续合并（基分支脏检测）。直接拒绝并在报错中给出出路。
   if (isWithin(root, vault)) {
@@ -313,7 +331,9 @@ export async function mergeTask(opts) { // eslint-disable-line
   const mode = opts.mode ?? 'commit'
   if (!MERGE_MODES.has(mode)) return { ok: false, error: `未知 mode：${mode}（可选 commit / refuse）` }
   const { root, cfg, git, repo } = opts
-  const vault = computeVault(root, cfg.vault)
+  const vaultResult = resolveOperationVault(root, cfg)
+  if (vaultResult.vault === null) return { ok: false, error: vaultResult.error }
+  const vault = vaultResult.vault
   try {
     return await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -354,7 +374,9 @@ export async function finishTask(opts) {
   const mode = opts.mode ?? 'commit'
   if (!FINISH_MODES.has(mode)) return { ok: false, error: `未知 mode：${mode}（可选 commit / abandon / keep）` }
   const { root, cfg, git, repo } = opts
-  const vault = computeVault(root, cfg.vault)
+  const vaultResult = resolveOperationVault(root, cfg)
+  if (vaultResult.vault === null) return { ok: false, error: vaultResult.error }
+  const vault = vaultResult.vault
   try {
     return await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -377,7 +399,9 @@ export async function finishTask(opts) {
 export async function listStatus(opts) {
   if (isAborted(opts.signal)) return abortResult()
   const { root, cfg, git } = opts
-  const vault = computeVault(root, cfg.vault)
+  const vaultResult = resolveOperationVault(root, cfg)
+  if (vaultResult.vault === null) return { ok: false, error: vaultResult.error }
+  const vault = vaultResult.vault
   try {
     const ledger = loadLedger(vault)
     const wl = await git.run(['worktree', 'list', '--porcelain'], { cwd: root, signal: opts.signal })
@@ -456,7 +480,9 @@ export async function purge(opts) {
   const mode = opts.mode ?? 'commit'
   if (!FINISH_MODES.has(mode)) return { ok: false, error: `未知 mode：${mode}（可选 commit / abandon / keep）` }
   const { root, cfg, git, repo } = opts
-  const vault = computeVault(root, cfg.vault)
+  const vaultResult = resolveOperationVault(root, cfg)
+  if (vaultResult.vault === null) return { ok: false, error: vaultResult.error }
+  const vault = vaultResult.vault
   try {
     return await withLock(vault, async () => {
       const ledger = loadLedger(vault)
