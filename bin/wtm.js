@@ -45,15 +45,17 @@ function usage() {
  * @property {boolean} [merged]
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean, counts: {ahead: number, behind: number} | null}>} [rows]
- * @property {Array<{task: string, ok: boolean, error?: string, note?: string}>} [results]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null}>} [rows]
+ * @property {Array<{task: string, ok: boolean, error?: string, note?: string, warnings?: string[]}>} [results]
  * @property {string[]} [warnings]
  */
+
+const OPTIONS_REQUIRING_VALUES = new Set(['base', 'branch', 'note', 'mode', 'message', 'root'])
 
 /**
  * 简单参数解析：支持 --key value 与 --flag（布尔）。
  * @param {string[]} argv
- * @returns {{positional: string[], options: Record<string, string | boolean>}}
+ * @returns {{positional: string[], options: Record<string, string | boolean>, error?: string}}
  */
 function parseArgs(argv) {
   const positional = []
@@ -67,6 +69,8 @@ function parseArgs(argv) {
       if (next !== undefined && !next.startsWith('--')) {
         options[key] = next
         i++
+      } else if (OPTIONS_REQUIRING_VALUES.has(key)) {
+        return { positional, options, error: `选项 --${key} 缺少值` }
       } else {
         options[key] = true
       }
@@ -92,6 +96,7 @@ function printResult(result, json) {
   }
   if (!result.ok) {
     process.stderr.write(`错误：${result.error}\n`)
+    for (const w of result.warnings ?? []) process.stdout.write(`警告：${w}\n`)
     return 1
   }
   let exitCode = 0
@@ -102,6 +107,7 @@ function printResult(result, json) {
     for (const r of result.results) {
       process.stdout.write(`• ${r.task}：${r.ok ? '完成' : `失败：${r.error}`}${r.note ? `（${r.note}）` : ''}\n`)
       if (!r.ok) exitCode = 1
+      for (const w of r.warnings ?? []) process.stdout.write(`警告：${w}\n`)
     }
   }
   if (Array.isArray(result.rows)) {
@@ -146,16 +152,39 @@ async function main() {
     return argv.length === 0 ? 2 : 0
   }
   const command = argv[0]
-  const { positional, options } = parseArgs(argv.slice(1))
+  if (!['begin', 'merge', 'finish', 'status', 'purge'].includes(command)) {
+    process.stderr.write(`未知命令：${command}\n\n${usage()}\n`)
+    return 2
+  }
+  const { positional, options, error } = parseArgs(argv.slice(1))
+  if (error) {
+    process.stderr.write(`错误：${error}\n`)
+    return 2
+  }
   const json = options.json === true
-  const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
-
   const git = new GitRunner()
-  const resolved = await resolveToplevel(git, root, undefined)
+  let resolved
+  try {
+    const root = typeof options.root === 'string' ? options.root : process.env.WTM_ROOT || process.cwd()
+    resolved = await resolveToplevel(git, root, undefined)
+  } catch (err) {
+    return printResult({
+      ok: false,
+      error: `解析仓库路径失败：${/** @type {Error} */ (err).message}`,
+    }, json)
+  }
   if (!resolved.ok) {
     return printResult(resolved, json)
   }
-  const repo = readRepoConfig(resolved.root)
+  let repo
+  try {
+    repo = readRepoConfig(resolved.root)
+  } catch (err) {
+    return printResult({
+      ok: false,
+      error: `读取仓库配置失败：${/** @type {Error} */ (err).message}`,
+    }, json)
+  }
   const cfg = loadConfig({ pluginConfig: {}, env: process.env, repoConfig: repo.config })
 
   /** @type {OpResult} */

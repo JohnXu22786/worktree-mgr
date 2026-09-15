@@ -17,16 +17,20 @@ import {
   closeSync,
   existsSync,
   futimesSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readlinkSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path'
 
 export class VaultError extends Error {
   /**
@@ -114,17 +118,80 @@ export function computeVault(rootPath, vault) {
 }
 
 /**
+ * 按路径段解析别名和符号链接，确保符号链接先于后续的 .. 处理。
+ * 目标目录可能尚未创建，因此遇到不存在的路径段后继续拼接剩余路径。
+ * @param {string} path
+ * @returns {string | null}
+ */
+function canonicalPath(path, seen = new Set()) {
+  const separatorPattern = process.platform === 'win32' ? /[\\/]+/ : /\/+/
+  /**
+   * @param {string} value
+   * @returns {{root: string, parts: string[]}}
+   */
+  const splitPath = (value) => {
+    const root = parse(value).root
+    return { root, parts: value.slice(root.length).split(separatorPattern).filter(Boolean) }
+  }
+  const absolute = isAbsolute(path)
+    ? path
+    : `${resolve('.')}${process.platform === 'win32' ? '\\' : '/'}${path}`
+  const parsed = splitPath(absolute)
+  let existing = parsed.root
+  /** @type {(string | { done: string })[]} */
+  const pending = [...parsed.parts]
+
+  while (pending.length > 0) {
+    const item = pending.shift()
+    if (item === undefined) continue
+    if (typeof item !== 'string') {
+      seen.delete(item.done)
+      continue
+    }
+    const component = item
+    if (component === '.') continue
+    if (component === '..') {
+      const parent = dirname(existing)
+      if (parent !== existing) existing = parent
+      continue
+    }
+
+    const candidate = join(existing, component)
+    try {
+      const stat = lstatSync(candidate)
+      if (stat.isSymbolicLink()) {
+        if (seen.has(candidate)) return null
+        seen.add(candidate)
+        const linkTarget = readlinkSync(candidate)
+        const target = splitPath(linkTarget)
+        existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
+        pending.unshift(...target.parts, { done: candidate })
+        continue
+      }
+      existing = realpathSync(candidate)
+    } catch {
+      existing = candidate
+    }
+  }
+  return existing
+}
+
+/**
  * 判断 target 是否位于 parent 之内（或等于 parent）。
- * 路径分隔符先归一化；Windows 下同时忽略大小写（与 samePath 语义一致），
- * 防止大小写变体绕过防护。
+ * 比较前解析路径别名和符号链接；仅在 Windows 下归一化路径分隔符并忽略大小写
+ * （与 samePath 语义一致），防止路径变体绕过防护。POSIX 下反斜杠是有效的文件名字符。
  * @param {string} parent
  * @param {string} target
  * @returns {boolean}
  */
 export function isWithin(parent, target) {
-  const norm = (/** @type {string} */ p) => p.replace(/\\/g, '/').replace(/\/+$/, '')
-  let p = norm(parent)
-  let t = norm(target)
+  const norm = (/** @type {string} */ p) =>
+    (process.platform === 'win32' ? p.replace(/\\/g, '/') : p).replace(/\/+$/, '')
+  const canonicalParent = canonicalPath(parent)
+  const canonicalTarget = canonicalPath(target)
+  if (canonicalParent === null || canonicalTarget === null) return false
+  let p = norm(canonicalParent)
+  let t = norm(canonicalTarget)
   if (process.platform === 'win32') {
     p = p.toLowerCase()
     t = t.toLowerCase()
@@ -188,6 +255,8 @@ export function saveLedger(vaultDir, ledger) {
  * 账本互斥锁。fn 执行期间持有锁，其他调用方自旋等待。
  *
  * 安全性设计（防止多进程并发写账本）：
+ * - token 先写入当前进程的临时文件，再通过硬链接原子地占用 .lock，
+ *   写入失败不会暴露未完成的锁文件；
  * - 锁文件内容为持有者唯一 token（pid + 随机数），释放前先读取比对，
  *   只删除属于自己的锁——被其他进程回收（stale 窃取）后不会误删后继锁；
  * - 持锁期间每心跳间隔刷新锁文件 mtime，长任务（如触发器）不会因
@@ -197,39 +266,78 @@ export function saveLedger(vaultDir, ledger) {
  * @template T
  * @param {string} vaultDir
  * @param {() => Promise<T>} fn
- * @param {{timeoutMs?: number, staleMs?: number, heartbeatMs?: number}} [opts]
+ * @param {{timeoutMs?: number, staleMs?: number, heartbeatMs?: number, signal?: AbortSignal}} [opts]
  * @returns {Promise<T>}
  * @throws {VaultError} 等待超时
  */
-export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_000, heartbeatMs = 30_000 } = {}) {
+export async function withLock(vaultDir, fn, {
+  timeoutMs = 5000,
+  staleMs = 300_000,
+  heartbeatMs = 30_000,
+  signal,
+} = {}) {
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+  }
+  /** @returns {Promise<void>} */
+  const waitForRetry = () => {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, 100))
+    return new Promise((resolve, reject) => {
+      /** @type {ReturnType<typeof setTimeout> | undefined} */
+      let timer
+      const onAbort = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+      }
+      timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, 100)
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    })
+  }
+
+  throwIfAborted()
   mkdirSync(vaultDir, { recursive: true })
   const lockPath = join(vaultDir, '.lock')
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const tempLockPath = join(vaultDir, `.lock-${token}.tmp`)
   const deadline = Date.now() + timeoutMs
   let fd = null
   let owned = false
   for (;;) {
+    throwIfAborted()
     try {
-      fd = openSync(lockPath, 'wx')
+      fd = openSync(tempLockPath, 'wx')
       writeFileSync(fd, token, 'utf8')
+      futimesSync(fd, new Date(), new Date())
+      linkSync(tempLockPath, lockPath)
       owned = true
+      try { unlinkSync(tempLockPath) } catch { /* 持锁期间保留，释放时再清理 */ }
       break
     } catch (err) {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* 忽略 */ }
+        fd = null
+      }
+      try { unlinkSync(tempLockPath) } catch { /* 忽略 */ }
       if (/** @type {any} */ (err).code !== 'EEXIST') throw err
       // 陈旧回收：mtime 超过 staleMs（持有者心跳已停止，视为进程死亡）
       try {
         const st = statSync(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
           unlinkSync(lockPath)
-          continue
         }
       } catch {
-        continue // 对方刚好释放，重试
+        // 对方可能刚好释放，也可能是持久的 I/O、权限错误或悬空符号链接；统一走超时检查。
       }
+      throwIfAborted()
       if (Date.now() >= deadline) {
         throw new VaultError(`账本被其他进程占用（${lockPath}），等待 ${timeoutMs}ms 超时`)
       }
-      await new Promise((r) => setTimeout(r, 100))
+      await waitForRetry()
     }
   }
   // 心跳：定期刷新 mtime，防止长任务期间被误判陈旧
@@ -239,6 +347,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
     }
   }, heartbeatMs)
   try {
+    throwIfAborted()
     return await fn()
   } finally {
     clearInterval(heartbeat)
@@ -250,6 +359,7 @@ export async function withLock(vaultDir, fn, { timeoutMs = 5000, staleMs = 300_0
       const content = readFileSync(lockPath, 'utf8')
       if (content === token) unlinkSync(lockPath)
     } catch { /* 已被回收或删除，忽略 */ }
+    try { unlinkSync(tempLockPath) } catch { /* 已清理或删除，忽略 */ }
   }
 }
 

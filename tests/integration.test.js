@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { GitRunner, resolveToplevel, samePath } from '../src/git.js'
 import { begin, mergeTask, finishTask, listStatus } from '../src/ops.js'
@@ -42,9 +43,12 @@ function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
 }
 
-for (const directory of ['vault with spaces', 'vault "quoted"', 'vault\nwith newline']) {
+for (const directory of [
+  'vault with spaces', 'vault "quoted"', 'vault\nwith newline',
+  'vault\nHEAD deadbeef\nbranch refs/heads/other', 'vault\\literal\tcarriage\rinside',
+]) {
   test(`集成：插件入口保留工作区路径 ${JSON.stringify(directory)}`, {
-    skip: !HAS_GIT || (process.platform === 'win32' && /["\n]/.test(directory)),
+    skip: !HAS_GIT || (process.platform === 'win32' && /["\x00-\x1f]/.test(directory)),
     timeout: 120000,
   }, async () => {
     const root = await makeRepo()
@@ -97,6 +101,170 @@ for (const directory of ['vault with spaces', 'vault "quoted"', 'vault\nwith new
     }
   })
 }
+
+test('集成：非 Git 目录的未知命令先报用法错误', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-'))
+  const cli = fileURLToPath(new URL('../bin/wtm.js', import.meta.url))
+  const env = { ...process.env }
+  delete env.WTM_ROOT
+  try {
+    const result = spawnSync(process.execPath, [cli, 'unknown-command'], {
+      cwd,
+      encoding: 'utf8',
+      env,
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /未知命令：unknown-command/)
+    assert.doesNotMatch(result.stderr, /不是 git 仓库/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('集成：base 只接受真实分支名，拒绝 revision expression', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  try {
+    writeFileSync(join(root, 'second.txt'), 'second\n')
+    assert.equal(gitOk(['add', 'second.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'second'], root).status, 0)
+
+    const b = await begin({ root, task: 'Revision Base', base: 'main^', cfg, git, repo: null })
+    assert.equal(b.ok, false)
+    assert.match(b.error ?? '', /基分支不存在：main\^/)
+    assert.equal(existsSync(join(vault, 'revision-base')), false)
+    assert.equal(loadLedger(vault).records.length, 0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：base 为 @ 时按字面分支创建工作区并统计状态', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let created = false
+  try {
+    assert.equal(gitOk(['branch', '@'], root).status, 0)
+    writeFileSync(join(root, 'second.txt'), 'second\n')
+    assert.equal(gitOk(['add', 'second.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'second'], root).status, 0)
+    writeFileSync(join(root, 'third.txt'), 'third\n')
+    assert.equal(gitOk(['add', 'third.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'third'], root).status, 0)
+
+    const baseHead = gitOk(['rev-parse', 'refs/heads/@'], root).stdout.trim()
+    const currentHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.notEqual(baseHead, currentHead)
+
+    const b = await begin({ root, task: 'At Base', base: '@', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    created = true
+    const worktreePath = /** @type {string} */ (b.path)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], worktreePath).stdout.trim(), baseHead)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+
+    const advancedBaseHead = gitOk(['rev-parse', 'main^'], root).stdout.trim()
+    assert.notEqual(advancedBaseHead, baseHead)
+    assert.equal(gitOk(['update-ref', 'refs/heads/@', advancedBaseHead], root).status, 0)
+
+    const s = await listStatus({ root, cfg, git, repo: null })
+    const row = s.rows?.find((x) => x.task === 'At Base')
+    assert.deepEqual(row?.counts, { ahead: 1, behind: 1 })
+  } finally {
+    if (created) {
+      const f = await finishTask({ root, task: 'At Base', mode: 'abandon', cfg, git, repo: null })
+      assert.equal(f.ok, true, f.error ?? '')
+    }
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：status 对任务分支使用完整 refs/heads 引用（避免同名 tag）', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let worktreePath
+  try {
+    const b = await begin({ root, task: 'Literal Ref Status', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    assert.equal(gitOk(['tag', 'wtm/literal-ref-status'], root).status, 0)
+
+    const s = await listStatus({ root, cfg, git, repo: null })
+    assert.equal(s.ok, true, s.error ?? '')
+    const row = s.rows?.find((x) => x.task === 'Literal Ref Status')
+    assert.deepEqual(row?.counts, { ahead: 1, behind: 0 })
+  } finally {
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['update-ref', '-d', 'refs/heads/wtm/literal-ref-status'], root)
+    gitOk(['tag', '-d', 'wtm/literal-ref-status'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：merge 对任务分支使用完整 refs/heads 引用（避免同名 tag）', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  let worktreePath
+  try {
+    const b = await begin({ root, task: 'Literal Ref Merge', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    assert.equal(gitOk(['tag', 'wtm/literal-ref-merge'], root).status, 0)
+
+    const m = await mergeTask({ root, task: 'Literal Ref Merge', mode: 'commit', cfg, git, repo: null })
+    assert.equal(m.ok, true, m.error ?? '')
+    assert.equal(m.merged, true)
+    assert.equal(readFileSync(join(root, 'task.txt'), 'utf8'), 'task\n')
+  } finally {
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['update-ref', '-d', 'refs/heads/wtm/literal-ref-merge'], root)
+    gitOk(['tag', '-d', 'wtm/literal-ref-merge'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
 
 test('集成：完整生命周期 begin → 修改 → status → finish(commit)', { skip: !HAS_GIT, timeout: 120000 }, async () => {
   const root = await makeRepo()
@@ -226,4 +394,3 @@ test('集成：resolveToplevel 真实解析子目录', { skip: !HAS_GIT, timeout
     rmSync(root, { recursive: true, force: true })
   }
 })
-

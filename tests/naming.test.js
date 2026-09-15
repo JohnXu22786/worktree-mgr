@@ -31,6 +31,12 @@ test('slugifyTask：保留多级斜杠分段，剔除空段与 . 和 .. 段', ()
   assert.equal(slugifyTask('/leading-slash'), 'leading-slash')
 })
 
+test('slugifyTask：斜杠前的标点段被剔除，不产生双斜杠', () => {
+  assert.equal(slugifyTask('!/foo'), 'foo')
+  assert.equal(deriveBranch('!/foo'), 'wtm/foo')
+  assert.equal(validateBranch(deriveBranch('!/foo')).ok, true)
+})
+
 test('slugifyTask：空输入与纯非法输入回退为 task', () => {
   assert.equal(slugifyTask(''), 'task')
   assert.equal(slugifyTask('   '), 'task')
@@ -58,6 +64,47 @@ test('slugifyTask：超长任务名被截断（含前缀仍不超 100 字符）'
   assert.ok(branch.length <= 100, `分支名长度 ${branch.length} 应 ≤ 100`)
 })
 
+test('slugifyTask：截断不切断非 BMP Unicode 字符', () => {
+  const task = 'a'.repeat(59) + '𐐀'
+  const normalized = task.normalize('NFKC').toLowerCase()
+  const slug = slugifyTask(task)
+
+  assert.equal(slug, normalized)
+  assert.equal(validateBranch(deriveBranch(task)).ok, true)
+})
+
+test('deriveBranch：前缀较长时仍限制分支总长度', () => {
+  const prefix = 'p'.repeat(190)
+  const task = '𐐀'.repeat(60)
+  const branch = deriveBranch(task, prefix)
+
+  assert.equal(Buffer.byteLength(branch), 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
+test('validatePrefix：为非 BMP slug 预留最小分支空间', () => {
+  assert.equal(validatePrefix('p'.repeat(251)).ok, false)
+
+  const prefix = 'p'.repeat(250)
+  const branch = deriveBranch('𐐀', prefix)
+  assert.equal(Buffer.byteLength(branch), 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
+test('deriveBranch：按 UTF-8 字节限制 Unicode 前缀与分支总长度', () => {
+  const prefix = '前'.repeat(80)
+  const branch = deriveBranch('x'.repeat(60), prefix)
+
+  assert.equal(Buffer.byteLength(prefix), 240)
+  assert.equal(Buffer.byteLength(branch), 255)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
+test('validatePrefix：按 UTF-8 字节为 slug 预留空间', () => {
+  assert.equal(validatePrefix('前'.repeat(83)).ok, true)
+  assert.equal(validatePrefix('前'.repeat(84)).ok, false)
+})
+
 test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => {
   // 截断切在 . 上：段尾残留 '.'
   assert.equal(validateBranch(deriveBranch('y'.repeat(59) + '.tail')).ok, true)
@@ -73,6 +120,16 @@ test('slugifyTask：截断后再修正段尾，派生分支始终合法', () => 
   assert.equal(slug.endsWith('.'), false)
 })
 
+test('slugifyTask：截断移除段尾连字符时也移除前面的斜杠', () => {
+  const task = 'a'.repeat(58) + '/..a'
+  const slug = slugifyTask(task)
+  const branch = deriveBranch(task)
+
+  assert.equal(slug, 'a'.repeat(58))
+  assert.equal(branch, `wtm/${'a'.repeat(58)}`)
+  assert.equal(validateBranch(branch).ok, true)
+})
+
 test('deriveBranch：默认前缀 wtm，支持自定义前缀', () => {
   assert.equal(deriveBranch('Dark Mode'), 'wtm/dark-mode')
   assert.equal(deriveBranch('Dark Mode', 'sandbox'), 'sandbox/dark-mode')
@@ -83,6 +140,7 @@ test('validateBranch：接受合法分支名', () => {
   assert.deepEqual(validateBranch('wtm/feat-1'), { ok: true })
   assert.deepEqual(validateBranch('main'), { ok: true })
   assert.deepEqual(validateBranch('feature/深色/模式'), { ok: true })
+  assert.deepEqual(validateBranch('@'), { ok: true })
 })
 
 test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
@@ -106,7 +164,6 @@ test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
     '.hidden',
     'a.',
     'a\u0007b',
-    '@',
     '',
   ]
   for (const name of bad) {
@@ -115,13 +172,21 @@ test('validateBranch：拒绝 git 非法 ref（防注入）', () => {
   }
 })
 
-test('validateBranch：长度上限 255', () => {
+test('validateBranch：拒绝保留的 HEAD 分支名', () => {
+  assert.equal(validateBranch('HEAD').ok, false)
+})
+
+test('validateBranch：长度上限 255 字节', () => {
   assert.equal(validateBranch('x'.repeat(255)).ok, true)
   assert.equal(validateBranch('x'.repeat(256)).ok, false)
+  assert.equal(validateBranch('前'.repeat(85)).ok, true)
+  assert.equal(validateBranch('前'.repeat(86)).ok, false)
 })
 
 test('validatePrefix：必须为单段合法 ref', () => {
   assert.equal(validatePrefix('wtm').ok, true)
+  assert.equal(validatePrefix('HEAD').ok, true)
+  assert.equal(validateBranch(deriveBranch('task', 'HEAD')).ok, true)
   assert.equal(validatePrefix('a/b').ok, false)
   assert.equal(validatePrefix('-x').ok, false)
   assert.equal(validatePrefix('').ok, false)
@@ -132,4 +197,17 @@ test('validateTask：非空且长度受限', () => {
   assert.equal(validateTask('').ok, false)
   assert.equal(validateTask('   ').ok, false)
   assert.equal(validateTask('x'.repeat(500)).ok, false)
+})
+
+test('validateTask：拒绝 Windows 保留设备名工作区段', () => {
+  const reserved = ['CON', 'Aux', 'NUL.txt', 'PRN.log', 'COM1', 'lpt9', 'nested/CON', 'foo/com1.txt/bar']
+  for (const task of reserved) {
+    const result = validateTask(task)
+    assert.equal(result.ok, false, `应拒绝 Windows 设备名任务: ${task}`)
+    assert.match(result.reason ?? '', /Windows.*设备名/)
+  }
+
+  for (const task of ['COM10', 'LPT0', 'CONSOLE', 'my-con']) {
+    assert.equal(validateTask(task).ok, true, `不应误拒绝普通任务名: ${task}`)
+  }
 })

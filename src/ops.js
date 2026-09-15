@@ -6,7 +6,7 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
   slugifyTask,
@@ -87,8 +87,8 @@ import { runTriggers } from './triggers.js'
  * @property {boolean} [removed]
  * @property {boolean} [branchDeleted]
  * @property {string[]} [warnings]
- * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
- * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean}>} [results]
+ * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
+ * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean, branchDeleted?: boolean, warnings?: string[]}>} [results]
  */
 
 const MERGE_MODES = new Set(['commit', 'refuse'])
@@ -107,6 +107,24 @@ function isAborted(signal) {
 
 function abortResult() {
   return { ok: false, error: '操作已取消（aborted）' }
+}
+
+/**
+ * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
+ * @param {string} path
+ * @returns {{exists: boolean, isDirectory?: boolean, error?: string}}
+ */
+function inspectPath(path) {
+  try {
+    return { exists: true, isDirectory: statSync(path).isDirectory() }
+  } catch (err) {
+    const error = /** @type {{code?: string, message?: string}} */ (err)
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { exists: false }
+    return {
+      exists: false,
+      error: error.message || String(err),
+    }
+  }
 }
 
 /**
@@ -158,9 +176,10 @@ export async function begin(opts) {
       if (!baseName) {
         return { ok: false, error: '主工作区处于 detached HEAD 状态，请显式指定 base 分支' }
       }
-      const baseCheck = await git.run(['rev-parse', '--verify', `refs/heads/${baseName}`], { cwd: root, signal: opts.signal })
+      const baseRef = `refs/heads/${baseName}`
+      const baseCheck = await git.run(['show-ref', '--verify', baseRef], { cwd: root, signal: opts.signal })
       if (!baseCheck.ok) {
-        // 空仓库（无任何提交）时分支尚未诞生，rev-parse 会失败——给出明确提示
+        // 空仓库（无任何提交）时分支尚未诞生，show-ref 会失败——给出明确提示
         const headCheck = await git.run(['rev-parse', '--verify', 'HEAD'], { cwd: root, signal: opts.signal })
         const hint = headCheck.ok ? '' : '（仓库尚无任何提交，请先创建首个提交）'
         return { ok: false, error: `基分支不存在：${baseName}${hint}` }
@@ -170,8 +189,11 @@ export async function begin(opts) {
       const existsCheck = await git.run(['show-ref', '--verify', `refs/heads/${branchName}`], { cwd: root, signal: opts.signal })
       if (existsCheck.ok) return { ok: false, error: `分支已存在：${branchName}` }
 
-      // 安全提示：主工作区脏时新建工作区不会包含未提交改动
+      // 安全检查：主工作区状态不可读时不能继续；脏时新建工作区不会包含未提交改动
       const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
+      if (!baseStatus.ok) {
+        return { ok: false, error: `读取主工作区状态失败：${baseStatus.stderr.trim() || 'git status 失败'}` }
+      }
       if (isDirty(baseStatus.stdout)) {
         warnings.push('主工作区存在未提交改动，新建的工作区不会包含这些改动，请留意')
       }
@@ -187,7 +209,7 @@ export async function begin(opts) {
       }
 
       // 核心动作：创建 worktree
-      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseName], { cwd: root, signal: opts.signal })
+      const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseRef], { cwd: root, signal: opts.signal })
       if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
       createdWorktree = true
 
@@ -241,20 +263,28 @@ export async function begin(opts) {
       upsertRecord(ledger, record)
       saveLedger(vault, ledger)
       return { ok: true, base: baseName, path: wtPath }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && typeof result === 'undefined') {
       try {
-        await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        await git.run(['branch', '-D', branchName], { cwd: root })
-        warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
+        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
+        const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+        if (remove.ok && branch.ok) {
+          warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
+        } else {
+          const failures = []
+          if (!remove.ok) failures.push(`worktree remove 失败：${remove.stderr.trim() || '命令返回失败'}`)
+          if (!branch.ok) failures.push(`branch -D 失败：${branch.stderr.trim() || '命令返回失败'}`)
+          warnings.push(`工作区创建未完成，且回滚失败：${failures.join('；')}；请手动执行 git worktree remove / branch -D`)
+        }
       } catch {
         warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
       }
     }
-    if (err instanceof VaultError) return { ok: false, error: err.message }
-    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}` }
+    if (isAborted(opts.signal)) return { ok: false, error: '操作已取消（aborted）', warnings }
+    if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
+    return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
   if (!result.ok) return result
   return {
@@ -300,8 +330,9 @@ export async function mergeTask(opts) { // eslint-disable-line
         merged: core.merged,
         warnings: core.warnings,
       }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `同步失败：${/** @type {Error} */ (err).message}` }
   }
@@ -330,8 +361,9 @@ export async function finishTask(opts) {
       const rec = findRecord(ledger, task)
       if (!rec) return { ok: false, error: `任务不存在：${task}（可用 wtm_status 查看）` }
       return await finishCore(opts, { vault, ledger, rec, mode })
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `收尾失败：${/** @type {Error} */ (err).message}` }
   }
@@ -349,20 +381,42 @@ export async function listStatus(opts) {
   try {
     const ledger = loadLedger(vault)
     const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+    if (wl.aborted || isAborted(opts.signal)) return abortResult()
     if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
     const worktrees = parseWorktreeList(wl.stdout)
+    /** @type {string[]} */
+    const warnings = []
     const rows = []
     for (const rec of ledger.records) {
       const wt = worktrees.find((w) => samePath(w.path, rec.path))
-      let dirty = false
       let counts = null
-      // 存在性 = 注册表有该工作区 且 目录实际存在（目录被外部删除后注册表仍会列出）
-      const alive = Boolean(wt) && existsSync(rec.path)
+      // 存在性 = 注册表有该工作区、目录实际存在且仍在账本分支上；
+      // 分支漂移后不能读取或统计错误分支的状态。
+      const pathState = wt ? inspectPath(rec.path) : { exists: false }
+      const alive = Boolean(wt) && pathState.exists && pathState.isDirectory === true && wt?.branch === rec.branch
+      /** @type {boolean | null} */
+      let dirty = pathState.error ? null : false
+      if (pathState.error) {
+        warnings.push(`读取任务工作区失败（${rec.task}）：${pathState.error}`)
+      }
       if (alive) {
         const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
-        dirty = st.ok && isDirty(st.stdout)
-        const rc = await git.run(['rev-list', '--left-right', '--count', `${rec.base}...${rec.branch}`], { cwd: root, signal: opts.signal })
-        counts = rc.ok ? parseAheadBehind(rc.stdout) : null
+        if (st.aborted || isAborted(opts.signal)) return abortResult()
+        if (st.ok) {
+          dirty = isDirty(st.stdout)
+        } else {
+          dirty = null
+          warnings.push(`读取任务工作区状态失败（${rec.task}）：${st.stderr.trim() || 'git status 失败'}`)
+        }
+        const rc = await git.run(['rev-list', '--left-right', '--count', `refs/heads/${rec.base}...refs/heads/${rec.branch}`], { cwd: root, signal: opts.signal })
+        if (rc.aborted || isAborted(opts.signal)) return abortResult()
+        const parsedCounts = rc.ok ? parseAheadBehind(rc.stdout) : null
+        if (parsedCounts) {
+          counts = parsedCounts
+        } else {
+          const detail = rc.ok ? 'git rev-list 输出格式无效' : rc.stderr.trim() || 'git rev-list 失败'
+          warnings.push(`读取任务领先/落后计数失败（${rec.task}）：${detail}`)
+        }
       }
       rows.push({
         task: rec.task,
@@ -375,7 +429,8 @@ export async function listStatus(opts) {
         updatedAt: rec.updatedAt,
       })
     }
-    return { ok: true, rows, warnings: [] }
+    if (isAborted(opts.signal)) return abortResult()
+    return { ok: true, rows, warnings }
   } catch (err) {
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `总览失败：${/** @type {Error} */ (err).message}` }
@@ -416,11 +471,21 @@ export async function purge(opts) {
           continue
         }
         const r = await finishCore(opts, { vault, ledger, rec: item.rec, mode })
-        results.push({ task: item.rec.task, ok: r.ok, error: r.error, note: r.note, merged: r.merged, committed: r.committed })
+        results.push({
+          task: item.rec.task,
+          ok: r.ok,
+          error: r.error,
+          note: r.note,
+          merged: r.merged,
+          committed: r.committed,
+          branchDeleted: r.branchDeleted,
+          warnings: r.warnings,
+        })
       }
       return { ok: true, results }
-    })
+    }, { signal: opts.signal })
   } catch (err) {
+    if (isAborted(opts.signal)) return abortResult()
     if (err instanceof VaultError) return { ok: false, error: err.message }
     return { ok: false, error: `批量清理失败：${/** @type {Error} */ (err).message}` }
   }
@@ -433,13 +498,17 @@ export async function purge(opts) {
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
+ * @param {string} [mode='commit']
  * @returns {Promise<{ok: boolean, committed: boolean, error?: string}>}
  */
-async function snapshotCommit(opts, rec, task) {
+async function snapshotCommit(opts, rec, task, mode = 'commit') {
   const { git, cfg } = opts
   const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
   if (!st.ok) return { ok: false, committed: false, error: `读取任务工作区状态失败：${st.stderr.trim()}` }
   if (!isDirty(st.stdout)) return { ok: true, committed: false }
+  if (mode === 'refuse') {
+    return { ok: false, committed: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
+  }
   const message = opts.message ?? renderTemplate(cfg.commitMessage, { task, branch: rec.branch, base: rec.base })
   const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
   if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
@@ -490,13 +559,21 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
-  const ancestor = await git.run(['merge-base', '--is-ancestor', rec.branch, 'HEAD'], { cwd: root, signal: opts.signal })
+  const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
   if (ancestor.ok) {
     return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
+  if (ancestor.code !== 1) {
+    return {
+      ok: false,
+      merged: false,
+      error: `检查任务分支是否已合并失败：${ancestor.stderr.trim() || 'git merge-base 失败'}`,
+      warnings: [],
+    }
+  }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', rec.branch, '-m', message], { cwd: root, signal: opts.signal })
+  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
   if (!merge.ok) {
     return {
       ok: false,
@@ -523,8 +600,18 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
   // stale：注册表没有该工作区，或目录已被外部删除
   // （目录被删后注册表仍会列出 prunable 条目，必须用目录实存判定）
-  if (!wt || !existsSync(rec.path)) {
+  if (!wt) {
     return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
+  }
+  const pathState = inspectPath(rec.path)
+  if (pathState.error) {
+    return { ok: false, error: `读取任务工作区失败（${rec.path}）：${pathState.error}` }
+  }
+  if (!pathState.exists) {
+    return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
+  }
+  if (pathState.isDirectory !== true) {
+    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
   }
 
   /** @type {string[]} */
@@ -541,7 +628,7 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
       return { ok: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
     }
   }
-  const snap = await snapshotCommit(opts, rec, task)
+  const snap = await snapshotCommit(opts, rec, task, mode)
   if (!snap.ok) return { ok: false, error: snap.error }
 
   // 2) 合并回基分支
@@ -550,12 +637,14 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   warnings.push(...merged.warnings)
 
   // 3) on_merge 触发器（工作目录 = 主仓库）
-  const triggerWarnings = await runTriggers(
-    repo?.triggers?.on_merge,
-    { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
-  )
-  warnings.push(...triggerWarnings.warnings)
+  if (merged.merged) {
+    const triggerWarnings = await runTriggers(
+      repo?.triggers?.on_merge,
+      { task, branch: rec.branch, base: rec.base, path: rec.path, root },
+      { spawn: opts.triggerSpawn, cwd: root },
+    )
+    warnings.push(...triggerWarnings.warnings)
+  }
 
   // 4) 更新账本时间戳
   rec.updatedAt = nowIso()
@@ -601,10 +690,23 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
-  if (!wt || !existsSync(rec.path)) {
+  if (!wt) {
     removeRecord(ledger, task)
     saveLedger(vault, ledger)
     return { ok: true, note: `任务工作区已不存在，已清理账本记录（任务：${task}）`, committed: false, merged: false }
+  }
+  const pathState = inspectPath(rec.path)
+  if (pathState.error) {
+    return { ok: false, error: `读取任务工作区失败（${rec.path}）：${pathState.error}` }
+  }
+  if (!pathState.exists) {
+    removeRecord(ledger, task)
+    saveLedger(vault, ledger)
+    return { ok: true, note: `任务工作区已不存在，已清理账本记录（任务：${task}）`, committed: false, merged: false }
+  }
+
+  if (pathState.isDirectory !== true) {
+    return { ok: false, error: `任务工作区路径不是目录（${rec.path}），请恢复该路径后重试` }
   }
 
   // keep：仅解除管理
@@ -614,13 +716,14 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     return { ok: true, note: `任务“${task}”已解除管理，工作区与分支保留`, committed: false, merged: false }
   }
 
+  // commit 与 abandon 都会移除工作区和处理任务分支，必须先确认当前工作区
+  // 仍是账本记录的分支，避免误删被切换到该目录的其他工作区或分支。
+  const branchCheck = checkWorktreeBranch(wt, rec)
+  if (!branchCheck.ok) return { ok: false, error: branchCheck.error }
+
   let committed = false
   let merged = false
   if (mode === 'commit') {
-    // commit 模式会提交改动：先校验工作区当前分支与账本记录一致，
-    // 否则快照会落在错误分支并静默丢失（与 merge 路径同一防护）
-    const branchCheck = checkWorktreeBranch(wt, rec)
-    if (!branchCheck.ok) return { ok: false, error: branchCheck.error }
     // 快照提交 + 合并（abandon 模式两者都跳过）
     const snap = await snapshotCommit(opts, rec, task)
     if (!snap.ok) return { ok: false, error: snap.error }
@@ -629,6 +732,14 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
     warnings.push(...m.warnings)
+    if (m.merged) {
+      const mergeTriggerWarnings = await runTriggers(
+        repo?.triggers?.on_merge,
+        { task, branch: rec.branch, base: rec.base, path: rec.path, root },
+        { spawn: opts.triggerSpawn, cwd: root },
+      )
+      warnings.push(...mergeTriggerWarnings.warnings)
+    }
   }
 
   // 移除工作区：commit 用安全移除，abandon 用 --force
@@ -640,6 +751,7 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     return {
       ok: false,
       error: `移除工作区失败：${remove.stderr.trim()}（如存在未跟踪文件，可改用 abandon 模式强制清理）`,
+      warnings,
     }
   }
 
@@ -669,7 +781,3 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     warnings,
   }
 }
-
-
-
-

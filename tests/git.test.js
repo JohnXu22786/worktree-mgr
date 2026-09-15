@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, GitRunner } from '../src/git.js'
+import { EventEmitter } from 'node:events'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runGit, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -14,6 +15,22 @@ test('samePath：POSIX 下保留路径分隔符语义', { skip: process.platform
 
 test('samePath：Windows 下忽略大小写', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/T1', 'c:\\wtm\\vault\\t1'), true)
+})
+
+test('resolveToplevel：保留仓库路径末尾的空格', async () => {
+  const git = {
+    run: async () => ({ ok: true, code: 0, stdout: '/tmp/repo \n', stderr: '', aborted: false }),
+  }
+  const result = await resolveToplevel(git, '/tmp/repo ')
+  assert.deepEqual(result, { ok: true, root: '/tmp/repo ' })
+})
+
+test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
+  const git = {
+    run: async () => ({ ok: true, code: 0, stdout: '/tmp/repo\r\n', stderr: '', aborted: false }),
+  }
+  const result = await resolveToplevel(git, '/tmp/repo\r')
+  assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
 })
 
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
@@ -74,6 +91,22 @@ test('parseWorktreeList：NUL 分隔保留换行、引号与末尾空白路径',
   assert.ok(list.every((entry) => entry.branch === 'wtm/task' && entry.locked))
 })
 
+test('parseWorktreeList：NUL 路径中的元数据样式文本不产生伪记录', () => {
+  const path = '/vault\nHEAD deadbeef\nbranch refs/heads/other\n\nworktree /fake'
+  const text = [
+    `worktree ${path}`, 'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/real', '',
+    'worktree /bare', 'bare', '',
+    'worktree /detached', 'HEAD 2222222222222222222222222222222222222222',
+    'detached', '', '',
+  ].join('\0')
+  assert.deepEqual(parseWorktreeList(text), [
+    { path, branch: 'real', detached: false, bare: false, locked: false },
+    { path: '/bare', branch: null, detached: false, bare: true, locked: false },
+    { path: '/detached', branch: null, detached: true, bare: false, locked: false },
+  ])
+})
+
 test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留）', () => {
   // git worktree list --porcelain 对已删除目录的工作区输出 prunable 行，
   // 解析器必须保留该条目与其分支信息（ops.js 结合目录实存判定 stale）。
@@ -95,6 +128,53 @@ test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留
   assert.equal(list[1].locked, false)
 })
 
+test('parseWorktreeList：保留旧版 porcelain 中路径内的换行', () => {
+  const text = [
+    'worktree /tmp/worktree',
+    'with-newline',
+    'HEAD 3333333333333333333333333333333333333333',
+    'branch refs/heads/task-with-newline',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/tmp/worktree\nwith-newline',
+    branch: 'task-with-newline',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：路径内类似 HEAD 字段时不提前截断', () => {
+  const text = [
+    'worktree /tmp/worktree\nHEAD 4444444444444444444444444444444444444444',
+    'HEAD 5555555555555555555555555555555555555555',
+    'branch refs/heads/task-with-head-line',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\nHEAD 4444444444444444444444444444444444444444')
+})
+
+test('parseWorktreeList：保留路径末尾的换行', () => {
+  const text = [
+    'worktree /tmp/worktree\n',
+    'HEAD 6666666666666666666666666666666666666666',
+    'branch refs/heads/task-with-trailing-newline',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\n')
+})
+
+test('parseWorktreeList：保留 POSIX 路径末尾的回车符', () => {
+  const text = [
+    'worktree /tmp/worktree\r',
+    'HEAD 7777777777777777777777777777777777777777',
+    'branch refs/heads/task-with-trailing-carriage-return',
+    '',
+  ].join('\n')
+  assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\r')
+})
+
 test('parseAheadBehind：按 base...branch 语义映射 rev-list 计数', () => {
   // rev-list 的第一个计数是基分支独有提交（任务落后），第二个是任务分支独有提交（任务领先）。
   assert.deepEqual(parseAheadBehind('3\t5'), { ahead: 5, behind: 3 })
@@ -107,6 +187,80 @@ test('isDirty：porcelain 输出非空即脏', () => {
   assert.equal(isDirty(''), false)
   assert.equal(isDirty(' M file.txt\n'), true)
   assert.equal(isDirty('?? untracked.txt\n'), true)
+})
+
+test('runGit：跨 chunk 的 UTF-8 路径保持完整', async () => {
+  const spawnImpl = () => {
+    const child = /** @type {any} */ (new EventEmitter())
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    queueMicrotask(() => {
+      child.stdout.emit('data', Buffer.from([0xe4, 0xb8]))
+      child.stdout.emit('data', Buffer.from([0xad]))
+      child.stderr.emit('data', Buffer.from([0xc3]))
+      child.stderr.emit('data', Buffer.from([0xa9]))
+      child.emit('close', 0, null)
+    })
+    return child
+  }
+
+  const result = await runGit(['status'], { spawnImpl })
+  assert.equal(result.stdout, '中')
+  assert.equal(result.stderr, 'é')
+})
+
+test('runGit：AbortError 后等待 close 再完成', async () => {
+  let child = /** @type {any} */ (null)
+  const spawnImpl = () => {
+    child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    return child
+  }
+
+  const resultPromise = runGit(['status'], { spawnImpl })
+  let settled = false
+  resultPromise.then(() => { settled = true })
+
+  const error = new Error('The operation was aborted')
+  error.name = 'AbortError'
+  child.emit('error', error)
+  await Promise.resolve()
+  assert.equal(settled, false)
+
+  child.emit('close', null, 'SIGTERM')
+  assert.deepEqual(await resultPromise, {
+    ok: false,
+    code: -1,
+    stdout: '',
+    stderr: '',
+    aborted: true,
+  })
+})
+
+test('runGit：未中止的 AbortSignal 遇到外部 SIGTERM/SIGKILL 时不标记 aborted', async () => {
+  for (const codeSig of ['SIGTERM', 'SIGKILL']) {
+    let child = /** @type {any} */ (null)
+    const spawnImpl = () => {
+      child = new EventEmitter()
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => child.emit('close', null, codeSig))
+      return child
+    }
+    const ac = new AbortController()
+
+    const result = await runGit(['status'], { signal: ac.signal, spawnImpl })
+
+    assert.equal(ac.signal.aborted, false)
+    assert.deepEqual(result, {
+      ok: false,
+      code: null,
+      stdout: '',
+      stderr: '',
+      aborted: false,
+    })
+  }
 })
 
 test('GitRunner.run：真实 git 可用时返回结构 {ok, code, stdout, stderr}', { skip: !GitRunner.probe() }, async () => {

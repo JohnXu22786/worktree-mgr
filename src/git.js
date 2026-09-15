@@ -7,16 +7,17 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * 执行一条 git 命令。
  * @param {string[]} args
- * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>, spawnImpl?: typeof spawn}} [opts]
  * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
  */
-export function runGit(args, { cwd, signal, env } = {}) {
+export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(
+    const child = spawnImpl(
       'git',
       ['--no-pager', '-c', 'core.quotepath=false', ...args],
       {
@@ -29,24 +30,47 @@ export function runGit(args, { cwd, signal, env } = {}) {
     )
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    child.stdout.on('data', (d) => { stdout += stdoutDecoder.write(d) })
+    child.stderr.on('data', (d) => { stderr += stderrDecoder.write(d) })
     let settled = false
     /**
-     * @param {{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}} result
+     * @param {{ok: boolean, code: number | null, stdout?: string, stderr?: string, aborted: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
         settled = true
-        resolve(result)
+        resolve({
+          ...result,
+          stdout: result.stdout ?? stdout + stdoutDecoder.end(),
+          stderr: result.stderr ?? stderr + stderrDecoder.end(),
+        })
       }
     }
+    let abortPending = false
     child.on('error', (err) => {
       const aborted = err.name === 'AbortError'
-      done({ ok: false, code: -1, stdout, stderr: aborted ? '' : stderr || err.message, aborted })
+      if (aborted) {
+        abortPending = true
+        return
+      }
+      const decodedStdout = stdout + stdoutDecoder.end()
+      const decodedStderr = stderr + stderrDecoder.end()
+      done({
+        ok: false,
+        code: -1,
+        stdout: decodedStdout,
+        stderr: aborted ? '' : decodedStderr || err.message,
+        aborted,
+      })
     })
-    child.on('close', (code, codeSig) => {
-      done({ ok: code === 0, code, stdout, stderr, aborted: codeSig !== null })
+    child.on('close', (code) => {
+      if (abortPending) {
+        done({ ok: false, code: -1, aborted: true })
+        return
+      }
+      done({ ok: code === 0, code, aborted: false })
     })
   })
 }
@@ -83,7 +107,7 @@ export async function resolveToplevel(git, candidate, signal) {
   if (!r.ok) {
     return { ok: false, error: `“${candidate}”不是 git 仓库：${r.stderr.trim() || 'rev-parse 失败'}` }
   }
-  return { ok: true, root: r.stdout.trim() }
+  return { ok: true, root: r.stdout.replace(/\n$/, '') }
 }
 
 /**
@@ -96,8 +120,7 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  const fields = text.includes('\0') ? text.split('\0') : text.split(/\r?\n/)
-  for (const line of fields) {
+  const consume = (/** @type {string} */ line) => {
     if (line.startsWith('worktree ')) {
       current = {
         path: line.slice('worktree '.length),
@@ -118,6 +141,27 @@ export function parseWorktreeList(text) {
         current.locked = true
       }
     }
+  }
+
+  if (text.includes('\0')) {
+    for (const field of text.split('\0')) consume(field)
+    return out
+  }
+
+  // Legacy porcelain has no record delimiter. Use the stable HEAD line and
+  // its following field to keep newlines that belong to a worktree path.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\nHEAD [0-9a-f]+(\r?)\n(?=(?:branch refs\/heads\/|detached(?:\r?\n|$)|bare(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))/gm)]
+  if (records.length > 0) {
+    for (let i = 0; i < records.length; i += 1) {
+      const record = records[i]
+      const path = record[2] === '\r' && record[1].endsWith('\r') ? record[1].slice(0, -1) : record[1]
+      consume(`worktree ${path}`)
+      const start = (record.index ?? 0) + record[0].length
+      const end = records[i + 1]?.index ?? text.length
+      for (const line of text.slice(start, end).split(/\r?\n/)) consume(line)
+    }
+  } else {
+    for (const line of text.split(/\r?\n/)) consume(line)
   }
   return out
 }

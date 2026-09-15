@@ -39,7 +39,8 @@ export function readRepoConfig(root) {
   let text
   try {
     text = readFileSync(join(root, '.wtm.json'), 'utf8')
-  } catch {
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'ENOENT') throw err
     return { config: null, warnings } // 无配置文件是常态
   }
   const parsed = parseRepoConfigText(text)
@@ -66,16 +67,29 @@ export function readRepoConfig(root) {
  */
 async function prepare({ args, exec, tool, git }) {
   if (exec?.signal?.aborted) return { ok: false, error: '调用已取消（aborted）' }
-  const candidate = typeof args.root === 'string'
-    ? args.root
-    : (typeof tool.config.root === 'string'
-      ? tool.config.root
-      : (typeof process.env.WTM_ROOT === 'string' && process.env.WTM_ROOT !== ''
-        ? process.env.WTM_ROOT
-        : process.cwd()))
-  const resolved = await resolveToplevel(git, candidate, exec?.signal)
+  let resolved
+  try {
+    const candidate = typeof args.root === 'string'
+      ? args.root
+      : (typeof tool.config.root === 'string'
+        ? tool.config.root
+        : (typeof process.env.WTM_ROOT === 'string' && process.env.WTM_ROOT !== ''
+          ? process.env.WTM_ROOT
+          : process.cwd()))
+    resolved = await resolveToplevel(git, candidate, exec?.signal)
+    if (!resolved.ok && exec?.signal?.aborted) {
+      return { ok: false, error: '调用已取消（aborted）' }
+    }
+  } catch (err) {
+    return { ok: false, error: `解析仓库路径失败：${/** @type {Error} */ (err).message}` }
+  }
   if (!resolved.ok) return { ok: false, error: resolved.error }
-  const repo = readRepoConfig(resolved.root)
+  let repo
+  try {
+    repo = readRepoConfig(resolved.root)
+  } catch (err) {
+    return { ok: false, error: `读取仓库配置失败：${/** @type {Error} */ (err).message}` }
+  }
   const cfg = loadConfig({
     pluginConfig: tool.config,
     env: process.env,
@@ -93,6 +107,16 @@ async function prepare({ args, exec, tool, git }) {
 /** @param {string} text */
 function textBlock(text) {
   return [{ type: 'text', text }]
+}
+
+/**
+ * @param {string} text
+ * @param {string[] | undefined} warnings
+ */
+function textBlockWithWarnings(text, warnings) {
+  const lines = [text]
+  for (const w of warnings ?? []) lines.push(`⚠️  ${w}`)
+  return textBlock(lines.join('\n'))
 }
 
 /**
@@ -139,7 +163,11 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 创建失败：${value.error}`)
+        if (!value.ok) {
+          const lines = [`❌ 创建失败：${value.error}`]
+          for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
+          return textBlock(lines.join('\n'))
+        }
         const lines = [
           `✅ 已创建任务工作区`,
           `任务: ${value.task}`,
@@ -158,7 +186,6 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, base: a.base, branch: a.branch,
         note: a.note, cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
@@ -193,7 +220,7 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 同步失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 同步失败：${value.error}`, value.warnings)
         const parts = [`✅ 已同步任务 ${value.task} → ${value.base}`]
         if (value.committed) parts.push(`已自动快照提交任务工作区的改动`)
         if (value.merged) parts.push(`已合并分支 ${value.branch} 回 ${value.base}`)
@@ -247,8 +274,8 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 收尾失败：${value.error}`)
-        if (value.note) return textBlock(`✅ ${value.note}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 收尾失败：${value.error}`, value.warnings)
+        if (value.note) return textBlockWithWarnings(`✅ ${value.note}`, value.warnings)
         const parts = [`✅ 任务 ${value.task} 已收尾`]
         if (value.committed) parts.push(`已快照提交任务改动`)
         if (value.merged) parts.push(`已合并回基分支`)
@@ -265,7 +292,7 @@ export function createToolSet(opts) {
         root: p.root, task: a.task, mode: a.mode, message: a.message,
         cfg: p.cfg, git, repo: p.repo, signal: exec?.signal,
       })
-      if (!r.ok) return { ...r, warnings: p.warnings }
+      if (!r.ok) return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
       return { ...r, warnings: [...p.warnings, ...(r.warnings ?? [])] }
     },
   })
@@ -294,10 +321,13 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 总览失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 总览失败：${value.error}`, value.warnings)
         const rows = value.rows ?? []
         if (rows.length === 0) {
-          return textBlock(`暂无进行中的任务。可用 wtm_begin 为任务创建隔离工作区。`)
+          return textBlockWithWarnings(
+            `暂无进行中的任务。可用 wtm_begin 为任务创建隔离工作区。`,
+            value.warnings,
+          )
         }
         const lines = [`进行中的任务（${rows.length}）：`, '']
         for (const r of rows) {
@@ -353,12 +383,18 @@ export function createToolSet(opts) {
         required: ['ok'],
       },
       render: (_args, value) => {
-        if (!value.ok) return textBlock(`❌ 批量清理失败：${value.error}`)
+        if (!value.ok) return textBlockWithWarnings(`❌ 批量清理失败：${value.error}`, value.warnings)
         const results = value.results ?? []
         const lines = [`批量清理完成（${results.length} 个任务）：`, '']
         for (const r of results) {
-          lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${r.note ? `（${r.note}）` : ''}`)
+          const details = []
+          if (r.note) details.push(r.note)
+          if (r.branchDeleted === true) details.push('分支已删除')
+          if (r.branchDeleted === false) details.push('分支未删除')
+          lines.push(`• ${r.task}：${r.ok ? '✅ 完成' : `❌ ${r.error}`}${details.length > 0 ? `（${details.join('；')}）` : ''}`)
+          for (const w of r.warnings ?? []) lines.push(`  ⚠️  ${w}`)
         }
+        for (const w of value.warnings ?? []) lines.push(`⚠️  ${w}`)
         return textBlock(lines.join('\n'))
       },
     },

@@ -1,5 +1,6 @@
 ﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { runTriggers } from '../src/triggers.js'
 
@@ -18,7 +19,7 @@ function makeFakeSpawn(captured, behaviors = {}) {
     queueMicrotask(() => {
       if (b.stderr) child.stderr.emit('data', Buffer.from(b.stderr))
       if (b.stdout) child.stdout.emit('data', Buffer.from(b.stdout))
-      child.emit('exit', b.code ?? 0, null)
+      child.emit('close', b.code ?? 0, null)
     })
     return child
   }
@@ -30,6 +31,28 @@ test('runTriggers：无命令时跳过且不产生警告', async () => {
   const { warnings } = await runTriggers([], { task: 'T' }, { spawn: makeFakeSpawn(captured) })
   assert.equal(captured.length, 0)
   assert.deepEqual(warnings, [])
+})
+
+test('runTriggers：非法命令配置类型产生警告', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const invalid = /** @type {any} */ ('invalid')
+  const { warnings } = await runTriggers(invalid, {}, { spawn: makeFakeSpawn(captured) })
+  assert.equal(captured.length, 0)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /触发器|类型/)
+})
+
+test('runTriggers：非法命令条目产生警告且不阻止合法命令', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const invalidEntries = /** @type {any} */ ([42, null, { command: 'not-a-string' }, 'valid-cmd'])
+  const { warnings } = await runTriggers(invalidEntries, {}, { spawn: makeFakeSpawn(captured) })
+
+  assert.equal(captured.length, 1)
+  assert.equal(captured[0].args.at(-1), 'valid-cmd')
+  assert.equal(warnings.length, 3)
+  assert.ok(warnings.every((warning) => /索引/.test(warning) && /字符串/.test(warning)))
 })
 
 test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () => {
@@ -50,6 +73,40 @@ test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () =>
     assert.equal(env.WTM_ROOT, 'R')
   }
   assert.deepEqual(warnings, [])
+})
+
+test('runTriggers：关闭真实子进程 stdin 后等待其正常退出', async () => {
+  /** @type {import('node:child_process').ChildProcess[]} */
+  const children = []
+  const script = 'require("node:fs").readFileSync(0)'
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer
+
+  try {
+    const result = /** @type {Promise<{warnings: string[]}>} */ (Promise.race([
+      runTriggers(['read-from-stdin'], {}, {
+        spawn: (_shell, _args, opts) => {
+          const child = spawn(process.execPath, ['--input-type=commonjs', '-e', script], opts)
+          children.push(child)
+          return child
+        },
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          for (const child of children) child.kill()
+          reject(new Error('runTriggers 未在 stdin EOF 后完成'))
+        }, 2000)
+      }),
+    ]))
+    const { warnings } = await result
+
+    assert.deepEqual(warnings, [])
+    assert.equal(children.length, 1)
+    assert.equal(children[0].exitCode, 0)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    for (const child of children) child.kill()
+  }
 })
 
 test('runTriggers：使用平台 shell（win32=cmd，其他=sh）', async () => {
@@ -77,6 +134,50 @@ test('runTriggers：命令失败产生警告，其余命令继续执行', async 
   assert.match(warnings[0], /boom/)
 })
 
+test('runTriggers：等待 close 事件后再读取失败输出', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  let closeSeen = false
+
+  const { warnings } = await runTriggers(['delayed-failure'], {}, {
+    spawn: () => {
+      queueMicrotask(() => {
+        child.emit('exit', 2, null)
+        queueMicrotask(() => {
+          child.stderr.emit('data', Buffer.from('late boom'))
+          closeSeen = true
+          child.emit('close', 2, null)
+        })
+      })
+      return child
+    },
+  })
+
+  assert.equal(closeSeen, true)
+  assert.match(warnings[0], /late boom/)
+})
+
+test('runTriggers：stderr 跨 chunk 的 UTF-8 字符保持完整', async () => {
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+
+  const { warnings } = await runTriggers(['split-utf8-failure'], {}, {
+    spawn: () => {
+      queueMicrotask(() => {
+        child.stderr.emit('data', Buffer.from([0xe4]))
+        child.stderr.emit('data', Buffer.from([0xb8, 0xad]))
+        child.emit('close', 1, null)
+      })
+      return child
+    },
+  })
+
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /退出码 1: 中/)
+})
+
 test('runTriggers：进程信号（非 0 code）与错误事件都归为警告', async () => {
   /** @type {Array<any>} */
   const captured = []
@@ -97,12 +198,10 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   child2.stderr = new EventEmitter()
   const w2 = await runTriggers(['sig-cmd2'], {}, {
     spawn: () => {
-      queueMicrotask(() => child2.emit('exit', null, 'SIGKILL'))
+      queueMicrotask(() => child2.emit('close', null, 'SIGKILL'))
       return child2
     },
   })
   assert.equal(w2.warnings.length, 1)
   assert.match(w2.warnings[0], /SIGKILL/)
 })
-
-

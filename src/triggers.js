@@ -7,6 +7,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * @typedef {object} TriggerContext
@@ -19,7 +20,7 @@ import { spawn } from 'node:child_process'
 
 /**
  * 顺序执行一组触发器命令。
- * @param {string[] | undefined} commands
+ * @param {unknown[] | undefined} commands
  * @param {TriggerContext} ctx
  * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string}} [opts]
  *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）
@@ -28,10 +29,18 @@ import { spawn } from 'node:child_process'
 export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd } = {}) {
   /** @type {string[]} */
   const warnings = []
-  if (!Array.isArray(commands)) return { warnings }
+  if (commands === undefined) return { warnings }
+  if (!Array.isArray(commands)) {
+    warnings.push('触发器配置类型无效，必须是命令数组，已忽略')
+    return { warnings }
+  }
   const isWin = process.platform === 'win32'
-  for (const cmd of commands) {
-    if (typeof cmd !== 'string' || cmd.trim() === '') continue
+  for (const [index, cmd] of commands.entries()) {
+    if (typeof cmd !== 'string') {
+      warnings.push(`触发器配置项无效（索引 ${index}），必须是字符串，已忽略`)
+      continue
+    }
+    if (cmd.trim() === '') continue
     const shell = isWin ? 'cmd' : 'sh'
     const args = isWin ? ['/d', '/s', '/c', cmd] : ['-c', cmd]
     const env = {
@@ -66,9 +75,19 @@ function runOne(spawnFn, shell, args, opts) {
       resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}` })
       return
     }
+    child.stdin?.end()
     let stdout = ''
     let stderr = ''
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    let outputFlushed = false
     let settled = false
+    const flushOutput = () => {
+      if (outputFlushed) return
+      outputFlushed = true
+      stdout += stdoutDecoder.end()
+      stderr += stderrDecoder.end()
+    }
     /**
      * @param {{ok: boolean, detail: string}} result
      */
@@ -78,12 +97,14 @@ function runOne(spawnFn, shell, args, opts) {
         resolve(result)
       }
     }
-    child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
-    child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
+    child.stdout?.on('data', (/** @type {any} */ d) => { stdout += stdoutDecoder.write(d) })
+    child.stderr?.on('data', (/** @type {any} */ d) => { stderr += stderrDecoder.write(d) })
     child.on('error', (/** @type {any} */ err) => {
+      flushOutput()
       done({ ok: false, detail: `${stderr.trim() || err.message}` })
     })
-    child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
+    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      flushOutput()
       if (code === 0) {
         done({ ok: true, detail: '' })
       } else {
