@@ -39,6 +39,7 @@ class FakeGit {
 }
 
 const OK = (stdout = '') => ({ ok: true, code: 0, stdout, stderr: '' })
+const WORKTREES = (text = '') => OK(text.replaceAll('\n', '\0'))
 const FAIL = (stderr = 'nope') => ({ ok: false, code: 128, stdout: '', stderr })
 
 function makeSignal() {
@@ -250,7 +251,7 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   writeFileSync(join(tmp, '.wtm.json'), '{broken')
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: {}, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')
@@ -328,7 +329,8 @@ test('readRepoConfig：配置文件读取失败时传播文件系统错误', () 
   try {
     mkdirSync(join(tmp, '.wtm.json'))
     assert.throws(() => readRepoConfig(tmp), (error) => {
-      assert.equal(error?.code, 'EISDIR')
+      assert.ok(error instanceof Error && 'code' in error)
+      assert.equal(error.code, 'EISDIR')
       return true
     })
   } finally {
@@ -389,14 +391,14 @@ test('wtm_finish：移除工作区失败时保留操作警告', async () => {
 
     const git = new FakeGit()
     git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
-    git.on(['worktree', 'list', '--porcelain'], OK(
+    git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES(
       `worktree ${root}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
       `worktree ${worktreePath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/wtm/t\n`,
     ))
     git.on(['status', '--porcelain'], OK())
     git.on(['branch', '--show-current'], OK('main\n'))
-    git.on(['merge-base', '--is-ancestor', 'wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
-    git.on(['merge', '--no-ff', 'wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
+    git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
+    git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
     git.on(['worktree', 'remove', worktreePath], FAIL('cannot remove worktree'))
 
     const tools = createToolSet({ config: { root, vault }, git })
@@ -419,7 +421,7 @@ test('wtm_status：无任务时返回空总览', async () => {
   mkdirSync(join(tmp, 'vault'))
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: { root: tmp, vault: join(tmp, 'vault') }, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')

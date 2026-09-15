@@ -111,7 +111,7 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
- * 解析 `git worktree list --porcelain` 输出。
+ * 解析 `git worktree list --porcelain -z` 输出（兼容原有换行分隔格式）。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}
  */
@@ -141,6 +141,11 @@ export function parseWorktreeList(text) {
         current.locked = true
       }
     }
+  }
+
+  if (text.includes('\0')) {
+    for (const field of text.split('\0')) consume(field)
+    return out
   }
 
   // Legacy porcelain has no record delimiter. Use the stable HEAD line and
