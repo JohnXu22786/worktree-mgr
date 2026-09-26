@@ -279,9 +279,11 @@ export async function withLock(vaultDir, fn, {
   const throwIfAborted = () => {
     if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
   }
+  /** @returns {Promise<void>} */
   const waitForRetry = () => {
     if (!signal) return new Promise((resolve) => setTimeout(resolve, 100))
     return new Promise((resolve, reject) => {
+      /** @type {ReturnType<typeof setTimeout> | undefined} */
       let timer
       const onAbort = () => {
         clearTimeout(timer)

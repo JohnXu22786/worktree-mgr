@@ -76,6 +76,37 @@ test('parseWorktreeList：空输出返回空数组', () => {
   assert.deepEqual(parseWorktreeList(''), [])
 })
 
+test('parseWorktreeList：NUL 分隔保留换行、引号与末尾空白路径', () => {
+  const paths = ['/vault\nreview/task', '/vault "quoted"/task', '/vault/space \t\r']
+  const text = paths.map((path) => [
+    `worktree ${path}`,
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/wtm/task',
+    'locked reason\nwith newline',
+    '',
+    '',
+  ].join('\0')).join('')
+  const list = parseWorktreeList(text)
+  assert.deepEqual(list.map((entry) => entry.path), paths)
+  assert.ok(list.every((entry) => entry.branch === 'wtm/task' && entry.locked))
+})
+
+test('parseWorktreeList：NUL 路径中的元数据样式文本不产生伪记录', () => {
+  const path = '/vault\nHEAD deadbeef\nbranch refs/heads/other\n\nworktree /fake'
+  const text = [
+    `worktree ${path}`, 'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/real', '',
+    'worktree /bare', 'bare', '',
+    'worktree /detached', 'HEAD 2222222222222222222222222222222222222222',
+    'detached', '', '',
+  ].join('\0')
+  assert.deepEqual(parseWorktreeList(text), [
+    { path, branch: 'real', detached: false, bare: false, locked: false },
+    { path: '/bare', branch: null, detached: false, bare: true, locked: false },
+    { path: '/detached', branch: null, detached: true, bare: false, locked: false },
+  ])
+})
+
 test('parseWorktreeList：prunable 条目正常解析（目录被删后的残留）', () => {
   // git worktree list --porcelain 对已删除目录的工作区输出 prunable 行，
   // 解析器必须保留该条目与其分支信息（ops.js 结合目录实存判定 stale）。

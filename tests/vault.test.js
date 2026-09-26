@@ -378,7 +378,7 @@ test('withLock：等待期间 signal 中止时立即抛出 AbortError', async ()
   await new Promise((r) => setTimeout(r, 50))
   ac.abort()
 
-  await assert.rejects(p2, (error) => error?.name === 'AbortError')
+  await assert.rejects(p2, (error) => error instanceof Error && error.name === 'AbortError')
   assert.equal(p2Ran, false)
   assert.ok(release, 'release 应已赋值')
   release()
