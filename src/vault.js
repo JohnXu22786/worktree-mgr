@@ -163,7 +163,12 @@ function canonicalPath(path, seen = new Set()) {
       if (stat.isSymbolicLink()) {
         if (seen.has(candidate)) return null
         seen.add(candidate)
-        const linkTarget = readlinkSync(candidate)
+        let linkTarget
+        try {
+          linkTarget = realpathSync(candidate)
+        } catch {
+          linkTarget = readlinkSync(candidate)
+        }
         const target = splitPath(linkTarget)
         existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
         pending.unshift(...target.parts, { done: candidate })

@@ -193,6 +193,7 @@ export function isDirty(text) {
  * 统一归一化后再比较，避免同一路径因分隔符差异匹配失败。
  * @param {string} a
  * @param {string} b
+ * @param {string} [platform]
  * @returns {boolean}
  */
 export function samePath(a, b, platform = process.platform) {

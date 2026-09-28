@@ -1,4 +1,33 @@
 import { realpathSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+
+/**
+ * Resolve the existing prefix of a path and append any missing tail.
+ * @param {string} path
+ * @returns {string}
+ */
+function resolveExistingPrefix(path) {
+  if (process.platform !== 'win32' && (/^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\'))) {
+    return path
+  }
+  let current = path
+  /** @type {string[]} */
+  const tail = []
+  while (true) {
+    try {
+      let resolved = realpathSync.native(current)
+      for (let i = tail.length - 1; i >= 0; i -= 1) resolved = join(resolved, tail[i])
+      return resolved
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return path
+      const name = basename(current)
+      if (name === '') return path
+      tail.push(name)
+      current = parent
+    }
+  }
+}
 
 /**
  * Normalize Windows path aliases for identity and containment comparisons.
@@ -9,13 +38,7 @@ import { realpathSync } from 'node:fs'
 export function normalizePathForComparison(path, platform = process.platform) {
   if (platform !== 'win32') return path
 
-  let resolved = path
-  try {
-    resolved = realpathSync.native(path)
-  } catch {
-    // A missing or inaccessible path can still be compared lexically.
-  }
-
+  const resolved = resolveExistingPrefix(path)
   let normalized = resolved.replace(/\\/g, '/')
   if (/^\/\/\?\/UNC\//i.test(normalized)) {
     normalized = normalized.replace(/^\/\/\?\/UNC\//i, '//')
