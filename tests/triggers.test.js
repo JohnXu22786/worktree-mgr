@@ -234,6 +234,7 @@ test('runTriggers：触发器期间 abort 时传播 signal 并停止后续命令
   assert.equal(/** @type {any} */ (captured[0].opts).signal, ac.signal)
   assert.deepEqual(result.warnings, [])
 })
+
 test('runTriggers：AbortError 后等待 close 再返回', async () => {
   const ac = new AbortController()
   const child = /** @type {any} */ (new EventEmitter())
@@ -273,7 +274,7 @@ test('runTriggers：abort 后不会让 shell 子进程继续执行', { skip: pro
   const marker = join(tmp, 'completed')
   const ac = new AbortController()
   try {
-    await runTriggers([`trap '' TERM; sleep 0.4 && touch ${marker}`], {}, {
+    await runTriggers([`trap '' TERM; (sleep 0.4; touch ${marker}) & wait`], {}, {
       signal: ac.signal,
       spawn: (cmd, args, opts) => {
         const child = spawn(cmd, args, opts)

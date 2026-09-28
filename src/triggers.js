@@ -95,6 +95,7 @@ function runOne(spawnFn, shell, args, opts) {
     let aborted = false
     let killRequested = false
     let settled = false
+    let termination = Promise.resolve()
     /** @type {() => void} */
     let onAbort = () => {}
     const flushOutput = () => {
@@ -113,7 +114,18 @@ function runOne(spawnFn, shell, args, opts) {
             windowsHide: true,
             stdio: 'ignore',
           })
-          killer.unref()
+          termination = new Promise((resolveTermination) => {
+            killer.once('error', () => {
+              try { child?.kill?.(signal) } catch { /* best effort */ }
+              resolveTermination()
+            })
+            killer.once('close', (code) => {
+              if (code !== 0) {
+                try { child?.kill?.(signal) } catch { /* best effort */ }
+              }
+              resolveTermination()
+            })
+          })
         } catch {
           // fallback to child.kill below
         }
@@ -164,7 +176,7 @@ function runOne(spawnFn, shell, args, opts) {
     child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
       flushOutput()
       if (aborted || opts.signal?.aborted) {
-        done({ ok: false, detail: '' })
+        void termination.then(() => done({ ok: false, detail: '' }))
         return
       }
       if (code === 0) {
