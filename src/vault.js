@@ -31,6 +31,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path'
+import { normalizePathForComparison } from './path-identity.js'
 
 export class VaultError extends Error {
   /**
@@ -185,17 +186,12 @@ function canonicalPath(path, seen = new Set()) {
  * @returns {boolean}
  */
 export function isWithin(parent, target) {
-  const norm = (/** @type {string} */ p) =>
-    (process.platform === 'win32' ? p.replace(/\\/g, '/') : p).replace(/\/+$/, '')
+  const norm = (/** @type {string} */ p) => normalizePathForComparison(p).replace(/\/+$/, '')
   const canonicalParent = canonicalPath(parent)
   const canonicalTarget = canonicalPath(target)
   if (canonicalParent === null || canonicalTarget === null) return false
   let p = norm(canonicalParent)
   let t = norm(canonicalTarget)
-  if (process.platform === 'win32') {
-    p = p.toLowerCase()
-    t = t.toLowerCase()
-  }
   if (p === t) return true
   return t.startsWith(p.endsWith('/') ? p : `${p}/`)
 }

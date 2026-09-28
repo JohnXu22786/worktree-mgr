@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join, sep } from 'node:path'
+import { join, sep, toNamespacedPath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   VaultError,
@@ -166,6 +166,19 @@ test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过
   assert.equal(existsSync(join(outside, 'vault')), false)
   assert.equal(isWithin(root, vault), true)
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：Windows 下识别扩展长度路径别名', { skip: process.platform !== 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const target = join(root, 'vault')
+  mkdirSync(root)
+  mkdirSync(target)
+  try {
+    assert.equal(isWithin(root, toNamespacedPath(target)), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('isWithin：相对符号链接目标从符号链接目录解析', { skip: process.platform === 'win32' }, () => {
