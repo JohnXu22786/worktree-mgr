@@ -119,7 +119,7 @@ export function computeVault(rootPath, vault) {
 }
 
 /**
- * 按路径段解析别名和符号链接，确保符号链接先于后续的 .. 处理。
+ * 按平台的文件系统语义解析路径段和符号链接。
  * 目标目录可能尚未创建，因此遇到不存在的路径段后继续拼接剩余路径。
  * @param {string} path
  * @returns {string | null}
@@ -134,9 +134,12 @@ function canonicalPath(path, seen = new Set()) {
     const root = parse(value).root
     return { root, parts: value.slice(root.length).split(separatorPattern).filter(Boolean) }
   }
-  const absolute = isAbsolute(path)
-    ? path
-    : `${resolve('.')}${process.platform === 'win32' ? '\\' : '/'}${path}`
+  // Win32 normalizes `..` before traversing junctions; POSIX follows symlinks first.
+  const absolute = process.platform === 'win32'
+    ? resolve(path)
+    : isAbsolute(path)
+      ? path
+      : `${resolve('.')}/${path}`
   const parsed = splitPath(absolute)
   let existing = parsed.root
   /** @type {(string | { done: string })[]} */

@@ -150,7 +150,7 @@ test('isWithin：指向仓库内缺失路径的悬空符号链接仍视为位于
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过包含检查', () => {
+test('isWithin：符号链接和 .. 的路径解析与平台文件系统语义一致', () => {
   const dir = makeTmp()
   const root = join(dir, 'repo')
   const outside = join(dir, 'outside')
@@ -162,9 +162,10 @@ test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过
 
   const vault = `${link}${sep}..${sep}vault`
   mkdirSync(vault)
-  assert.equal(existsSync(join(root, 'vault')), true)
-  assert.equal(existsSync(join(outside, 'vault')), false)
-  assert.equal(isWithin(root, vault), true)
+  const followsLinkBeforeParent = process.platform !== 'win32'
+  assert.equal(existsSync(join(root, 'vault')), followsLinkBeforeParent)
+  assert.equal(existsSync(join(outside, 'vault')), !followsLinkBeforeParent)
+  assert.equal(isWithin(root, vault), followsLinkBeforeParent)
   rmSync(dir, { recursive: true, force: true })
 })
 
