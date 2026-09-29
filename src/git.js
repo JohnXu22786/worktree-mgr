@@ -8,6 +8,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { StringDecoder } from 'node:string_decoder'
+import { samePathIdentity } from './path-identity.js'
 
 /**
  * 执行一条 git 命令。
@@ -192,12 +193,9 @@ export function isDirty(text) {
  * 统一归一化后再比较，避免同一路径因分隔符差异匹配失败。
  * @param {string} a
  * @param {string} b
+ * @param {string} [platform]
  * @returns {boolean}
  */
-export function samePath(a, b) {
-  const norm = (/** @type {string} */ p) => p.replace(/\\/g, '/')
-  if (process.platform === 'win32') {
-    return norm(a).toLowerCase() === norm(b).toLowerCase()
-  }
-  return a === b
+export function samePath(a, b, platform = process.platform) {
+  return samePathIdentity(a, b, platform)
 }

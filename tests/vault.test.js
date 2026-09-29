@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join, sep } from 'node:path'
+import { join, sep, toNamespacedPath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   VaultError,
@@ -150,7 +150,7 @@ test('isWithin：指向仓库内缺失路径的悬空符号链接仍视为位于
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过包含检查', () => {
+test('isWithin：符号链接和 .. 的路径解析与平台文件系统语义一致', () => {
   const dir = makeTmp()
   const root = join(dir, 'repo')
   const outside = join(dir, 'outside')
@@ -162,10 +162,24 @@ test('isWithin：先解析符号链接再处理 ..，避免仓库外路径绕过
 
   const vault = `${link}${sep}..${sep}vault`
   mkdirSync(vault)
-  assert.equal(existsSync(join(root, 'vault')), true)
-  assert.equal(existsSync(join(outside, 'vault')), false)
-  assert.equal(isWithin(root, vault), true)
+  const followsLinkBeforeParent = process.platform !== 'win32'
+  assert.equal(existsSync(join(root, 'vault')), followsLinkBeforeParent)
+  assert.equal(existsSync(join(outside, 'vault')), !followsLinkBeforeParent)
+  assert.equal(isWithin(root, vault), followsLinkBeforeParent)
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：Windows 下识别扩展长度路径别名', { skip: process.platform !== 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const target = join(root, 'vault')
+  mkdirSync(root)
+  mkdirSync(target)
+  try {
+    assert.equal(isWithin(root, toNamespacedPath(target)), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('isWithin：相对符号链接目标从符号链接目录解析', { skip: process.platform === 'win32' }, () => {

@@ -1,11 +1,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, toNamespacedPath } from 'node:path'
 import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runGit, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
   assert.equal(samePath('C:/a', 'C:/b'), false)
+})
+
+test('samePath：Windows 扩展长度路径前缀与普通路径等价', () => {
+  assert.equal(samePath('C:/Repo', '\\\\?\\c:\\repo', 'win32'), true)
 })
 
 test('samePath：POSIX 下保留路径分隔符语义', { skip: process.platform === 'win32' }, () => {
@@ -15,6 +22,30 @@ test('samePath：POSIX 下保留路径分隔符语义', { skip: process.platform
 
 test('samePath：Windows 下忽略大小写', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/T1', 'c:\\wtm\\vault\\t1'), true)
+})
+
+test('samePath：Windows 下规范化真实路径别名和扩展长度路径', { skip: process.platform !== 'win32' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wtm-same-path-'))
+  try {
+    const real = realpathSync.native(dir)
+    assert.equal(samePath(dir, real), true)
+    assert.equal(samePath(real, toNamespacedPath(real)), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('samePath：Windows 下解析未创建子路径的目录别名', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wtm-same-path-alias-'))
+  const target = join(dir, 'target')
+  const alias = join(dir, 'alias')
+  mkdirSync(target)
+  symlinkSync(target, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  try {
+    assert.equal(samePath(join(alias, 'vault'), join(target, 'vault'), 'win32'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('resolveToplevel：保留仓库路径末尾的空格', async () => {

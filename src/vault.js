@@ -31,6 +31,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path'
+import { normalizePathForComparison } from './path-identity.js'
 
 export class VaultError extends Error {
   /**
@@ -118,7 +119,7 @@ export function computeVault(rootPath, vault) {
 }
 
 /**
- * 按路径段解析别名和符号链接，确保符号链接先于后续的 .. 处理。
+ * 按平台的文件系统语义解析路径段和符号链接。
  * 目标目录可能尚未创建，因此遇到不存在的路径段后继续拼接剩余路径。
  * @param {string} path
  * @returns {string | null}
@@ -133,9 +134,12 @@ function canonicalPath(path, seen = new Set()) {
     const root = parse(value).root
     return { root, parts: value.slice(root.length).split(separatorPattern).filter(Boolean) }
   }
-  const absolute = isAbsolute(path)
-    ? path
-    : `${resolve('.')}${process.platform === 'win32' ? '\\' : '/'}${path}`
+  // Win32 normalizes `..` before traversing junctions; POSIX follows symlinks first.
+  const absolute = process.platform === 'win32'
+    ? resolve(path)
+    : isAbsolute(path)
+      ? path
+      : `${resolve('.')}/${path}`
   const parsed = splitPath(absolute)
   let existing = parsed.root
   /** @type {(string | { done: string })[]} */
@@ -162,11 +166,17 @@ function canonicalPath(path, seen = new Set()) {
       if (stat.isSymbolicLink()) {
         if (seen.has(candidate)) return null
         seen.add(candidate)
-        const linkTarget = readlinkSync(candidate)
-        const target = splitPath(linkTarget)
-        existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
-        pending.unshift(...target.parts, { done: candidate })
-        continue
+        try {
+          existing = realpathSync.native(candidate)
+          pending.unshift({ done: candidate })
+          continue
+        } catch {
+          const linkTarget = readlinkSync(candidate)
+          const target = splitPath(linkTarget)
+          existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
+          pending.unshift(...target.parts, { done: candidate })
+          continue
+        }
       }
       existing = realpathSync(candidate)
     } catch {
@@ -185,17 +195,12 @@ function canonicalPath(path, seen = new Set()) {
  * @returns {boolean}
  */
 export function isWithin(parent, target) {
-  const norm = (/** @type {string} */ p) =>
-    (process.platform === 'win32' ? p.replace(/\\/g, '/') : p).replace(/\/+$/, '')
+  const norm = (/** @type {string} */ p) => normalizePathForComparison(p).replace(/\/+$/, '')
   const canonicalParent = canonicalPath(parent)
   const canonicalTarget = canonicalPath(target)
   if (canonicalParent === null || canonicalTarget === null) return false
   let p = norm(canonicalParent)
   let t = norm(canonicalTarget)
-  if (process.platform === 'win32') {
-    p = p.toLowerCase()
-    t = t.toLowerCase()
-  }
   if (p === t) return true
   return t.startsWith(p.endsWith('/') ? p : `${p}/`)
 }

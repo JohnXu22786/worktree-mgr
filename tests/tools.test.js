@@ -279,13 +279,11 @@ test('wtm_status：root 解析同步失败时返回结构化错误而非抛异�
 })
 
 test('wtm_status：默认 root 的 cwd 不可用时返回结构化错误而非抛异常', async () => {
-  const originalCwd = process.cwd()
-  const unavailableCwd = mkdtempSync(join(tmpdir(), 'wtm-tools-cwd-'))
+  const originalCwd = process.cwd
   const hadWtmRoot = Object.hasOwn(process.env, 'WTM_ROOT')
   const originalWtmRoot = process.env.WTM_ROOT
   delete process.env.WTM_ROOT
-  process.chdir(unavailableCwd)
-  rmSync(unavailableCwd, { recursive: true, force: true })
+  process.cwd = () => { throw new Error('cwd is unavailable') }
 
   try {
     const git = new FakeGit()
@@ -300,7 +298,7 @@ test('wtm_status：默认 root 的 cwd 不可用时返回结构化错误而非�
     assert.match(value.error ?? '', /cwd|ENOENT|no such file/i)
     assert.equal(git.calls.length, 0)
   } finally {
-    process.chdir(originalCwd)
+    process.cwd = originalCwd
     if (hadWtmRoot) process.env.WTM_ROOT = originalWtmRoot
     else delete process.env.WTM_ROOT
   }

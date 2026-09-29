@@ -32,6 +32,7 @@ async function makeRepo() {
   gitOk(['config', 'user.name', 'wtm-test'], root)
   gitOk(['config', 'user.email', 'wtm@example.test'], root)
   gitOk(['config', 'commit.gpgsign', 'false'], root)
+  gitOk(['config', 'core.autocrlf', 'false'], root)
   writeFileSync(join(root, 'a.txt'), 'base\n')
   gitOk(['add', 'a.txt'], root)
   assert.equal(gitOk(['commit', '-m', 'init'], root).status, 0)
