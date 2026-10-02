@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join, sep, toNamespacedPath } from 'node:path'
+import { join, resolve, sep, toNamespacedPath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   VaultError,
@@ -127,6 +127,14 @@ test('resolveVault：显式 vault 生效（相对路径以仓库路径解析）'
   const rootPath = process.platform === 'win32' ? 'C:/repo' : '/repo'
   assert.equal(resolveVault({ rootPath: 'C:/repo', vault: 'D:/v' }), 'D:/v')
   assert.equal(resolveVault({ rootPath, vault: './v' }), join(rootPath, 'v'))
+  assert.equal(resolveVault({ rootPath, vault: '.' }), resolve(rootPath))
+  assert.equal(resolveVault({ rootPath, vault: './' }), resolve(rootPath))
+  assert.equal(resolveVault({ rootPath, vault: 'D:foo' }), resolve(rootPath, 'D:foo'))
+  const withParent = `link${sep}..${sep}vault`
+  assert.equal(
+    resolveVault({ rootPath, vault: withParent }),
+    process.platform === 'win32' ? join(rootPath, 'vault') : `${resolve(rootPath)}${sep}${withParent}`,
+  )
   assert.equal(resolveVault({ rootPath, vault: '' }), null) // 空串视为未设置
 })
 

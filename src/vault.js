@@ -105,7 +105,13 @@ export function resolveVault({ rootPath, vault }) {
   if (typeof vault !== 'string' || vault.trim() === '') return null
   const v = vault.trim()
   if (isAbsolute(v) || /^[A-Za-z]:[\\/]/.test(v)) return v
-  return resolve(rootPath, v)
+  if (/^[A-Za-z]:[^\\/]/.test(v)) return resolve(rootPath, v)
+  const root = resolve(rootPath)
+  const separator = process.platform === 'win32' ? '\\' : '/'
+  const separatorPattern = process.platform === 'win32' ? /[\\/]+/ : /\/+/
+  const relative = v.split(separatorPattern).filter((part) => part && part !== '.').join(separator)
+  if (relative === '') return root
+  return root.endsWith(separator) ? `${root}${relative}` : `${root}${separator}${relative}`
 }
 
 /**
@@ -155,6 +161,12 @@ function canonicalPath(path, seen = new Set()) {
     const component = item
     if (component === '.') continue
     if (component === '..') {
+      if (process.platform !== 'win32') {
+        if (!statSync(existing).isDirectory()) {
+          const error = Object.assign(new Error(`ENOTDIR: not a directory, path '${existing}'`), { code: 'ENOTDIR' })
+          throw error
+        }
+      }
       const parent = dirname(existing)
       if (parent !== existing) existing = parent
       continue
@@ -170,7 +182,8 @@ function canonicalPath(path, seen = new Set()) {
           existing = realpathSync.native(candidate)
           pending.unshift({ done: candidate })
           continue
-        } catch {
+        } catch (err) {
+          if (/** @type {{code?: string}} */ (err).code === 'ELOOP') return null
           const linkTarget = readlinkSync(candidate)
           const target = splitPath(linkTarget)
           existing = isAbsolute(linkTarget) ? target.root : dirname(candidate)
@@ -187,6 +200,15 @@ function canonicalPath(path, seen = new Set()) {
 }
 
 /**
+ * 按文件系统语义解析路径；符号链接循环时返回 null。
+ * @param {string} path
+ * @returns {string | null}
+ */
+export function canonicalizePath(path) {
+  return canonicalPath(path)
+}
+
+/**
  * 判断 target 是否位于 parent 之内（或等于 parent）。
  * 比较前解析路径别名和符号链接；仅在 Windows 下归一化路径分隔符并忽略大小写
  * （与 samePath 语义一致），防止路径变体绕过防护。POSIX 下反斜杠是有效的文件名字符。
@@ -196,8 +218,14 @@ function canonicalPath(path, seen = new Set()) {
  */
 export function isWithin(parent, target) {
   const norm = (/** @type {string} */ p) => normalizePathForComparison(p).replace(/\/+$/, '')
-  const canonicalParent = canonicalPath(parent)
-  const canonicalTarget = canonicalPath(target)
+  let canonicalParent
+  let canonicalTarget
+  try {
+    canonicalParent = canonicalPath(parent)
+    canonicalTarget = canonicalPath(target)
+  } catch {
+    return false
+  }
   if (canonicalParent === null || canonicalTarget === null) return false
   let p = norm(canonicalParent)
   let t = norm(canonicalTarget)
