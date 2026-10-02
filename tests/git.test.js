@@ -103,6 +103,151 @@ test('parseWorktreeList：detached 与 bare 工作区', () => {
   assert.equal(list[1].bare, true)
 })
 
+test('parseWorktreeList：无 HEAD 的 bare 记录后仍能解析普通工作区', () => {
+  const text = [
+    'worktree /bare.git',
+    'bare',
+    '',
+    'worktree /linked',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/linked',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/bare.git',
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }, {
+    path: '/linked',
+    branch: 'linked',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：EOF bare 记录的 CRLF 路径分隔符不进入路径', () => {
+  assert.deepEqual(parseWorktreeList('worktree /bare.git\r\nbare'), [{
+    path: '/bare.git',
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：LF 输出中的 EOF bare 路径末尾回车符仍是路径数据', () => {
+  const text = [
+    'worktree /normal',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/normal',
+    '',
+    'worktree /bare\r',
+    'bare',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/normal',
+    branch: 'normal',
+    detached: false,
+    bare: false,
+    locked: false,
+  }, {
+    path: '/bare\r',
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：CRLF bare 记录不保留分隔符回车符', () => {
+  const text = [
+    'worktree /bare.git\r',
+    'bare\r',
+    '\r',
+    'worktree /linked\r',
+    'HEAD 2222222222222222222222222222222222222222\r',
+    'branch refs/heads/linked\r',
+    '\r',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/bare.git',
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }, {
+    path: '/linked',
+    branch: 'linked',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：bare 路径中的 HEAD 字段不提前截断', () => {
+  const text = [
+    'worktree /bare',
+    'HEAD 4444444444444444444444444444444444444444',
+    'bare',
+    '',
+    'worktree /linked',
+    'HEAD 5555555555555555555555555555555555555555',
+    'branch refs/heads/linked',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/bare\nHEAD 4444444444444444444444444444444444444444',
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }, {
+    path: '/linked',
+    branch: 'linked',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：普通路径中的 bare 字段不提前截断', () => {
+  const text = [
+    'worktree /normal',
+    'bare',
+    'HEAD 6666666666666666666666666666666666666666',
+    'branch refs/heads/normal',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/normal\nbare',
+    branch: 'normal',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：普通路径中的 bare 后 locked 字段不提前截断', () => {
+  const text = [
+    'worktree /normal',
+    'bare',
+    'locked path metadata',
+    'HEAD 7777777777777777777777777777777777777777',
+    'branch refs/heads/normal',
+    '',
+  ].join('\n')
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/normal\nbare\nlocked path metadata',
+    branch: 'normal',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
 test('parseWorktreeList：空输出返回空数组', () => {
   assert.deepEqual(parseWorktreeList(''), [])
 })
