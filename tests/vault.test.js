@@ -133,7 +133,7 @@ test('resolveVault：显式 vault 生效（相对路径以仓库路径解析）'
   const withParent = `link${sep}..${sep}vault`
   assert.equal(
     resolveVault({ rootPath, vault: withParent }),
-    process.platform === 'win32' ? join(rootPath, 'vault') : `${resolve(rootPath)}${sep}${withParent}`,
+    `${resolve(rootPath)}${sep}${withParent}`,
   )
   assert.equal(resolveVault({ rootPath, vault: '' }), null) // 空串视为未设置
 })
