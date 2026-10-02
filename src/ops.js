@@ -604,7 +604,11 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], { cwd: root, signal: opts.signal })
+  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], {
+    cwd: root,
+    signal: opts.signal,
+    env: { LC_ALL: 'C', LANG: 'C' },
+  })
   if (!merge.ok) {
     return {
       ok: false,
@@ -612,6 +616,9 @@ async function mergeIntoBase(opts, rec, task) {
       error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
       warnings: [],
     }
+  }
+  if (/^Already up to date\.?$/m.test(merge.stdout)) {
+    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
   return { ok: true, merged: true, warnings: [] }
 }
