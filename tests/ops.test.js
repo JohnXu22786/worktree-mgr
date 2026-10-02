@@ -559,6 +559,31 @@ test('mergeTask：干净任务直接合并并更新记录', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('mergeTask：祖先检查后的 Already up to date 不触发 on_merge', async () => {
+  const tmp = makeTmp()
+  const { cfg, git } = mergeFixture(tmp)
+  git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Already up to date.\n'))
+  let triggerCalls = 0
+
+  const r = await mergeTask({
+    root: 'C:/repo',
+    task: 'T',
+    mode: 'commit',
+    cfg,
+    git,
+    repo: { triggers: { on_merge: ['deploy.sh'] } },
+    triggerSpawn: () => {
+      triggerCalls += 1
+      throw new Error('on_merge should not run when git did not create a merge')
+    },
+  })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.merged, false)
+  assert.equal(triggerCalls, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
 test('mergeTask：merge-base 致命失败时拒绝继续合并', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp)
