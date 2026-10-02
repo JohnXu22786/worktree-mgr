@@ -30,6 +30,88 @@ function runCli(args, cwd) {
   })
 }
 
+test('CLI：单任务命令拒绝多余的位置参数', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-positionals-'))
+  try {
+    /** @type {Array<[string, string[]]>} */
+    const cases = [
+      ['begin', ['Task A', 'typo']],
+      ['merge', ['Task A', 'typo']],
+      ['finish', ['Task A', 'typo']],
+      ['status', ['unexpected']],
+      ['finish', ['Task A', '--json', 'typo']],
+      ['status', ['--json', 'unexpected']],
+    ]
+    for (const [command, args] of cases) {
+      const result = runCli([command, ...args], cwd)
+
+      assert.equal(result.status, 2, `${command} should reject extra positional arguments`)
+      assert.match(result.stderr, /位置参数/)
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：未知选项拒绝执行，不把后续参数当作任务', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-unknown-option-'))
+  try {
+    execFileSync('git', ['init', '--quiet', cwd], { stdio: 'ignore' })
+    writeFileSync(join(cwd, '.wtm.json'), JSON.stringify({ vault: join(cwd, 'vault') }))
+
+    const result = runCli(['purge', '--typo', 'ExistingTask', '--mode', 'abandon', '--json'], cwd)
+
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /未知选项.*--typo/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：各命令拒绝不支持的选项', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-command-options-'))
+  try {
+    /** @type {Array<[string, string[], string]>} */
+    const cases = [
+      ['begin', ['--all', 'Task', '--json'], '--all'],
+      ['merge', ['--base', 'Task', '--json'], '--base'],
+      ['finish', ['--branch', 'Task', '--json'], '--branch'],
+      ['status', ['--all', '--json'], '--all'],
+      ['purge', ['--branch', 'Task', '--json'], '--branch'],
+    ]
+    for (const [command, args, option] of cases) {
+      const result = runCli([command, ...args], cwd)
+
+      assert.equal(result.status, 2, `${command} should reject ${option}`)
+      assert.match(result.stderr, /命令不支持选项.*--/)
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('CLI：布尔选项不吞掉后续位置参数', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'wtm-cli-purge-positionals-'))
+  try {
+    execFileSync('git', ['init', '--quiet', cwd], { stdio: 'ignore' })
+    writeFileSync(join(cwd, '.wtm.json'), JSON.stringify({ vault: join(cwd, 'vault') }))
+
+    const result = runCli(['purge', 'Task A', '--json', 'Task B'], cwd)
+
+    assert.equal(result.status, 1)
+    const payload = /** @type {{results: Array<{task: string}>}} */ (JSON.parse(result.stdout))
+    assert.deepEqual(payload.results.map((item) => item.task), ['Task A', 'Task B'])
+
+    const allResult = runCli(['purge', '--all', 'Task B', '--json'], cwd)
+
+    assert.equal(allResult.status, 1)
+    const allPayload = JSON.parse(allResult.stdout)
+    assert.match(allPayload.error, /all 与 tasks 不能同时指定/)
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
 test('CLI：finish 的 --mode 缺少值时拒绝执行，不采用默认 commit', () => {
   const result = runCli(['finish', 'task', '--mode'], process.cwd())
 
