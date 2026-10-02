@@ -2,6 +2,9 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runTriggers } from '../src/triggers.js'
 
 // 可注入的假 spawn：捕获调用并模拟子进程输出与退出
@@ -187,7 +190,10 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   captured.push('x')
   const w1 = await runTriggers(['sig-cmd'], {}, {
     spawn: () => {
-      queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')))
+      queueMicrotask(() => {
+        child.emit('error', new Error('spawn ENOENT'))
+        child.emit('close', null, null)
+      })
       return child
     },
   })
@@ -204,4 +210,81 @@ test('runTriggers：进程信号（非 0 code）与错误事件都归为警告',
   })
   assert.equal(w2.warnings.length, 1)
   assert.match(w2.warnings[0], /SIGKILL/)
+})
+test('runTriggers：触发器期间 abort 时传播 signal 并停止后续命令', async () => {
+  /** @type {Array<{cmd: string, args: string[], opts: object}>} */
+  const captured = []
+  const ac = new AbortController()
+  const result = await runTriggers(['abort-cmd', 'later-cmd'], {}, {
+    signal: ac.signal,
+    spawn: (cmd, args, opts) => {
+      captured.push({ cmd, args, opts })
+      const child = /** @type {any} */ (new EventEmitter())
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      queueMicrotask(() => {
+        ac.abort()
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
+      return child
+    },
+  })
+  assert.equal(captured.length, 1)
+  assert.equal(/** @type {any} */ (captured[0].opts).signal, ac.signal)
+  assert.deepEqual(result.warnings, [])
+})
+
+test('runTriggers：AbortError 后等待 close 再返回', async () => {
+  const ac = new AbortController()
+  const child = /** @type {any} */ (new EventEmitter())
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  let closed = false
+  const pending = runTriggers(['abort-cmd'], {}, {
+    signal: ac.signal,
+    spawn: () => {
+      queueMicrotask(() => {
+        ac.abort()
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        child.emit('error', err)
+        setTimeout(() => {
+          closed = true
+          child.emit('close', null, 'SIGTERM')
+        }, 30)
+      })
+      return child
+    },
+  })
+  let settled = false
+  const result = pending.then((value) => {
+    settled = true
+    return value
+  })
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(settled, false)
+  const { warnings } = await result
+  assert.equal(closed, true)
+  assert.deepEqual(warnings, [])
+})
+
+test('runTriggers：abort 后不会让 shell 子进程继续执行', { skip: process.platform === 'win32' }, async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-trigger-abort-'))
+  const marker = join(tmp, 'completed')
+  const ac = new AbortController()
+  try {
+    await runTriggers([`trap '' TERM; (sleep 0.4; touch ${marker}) & wait`], {}, {
+      signal: ac.signal,
+      spawn: (cmd, args, opts) => {
+        const child = spawn(cmd, args, opts)
+        setTimeout(() => ac.abort(), 20)
+        return child
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.equal(existsSync(marker), false)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
