@@ -388,7 +388,7 @@ export async function finishTask(opts) {
       const ledger = loadLedger(vault)
       const rec = findRecord(ledger, task)
       if (!rec) return { ok: false, error: `任务不存在：${task}（可用 wtm_status 查看）` }
-      return await finishCore(opts, { vault, ledger, rec, mode })
+      return await finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDeleteFailure: true })
     }, { signal: opts.signal })
   } catch (err) {
     if (isAborted(opts.signal)) return abortResult()
@@ -554,7 +554,7 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
- * @returns {Promise<{ok: boolean, merged: boolean, error?: string, warnings: string[]}>}
+ * @returns {Promise<{ok: boolean, merged: boolean, branchHead?: string, error?: string, warnings: string[]}>}
  */
 async function mergeIntoBase(opts, rec, task) {
   const { root, git, cfg } = opts
@@ -563,6 +563,17 @@ async function mergeIntoBase(opts, rec, task) {
   if (!initialBaseCheck.ok) {
     return { ok: false, merged: false, error: initialBaseCheck.error, warnings: [] }
   }
+
+  const initialMergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+  if (!initialMergeHead.ok || !initialMergeHead.stdout.trim()) {
+    return {
+      ok: false,
+      merged: false,
+      error: `读取任务分支尖端失败：${initialMergeHead.stderr.trim() || 'git rev-parse 失败'}`,
+      warnings: [],
+    }
+  }
+  const initialBranchHead = initialMergeHead.stdout.trim()
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
@@ -581,7 +592,24 @@ async function mergeIntoBase(opts, rec, task) {
     return { ok: false, merged: false, error: finalBaseCheck.error, warnings: [] }
   }
   if (ancestor.ok) {
-    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+    const currentMergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+    if (!currentMergeHead.ok || !currentMergeHead.stdout.trim()) {
+      return {
+        ok: false,
+        merged: false,
+        error: `读取任务分支尖端失败：${currentMergeHead.stderr.trim() || 'git rev-parse 失败'}`,
+        warnings: [],
+      }
+    }
+    if (currentMergeHead.stdout.trim() !== initialBranchHead) {
+      return {
+        ok: false,
+        merged: false,
+        error: `检查任务分支是否已合并时尖端继续前进（检查前 ${initialBranchHead}，当前 ${currentMergeHead.stdout.trim()}），请重试`,
+        warnings: [],
+      }
+    }
+    return { ok: true, merged: false, branchHead: initialBranchHead, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
   }
 
   const mergeOptions = await readMergeOptions(root, git, opts.signal, rec.base)
@@ -659,9 +687,9 @@ async function mergeIntoBase(opts, rec, task) {
       }
     }
     if (/^Already up to date\.?$/m.test(merge.stdout)) {
-      return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+      return { ok: true, merged: false, branchHead: expectedMergeHead, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
     }
-    return { ok: true, merged: true, warnings: [] }
+    return { ok: true, merged: true, branchHead: expectedMergeHead, warnings: [] }
   } finally {
     rmSync(guard.hooksPath, { recursive: true, force: true })
   }
@@ -788,14 +816,28 @@ function checkWorktreeBranch(wt, rec) {
  * 收尾核心：同步（commit 模式）→ 移除工作区 → 删分支 → 清记录。
  * 前提：调用方已持有 vault 锁。
  * @param {OpOpts} opts
- * @param {{vault: string, ledger: Ledger, rec: LedgerRecord, mode: string}} box
+ * @param {{vault: string, ledger: Ledger, rec: LedgerRecord, mode: string, restoreOnBranchDeleteFailure?: boolean}} box
  * @returns {Promise<OpResult>}
  */
-async function finishCore(opts, { vault, ledger, rec, mode }) {
+async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDeleteFailure = false }) {
   const { root, git, repo } = opts
   const task = rec.task
   /** @type {string[]} */
   const warnings = []
+  /** @param {string} cause */
+  const preserveAfterBranchDrift = async (cause) => {
+    upsertRecord(ledger, rec)
+    saveLedger(vault, ledger)
+    const restore = await git.run(['worktree', 'add', rec.path, rec.branch], { cwd: root, signal: opts.signal })
+    return {
+      ok: false,
+      error: `${cause}，分支删除失败（${rec.branch}）；` +
+        (restore.ok
+          ? '工作区已恢复，账本记录已保留，请同步新提交后重试'
+          : `工作区恢复失败：${restore.stderr.trim() || 'git worktree add 失败'}；账本记录已保留，请手动恢复工作区`),
+      warnings,
+    }
+  }
 
   // 工作区已消失（stale：注册表缺失或目录被外部删除）：直接清记录
   const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
@@ -835,6 +877,8 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
 
   let committed = false
   let merged = false
+  /** @type {string | undefined} */
+  let mergedBranchHead
   if (mode === 'commit') {
     // 快照提交 + 合并（abandon 模式两者都跳过）
     const snap = await snapshotCommit(opts, rec, task)
@@ -843,7 +887,25 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     const m = await mergeIntoBase(opts, rec, task)
     if (!m.ok) return { ok: false, error: m.error }
     merged = m.merged
+    mergedBranchHead = m.branchHead
     warnings.push(...m.warnings)
+    if (restoreOnBranchDeleteFailure) {
+      const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+      if (!currentBranchHead.ok || !currentBranchHead.stdout.trim()) {
+        return {
+          ok: false,
+          error: `合并后读取任务分支尖端失败：${currentBranchHead.stderr.trim() || 'git rev-parse 失败'}；已保留工作区与账本记录`,
+          warnings,
+        }
+      }
+      if (currentBranchHead.stdout.trim() !== mergedBranchHead) {
+        return {
+          ok: false,
+          error: `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${currentBranchHead.stdout.trim()}）；已保留工作区与账本记录，请同步新提交后重试`,
+          warnings,
+        }
+      }
+    }
     if (m.merged) {
       const mergeTriggerWarnings = await runTriggers(
         repo?.triggers?.on_merge,
@@ -867,11 +929,43 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
     }
   }
 
-  // 删除任务分支：commit 用安全删除 -d；abandon 用 -D
-  const delArgs = mode === 'abandon' ? ['branch', '-D', rec.branch] : ['branch', '-d', rec.branch]
-  const del = await git.run(delArgs, { cwd: root, signal: opts.signal })
+  // Finish commit 条件删除合并时的 OID，避免误删前进后的尖端。
+  // update-ref 不检查其他工作区是否检出该分支，因此先刷新列表核对。
+  // Purge 保留原有 -d 行为；abandon 仍使用 -D。
+  const delArgs = mode === 'abandon'
+    ? ['branch', '-D', rec.branch]
+    : mode === 'commit' && restoreOnBranchDeleteFailure && mergedBranchHead
+      ? ['update-ref', '-d', `refs/heads/${rec.branch}`, mergedBranchHead]
+      : ['branch', '-d', rec.branch]
+  let del
+  if (mode === 'commit' && restoreOnBranchDeleteFailure && mergedBranchHead) {
+    const remainingWorktrees = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+    const otherWorktree = remainingWorktrees.ok
+      ? parseWorktreeList(remainingWorktrees.stdout).find((other) => !samePath(other.path, rec.path) && other.branch === rec.branch)
+      : undefined
+    if (!remainingWorktrees.ok) {
+      del = { ok: false, code: remainingWorktrees.code, stdout: '', stderr: `读取 worktree 列表失败：${remainingWorktrees.stderr.trim()}` }
+    } else if (otherWorktree) {
+      del = { ok: false, code: 1, stdout: '', stderr: `分支仍在其他工作区检出：${otherWorktree.path}` }
+    } else {
+      del = await git.run(delArgs, { cwd: root, signal: opts.signal })
+    }
+  } else {
+    del = await git.run(delArgs, { cwd: root, signal: opts.signal })
+  }
   let branchDeleted = del.ok
-  if (!del.ok) warnings.push(`分支删除失败（${rec.branch}）：${del.stderr.trim()}`)
+  if (!del.ok) {
+    if (mode === 'commit' && restoreOnBranchDeleteFailure) {
+      const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+      if (!currentBranchHead.ok || !currentBranchHead.stdout.trim() || currentBranchHead.stdout.trim() !== mergedBranchHead) {
+        const cause = currentBranchHead.ok && currentBranchHead.stdout.trim()
+          ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${currentBranchHead.stdout.trim()}）`
+          : `合并后读取任务分支尖端失败：${currentBranchHead.stderr.trim() || 'git rev-parse 失败'}`
+        return preserveAfterBranchDrift(cause)
+      }
+    }
+    warnings.push(`分支删除失败（${rec.branch}）：${del.stderr.trim()}`)
+  }
 
   // on_finish 触发器（工作目录 = 主仓库；注意此时任务工作区已移除）
   const triggerWarnings = await runTriggers(
@@ -881,8 +975,27 @@ async function finishCore(opts, { vault, ledger, rec, mode }) {
   )
   warnings.push(...triggerWarnings.warnings)
 
+  if (mode === 'commit' && restoreOnBranchDeleteFailure && !branchDeleted && mergedBranchHead) {
+    const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+    if (!currentBranchHead.ok || !currentBranchHead.stdout.trim() || currentBranchHead.stdout.trim() !== mergedBranchHead) {
+      const cause = currentBranchHead.ok && currentBranchHead.stdout.trim()
+        ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${currentBranchHead.stdout.trim()}）`
+        : `合并后读取任务分支尖端失败：${currentBranchHead.stderr.trim() || 'git rev-parse 失败'}`
+      return preserveAfterBranchDrift(cause)
+    }
+  }
+
   removeRecord(ledger, task)
   saveLedger(vault, ledger)
+  if (mode === 'commit' && restoreOnBranchDeleteFailure && !branchDeleted && mergedBranchHead) {
+    const finalBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+    if (!finalBranchHead.ok || !finalBranchHead.stdout.trim() || finalBranchHead.stdout.trim() !== mergedBranchHead) {
+      const cause = finalBranchHead.ok && finalBranchHead.stdout.trim()
+        ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${finalBranchHead.stdout.trim()}）`
+        : `合并后读取任务分支尖端失败：${finalBranchHead.stderr.trim() || 'git rev-parse 失败'}`
+      return preserveAfterBranchDrift(cause)
+    }
+  }
   return {
     ok: true,
     task,
