@@ -138,6 +138,31 @@ async function waitForAnyFile(paths, timeoutMs = 5000) {
     await new Promise((r) => setTimeout(r, 5))
   }
 }
+
+/**
+ * @returns {{wasInjected: () => boolean, partialToken: () => string | null}}
+ */
+function injectPartialLeaseTokenWriteFailure() {
+  const originalWriteFileSync = fs.writeFileSync
+  let injected = false
+  /** @type {string | null} */
+  let partialToken = null
+  /** @type {typeof fs.writeFileSync} */
+  const writeFileSyncWithPartialFailure = (...args) => {
+    const [target, data] = args
+    if (!injected && typeof target === 'number' && typeof data === 'string' && /^\d+-[a-f0-9]{16}$/.test(data)) {
+      partialToken = data.slice(0, 4)
+      originalWriteFileSync(target, partialToken)
+      injected = true
+      throw Object.assign(new Error('simulated partial token write failure'), { code: 'EIO' })
+    }
+    return originalWriteFileSync(...args)
+  }
+  mock.method(fs, 'writeFileSync', writeFileSyncWithPartialFailure)
+  syncBuiltinESMExports()
+  return { wasInjected: () => injected, partialToken: () => partialToken }
+}
+
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
   const a = repoSlug('C:/work/proj')
   const b = repoSlug('D:/other/proj')
@@ -659,6 +684,88 @@ test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
   await withLock(dir, async () => { ran = true }, { timeoutMs: 1000, staleMs: 60_000 })
   assert.equal(ran, true)
   assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：guard token 部分写入失败后不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(existsSync(reclaimPath), false)
+
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 })
+  assert.equal(acquired, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：reclaim marker token 部分写入失败后不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const markerPath = `${reclaimPath}.reclaiming`
+  writeFileSync(reclaimPath, 'stale-guard-token')
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(reclaimPath, past, past)
+
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 1000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(existsSync(markerPath), false)
+
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 500, staleMs: 1000, heartbeatMs: 10 })
+  assert.equal(acquired, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：部分 token 清理时保留被替换的后继 guard', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const originalWriteFileSync = fs.writeFileSync
+  const originalRenameSync = fs.renameSync
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  let successorReplaced = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorReplaced && source === reclaimPath && target.startsWith(`${reclaimPath}.released-`)) {
+      successorReplaced = true
+      unlinkSync(source)
+      const successorBytes = writeFailure.partialToken()
+      assert.ok(successorBytes)
+      originalWriteFileSync(source, successorBytes)
+    }
+    return originalRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(successorReplaced, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), writeFailure.partialToken())
   rmSync(dir, { recursive: true, force: true })
 })
 
