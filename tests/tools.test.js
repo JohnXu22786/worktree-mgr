@@ -31,8 +31,10 @@ class FakeGit {
    */
   async run(args, opts = {}) {
     this.calls.push({ args, cwd: opts.cwd })
-    const key = args.join(' ')
-    const a = this.answers.get(key)
+    const mergeIndex = args.indexOf('merge')
+    const normalized = mergeIndex === -1 ? args : args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+    const key = normalized.join(' ')
+    const a = this.answers.get(args.join(' ')) ?? this.answers.get(key)
     if (a === undefined) throw new Error(`FakeGit: 未预设答案: ${key}`)
     return typeof a === 'function' ? a() : a
   }
@@ -396,6 +398,11 @@ test('wtm_finish：移除工作区失败时保留操作警告', async () => {
     git.on(['status', '--porcelain'], OK())
     git.on(['branch', '--show-current'], OK('main\n'))
     git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
+    git.on(['config', '--get', 'branch.main.mergeOptions'], { ok: false, code: 1, stdout: '', stderr: '' })
+    git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], OK(`${'2'.repeat(40)}\n`))
+    git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
+    git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
+    git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
     git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
     git.on(['worktree', 'remove', worktreePath], FAIL('cannot remove worktree'))
 

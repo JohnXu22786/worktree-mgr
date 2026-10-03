@@ -6,7 +6,7 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
   slugifyTask,
@@ -28,6 +28,7 @@ import {
   removeRecord,
 } from './vault.js'
 import { parseWorktreeList, parseAheadBehind, isDirty, samePath } from './git.js'
+import { calculateMergeTree, createMergeGuard, readMergeOptions } from './merge-guard.js'
 import { runTriggers } from './triggers.js'
 
 /**
@@ -549,7 +550,7 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
 }
 
 /**
- * 合并回基分支：校验基工作区干净 → merge --no-ff。
+ * 合并回基分支：复验基工作区 → 安装 merge-time guard → merge --no-ff。
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
@@ -558,43 +559,14 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
 async function mergeIntoBase(opts, rec, task) {
   const { root, git, cfg } = opts
 
-  // 合并目标必须与账本记录的基分支一致：主工作区可能已被切到其他分支
-  // （或处于 detached HEAD），此时继续会把改动合入错误目标
-  const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
-  if (!cur.ok) {
-    return { ok: false, merged: false, error: `读取主工作区分支失败：${cur.stderr.trim()}`, warnings: [] }
-  }
-  const currentBase = cur.stdout.trim()
-  if (currentBase !== rec.base) {
-    const hint = currentBase ? `当前在 ${currentBase}` : '当前处于 detached HEAD'
-    return {
-      ok: false,
-      merged: false,
-      error: `主工作区当前分支与任务基分支不一致（账本：${rec.base}，${hint}）。` +
-        `请先在主工作区切回 ${rec.base} 再重试（git checkout ${rec.base}）`,
-      warnings: [],
-    }
-  }
-
-  const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
-  if (!baseStatus.ok) {
-    return { ok: false, merged: false, error: `读取基分支状态失败：${baseStatus.stderr.trim()}`, warnings: [] }
-  }
-  if (isDirty(baseStatus.stdout)) {
-    return {
-      ok: false,
-      merged: false,
-      error: '基分支工作区存在未提交改动，请先提交或暂存（防止合并混入未完成的工作）',
-      warnings: [],
-    }
+  const initialBaseCheck = await checkBaseState(opts, rec)
+  if (!initialBaseCheck.ok) {
+    return { ok: false, merged: false, error: initialBaseCheck.error, warnings: [] }
   }
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
-  if (ancestor.ok) {
-    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
-  }
-  if (ancestor.code !== 1) {
+  if (!ancestor.ok && ancestor.code !== 1) {
     return {
       ok: false,
       merged: false,
@@ -603,24 +575,126 @@ async function mergeIntoBase(opts, rec, task) {
     }
   }
 
-  const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
-  const merge = await git.run(['merge', '--no-ff', `refs/heads/${rec.branch}`, '-m', message], {
-    cwd: root,
-    signal: opts.signal,
-    env: { LC_ALL: 'C', LANG: 'C' },
-  })
-  if (!merge.ok) {
+  // Recheck after the asynchronous ancestor query; the user may have switched branches or edited the base meanwhile.
+  const finalBaseCheck = await checkBaseState(opts, rec)
+  if (!finalBaseCheck.ok) {
+    return { ok: false, merged: false, error: finalBaseCheck.error, warnings: [] }
+  }
+  if (ancestor.ok) {
+    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+  }
+
+  const mergeOptions = await readMergeOptions(root, git, opts.signal, rec.base)
+  if (!mergeOptions.ok) {
+    return { ok: false, merged: false, error: mergeOptions.error, warnings: [] }
+  }
+  const mergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+  if (!mergeHead.ok) {
     return {
       ok: false,
       merged: false,
-      error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
+      error: `读取任务分支尖端失败：${mergeHead.stderr.trim() || 'git rev-parse 失败'}`,
       warnings: [],
     }
   }
-  if (/^Already up to date\.?$/m.test(merge.stdout)) {
-    return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+  const expectedMergeHead = mergeHead.stdout.trim()
+  if (!expectedMergeHead) {
+    return { ok: false, merged: false, error: '任务分支没有有效的 commit 尖端', warnings: [] }
   }
-  return { ok: true, merged: true, warnings: [] }
+
+  const baseHead = await git.run(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, signal: opts.signal })
+  if (!baseHead.ok || !baseHead.stdout.trim()) {
+    return {
+      ok: false,
+      merged: false,
+      error: `读取基分支尖端失败：${baseHead.stderr.trim() || 'git rev-parse 失败'}`,
+      warnings: [],
+    }
+  }
+  const expectedBaseHead = baseHead.stdout.trim()
+  const expectedTree = await calculateMergeTree(root, git, opts.signal, expectedBaseHead, expectedMergeHead, mergeOptions)
+  if (!expectedTree.ok) {
+    return { ok: false, merged: false, error: expectedTree.error, warnings: [] }
+  }
+
+  const message = opts.message ?? renderTemplate(cfg.mergeMessage, { task, branch: rec.branch, base: rec.base })
+  let guard
+  try {
+    guard = await createMergeGuard(root, git, opts.signal, rec.base, {
+      expectedTree: expectedTree.tree,
+      expectedBaseHead,
+      expectedMergeHead,
+    })
+  } catch (err) {
+    return {
+      ok: false,
+      merged: false,
+      error: `准备合并保护钩子失败：${/** @type {Error} */ (err).message}`,
+      warnings: [],
+    }
+  }
+
+  try {
+    const mergeArgs = ['-c', `core.hooksPath=${guard.hooksPath}`]
+    if (mergeOptions.value !== null) mergeArgs.push('-c', `branch.${rec.base}.mergeOptions=${mergeOptions.value}`)
+    mergeArgs.push('merge', '--no-ff', '--commit', `refs/heads/${rec.branch}`, '-m', message)
+    const merge = await git.run(
+      mergeArgs,
+      {
+        cwd: root,
+        signal: opts.signal,
+        env: {
+          LC_ALL: 'C',
+          LANG: 'C',
+          WTM_EXPECTED_BASE: rec.base,
+        },
+      },
+    )
+    if (!merge.ok) {
+      return {
+        ok: false,
+        merged: false,
+        error: `合并失败：${merge.stderr.trim()}。主工作区可能处于合并中状态，可用 git merge --abort 恢复后重试`,
+        warnings: [],
+      }
+    }
+    if (/^Already up to date\.?$/m.test(merge.stdout)) {
+      return { ok: true, merged: false, warnings: ['任务分支已包含在基分支中，跳过重复合并'] }
+    }
+    return { ok: true, merged: true, warnings: [] }
+  } finally {
+    rmSync(guard.hooksPath, { recursive: true, force: true })
+  }
+}
+
+/**
+ * 校验当前主工作区仍位于账本基分支且没有未提交改动。
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true} | {ok: false, error: string}>}
+ */
+async function checkBaseState(opts, rec) {
+  const { root, git } = opts
+  const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
+  if (!cur.ok) return { ok: false, error: `读取主工作区分支失败：${cur.stderr.trim()}` }
+
+  const currentBase = cur.stdout.trim()
+  if (currentBase !== rec.base) {
+    const hint = currentBase ? `当前在 ${currentBase}` : '当前处于 detached HEAD'
+    return {
+      ok: false,
+      error: `主工作区当前分支与任务基分支不一致（账本：${rec.base}，${hint}）。` +
+        `请先在主工作区切回 ${rec.base} 再重试（git checkout ${rec.base}）`,
+    }
+  }
+
+  const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
+  if (!baseStatus.ok) return { ok: false, error: `读取基分支状态失败：${baseStatus.stderr.trim()}` }
+  if (isDirty(baseStatus.stdout)) {
+    return { ok: false, error: '基分支工作区存在未提交改动，请先提交或暂存（防止合并混入未完成的工作）' }
+  }
+
+  return { ok: true }
 }
 
 /**

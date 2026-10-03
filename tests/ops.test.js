@@ -36,8 +36,10 @@ class FakeGit {
    */
   async run(args, opts = {}) {
     this.calls.push({ args, cwd: opts.cwd })
-    const key = args.join(' ')
-    const a = this.answers.get(key)
+    const mergeIndex = args.indexOf('merge')
+    const normalized = mergeIndex === -1 ? args : args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+    const key = normalized.join(' ')
+    const a = this.answers.get(args.join(' ')) ?? this.answers.get(key)
     if (a === undefined) throw new Error(`FakeGit: 未预设答案: ${key}`)
     return typeof a === 'function' ? a({ args, cwd: opts.cwd }) : a
   }
@@ -46,11 +48,21 @@ class FakeGit {
    * @param {string | undefined} [cwd]
    */
   called(args, cwd) {
-    return this.calls.some((c) => c.args.join(' ') === args.join(' ') && (cwd === undefined || c.cwd === cwd))
+    return this.calls.some((c) => {
+      const mergeIndex = c.args.indexOf('merge')
+      const normalized = mergeIndex === -1 ? c.args : c.args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+      const actual = normalized.join(' ')
+      return actual === args.join(' ') && (cwd === undefined || c.cwd === cwd)
+    })
   }
   /** @param {string[]} args */
   count(args) {
-    return this.calls.filter((c) => c.args.join(' ') === args.join(' ')).length
+    return this.calls.filter((c) => {
+      const mergeIndex = c.args.indexOf('merge')
+      const normalized = mergeIndex === -1 ? c.args : c.args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+      const actual = normalized.join(' ')
+      return actual === args.join(' ')
+    }).length
   }
 }
 
@@ -543,6 +555,11 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   git.on(['branch', '--show-current'], OK('main\n'))
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
+  git.on(['config', '--get', 'branch.main.mergeOptions'], FAIL('', 1))
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], OK(`${'2'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
+  git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
+  git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   return { cfg, git, vault }
 }
 
@@ -1127,6 +1144,13 @@ test('purge：批量清理，逐任务报告，单个失败不中断', async () 
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t1', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t2', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['status', '--porcelain'], OK(''))
+  git.on(['config', '--get', 'branch.main.mergeOptions'], FAIL('', 1))
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t1^{commit}'], OK(`${'2'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t2^{commit}'], OK(`${'3'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
+  git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'4'.repeat(40)}\n`))
+  git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'3'.repeat(40)}`], OK(`${'5'.repeat(40)}\n`))
+  git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t1', '-m', 'fold T1 into main'], OK('merged'))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t2', '-m', 'fold T2 into main'], FAIL('conflict'))
   git.on(['worktree', 'remove', join(cfg.vault, 't1')], OK())
