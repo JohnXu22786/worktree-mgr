@@ -21,6 +21,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readlinkSync,
   readFileSync,
   realpathSync,
@@ -397,6 +398,60 @@ function removeGuardArtifact(path) {
 }
 
 /**
+ * Restore a tombstoned lease only while atomically claiming its fixed path.
+ * Files are hard-linked so an existing destination is never replaced; legacy
+ * guard directories reserve their name with mkdir before their children move.
+ * @param {string} tombstonePath
+ * @param {string} path
+ */
+function restoreGuardArtifact(tombstonePath, path) {
+  let tombstoneStat
+  try {
+    tombstoneStat = lstatSync(tombstonePath)
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return
+    throw err
+  }
+
+  if (tombstoneStat.isDirectory()) {
+    try {
+      mkdirSync(path, { mode: tombstoneStat.mode })
+    } catch (err) {
+      const code = /** @type {any} */ (err).code
+      if (code === 'EEXIST') {
+        removeGuardArtifact(tombstonePath)
+        return
+      }
+      if (code === 'ENOENT') return
+      throw err
+    }
+
+    for (const child of readdirSync(tombstonePath)) {
+      renameSync(join(tombstonePath, child), join(path, child))
+    }
+    rmdirSync(tombstonePath)
+    return
+  }
+
+  try {
+    linkSync(tombstonePath, path)
+  } catch (err) {
+    const code = /** @type {any} */ (err).code
+    if (code === 'EEXIST') {
+      removeGuardArtifact(tombstonePath)
+      return
+    }
+    if (code === 'ENOENT') return
+    throw err
+  }
+  try {
+    unlinkSync(tombstonePath)
+  } catch (err) {
+    if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+  }
+}
+
+/**
  * 将一个陈旧 guard 原子地移到私有 tombstone 后再判断其时间戳。
  * 读取 mtime 与删除路径之间允许其他进程运行；若它们发布了后继
  * guard，rename 会移动后继对象，但后继的最新 mtime 会使其被恢复，
@@ -432,18 +487,7 @@ function reclaimStaleGuard(path, staleMs, token) {
     throw err
   }
   if (Date.now() - tombstoneStat.mtimeMs <= staleMs) {
-    try {
-      renameSync(tombstonePath, path)
-    } catch (err) {
-      const code = /** @type {any} */ (err).code
-      if (code === 'EEXIST') {
-        // A fresh successor has already claimed the original path. The
-        // tombstoned object is the old one and can be discarded safely.
-        removeGuardArtifact(tombstonePath)
-      } else if (code !== 'ENOENT') {
-        throw err
-      }
-    }
+    restoreGuardArtifact(tombstonePath, path)
     return false
   }
   removeGuardArtifact(tombstonePath)
@@ -644,16 +688,9 @@ async function releaseLeasePath(path, token, heartbeat, errorMessage, allowEmpty
         return
       }
 
-      // The path contained a successor. Restore it if the path is still
-      // empty; if the successor has already replaced it, discard only the
-      // old tombstoned object.
-      try {
-        renameSync(tombstonePath, path)
-      } catch (err) {
-        const code = /** @type {any} */ (err).code
-        if (code === 'EEXIST') removeGuardArtifact(tombstonePath)
-        else if (code !== 'ENOENT') throw err
-      }
+      // The path contained a successor. Restore it only if it can claim the
+      // fixed path without replacing a successor that appeared in the meantime.
+      restoreGuardArtifact(tombstonePath, path)
       moved = false
     })
   } catch (err) {

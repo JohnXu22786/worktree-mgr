@@ -597,6 +597,56 @@ test('withLock：stale 锁持续被重新创建时仍遵守 timeout', async () =
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：恢复新鲜 stale tombstone 时不覆盖后继锁', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const successorToken = 'successor-lock-token'
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'stale-lock-token')
+  utimesSync(lockPath, past, past)
+
+  const originalRenameSync = fs.renameSync
+  const originalLinkSync = fs.linkSync
+  const originalUtimesSync = fs.utimesSync
+  let tombstoneMadeFresh = false
+  let successorPublished = false
+  const publishSuccessor = (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorPublished && target === lockPath && source.startsWith(`${lockPath}.stale-`)) {
+      successorPublished = true
+      writeFileSync(target, successorToken)
+    }
+  }
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    const result = originalRenameSync(source, target)
+    if (!tombstoneMadeFresh && source === lockPath && target.startsWith(`${lockPath}.stale-`)) {
+      tombstoneMadeFresh = true
+      const now = new Date()
+      originalUtimesSync(target, now, now)
+    }
+    return result
+  })
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    return originalLinkSync(source, target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 1000, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(tombstoneMadeFresh, true)
+  assert.equal(successorPublished, true)
+  assert.equal(readFileSync(lockPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
   const dir = makeTmp()
   const reclaimPath = join(dir, '.lock.reclaim')
@@ -706,6 +756,49 @@ test('withLock：释放 reclaim marker 时后继 marker 不会被旧流程删除
   }
   assert.equal(replaced, true)
   assert.equal(successorMoved, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：恢复 release tombstone 时不覆盖后继 guard', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const successorToken = 'successor-guard-at-restore-token'
+  const tombstoneToken = 'foreign-guard-tombstone-token'
+  const originalRenameSync = fs.renameSync
+  const originalLinkSync = fs.linkSync
+  let tombstoneChanged = false
+  let successorPublished = false
+  const publishSuccessor = (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorPublished && target === reclaimPath && source.startsWith(`${reclaimPath}.released-`)) {
+      successorPublished = true
+      writeFileSync(target, successorToken)
+    }
+  }
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!tombstoneChanged && source === reclaimPath && target.startsWith(`${reclaimPath}.released-`)) {
+      const result = originalRenameSync(source, target)
+      tombstoneChanged = true
+      writeFileSync(target, tombstoneToken)
+      return result
+    }
+    publishSuccessor(source, target)
+    return originalRenameSync(source, target)
+  })
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    return originalLinkSync(source, target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(tombstoneChanged, true)
+  assert.equal(successorPublished, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), successorToken)
   rmSync(dir, { recursive: true, force: true })
 })
 
