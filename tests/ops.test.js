@@ -33,7 +33,7 @@ class FakeGit {
   /**
    * @param {string[]} args
    * @param {{cwd?: string, signal?: AbortSignal}} [opts]
-   */
+  */
   async run(args, opts = {}) {
     this.calls.push({ args, cwd: opts.cwd })
     const mergeIndex = args.indexOf('merge')
@@ -41,7 +41,7 @@ class FakeGit {
     const key = normalized.join(' ')
     const a = this.answers.get(args.join(' ')) ?? this.answers.get(key)
     if (a === undefined) throw new Error(`FakeGit: 未预设答案: ${key}`)
-    return typeof a === 'function' ? a({ args, cwd: opts.cwd }) : a
+    return typeof a === 'function' ? a({ args, cwd: opts.cwd, signal: opts.signal }) : a
   }
   /**
    * @param {string[]} args
@@ -535,6 +535,9 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   const cfg = baseCfg(tmp)
   const git = new FakeGit()
   const vault = cfg.vault
+  const taskPath = join(vault, 't')
+  const abandonPath = join(vault, '.t.abandon-pending')
+  const taskGitDir = join(tmp, 'task-gitdir')
   // 预置一条任务记录，并真实创建工作区目录（stale 判定依赖目录实存）
   const ledger = structuredClone(EMPTY_LEDGER)
   upsertRecord(ledger, {
@@ -543,11 +546,24 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   })
   saveLedger(vault, ledger)
   mkdirSync(join(vault, 't'), { recursive: true })
+  mkdirSync(taskGitDir, { recursive: true })
   git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree C:/repo\nHEAD 1'.padEnd(40, '1') + '\nbranch refs/heads/main\n\nworktree ' + join(vault, 't') + '\nHEAD 2'.padEnd(40, '2') + '\nbranch refs/heads/' + taskBranch + '\n'))
   // status 答案按 cwd 区分：任务工作区脏与否 / 基工作区脏与否
   git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
     if (ctx.cwd === join(vault, 't')) return taskDirty ? OK(' M f.txt\n') : OK('')
     return baseDirty ? OK(' M base.txt\n') : OK('')
+  })
+  git.on(['status', '--porcelain=v2', '--branch', '--untracked-files=all'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === taskPath || ctx.cwd === abandonPath) {
+      return OK(`# branch.oid ${'2'.repeat(40)}\n# branch.head ${taskBranch}\n${taskDirty ? '? f.txt\n' : ''}`)
+    }
+    return OK(`# branch.oid ${'1'.repeat(40)}\n# branch.head main\n${baseDirty ? '? base.txt\n' : ''}`)
+  })
+  git.on(['worktree', 'move', taskPath, abandonPath], OK())
+  git.on(['worktree', 'move', abandonPath, taskPath], OK())
+  git.on(['rev-parse', '--absolute-git-dir'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === taskPath || ctx.cwd === abandonPath) return OK(`${taskGitDir}\n`)
+    return FAIL('unknown worktree')
   })
   git.on(['add', '-A'], OK())
   git.on(['commit', '-m', 'snapshot T'], OK('[wtm/t 9999999] snapshot T'))
@@ -560,7 +576,7 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
   git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
   git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
-  return { cfg, git, vault }
+  return { cfg, git, vault, taskGitDir }
 }
 
 test('mergeTask：干净任务直接合并并更新记录', async () => {
@@ -888,14 +904,21 @@ test('finishTask：分支尖端未变化时保留删除警告并完成清理', a
 test('finishTask：abandon 模式跳过提交与合并，强制删除', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
-  git.on(['worktree', 'remove', '--force', join(vault, 't')], OK())
+  const abandonPath = join(vault, '.t.abandon-pending')
+  const headLockPath = join(tmp, 'task-gitdir', 'HEAD.lock')
+  git.on(['worktree', 'remove', '--force', abandonPath], () => {
+    assert.equal(fs.existsSync(headLockPath), true, '移除时必须继续持有分支锁')
+    return OK()
+  })
   git.on(['branch', '-D', 'wtm/t'], OK())
   const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.equal(r.merged, false)
   assert.equal(r.committed, false)
   assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
-  assert.ok(git.called(['worktree', 'remove', '--force', join(vault, 't')]))
+  assert.ok(git.called(['worktree', 'move', join(vault, 't'), abandonPath]))
+  assert.ok(git.called(['worktree', 'remove', '--force', abandonPath]))
+  assert.equal(fs.existsSync(headLockPath), false, '完成移除后必须释放分支锁')
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   assert.equal(loadLedger(vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
@@ -911,6 +934,99 @@ test('finishTask：abandon 模式发现工作区分支不一致时拒绝删除',
   assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
   assert.deepEqual(loadLedger(vault).records.map((rec) => rec.branch), ['wtm/t'])
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：abandon 强制移除前发现分支和工作区状态漂移时保留新改动与账本', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault, taskGitDir } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  const abandonPath = join(vault, '.t.abandon-pending')
+  const headLockPath = join(taskGitDir, 'HEAD.lock')
+  const racePath = join(taskPath, 'race.txt')
+  const statusArgs = ['status', '--porcelain=v2', '--branch', '--untracked-files=all']
+  let branch = 'wtm/t'
+  let statusChecks = 0
+  git.on(statusArgs, (/** @type {{cwd: string | undefined}} */ ctx) => {
+    statusChecks += 1
+    if (statusChecks === 1) {
+      assert.equal(ctx.cwd, taskPath)
+      const before = `# branch.oid ${'2'.repeat(40)}\n# branch.head ${branch}\n`
+      branch = 'other'
+      fs.writeFileSync(racePath, 'preserve this change')
+      return OK(before)
+    }
+    assert.equal(ctx.cwd, abandonPath)
+    assert.equal(fs.existsSync(headLockPath), true, '最终状态检查期间必须阻止分支切换')
+    return OK(`# branch.oid ${'4'.repeat(40)}\n# branch.head ${branch}\n? race.txt\n`)
+  })
+  git.on(['worktree', 'move', taskPath, abandonPath], () => {
+    fs.renameSync(taskPath, abandonPath)
+    return OK()
+  })
+  git.on(['worktree', 'move', abandonPath, taskPath], () => {
+    assert.equal(fs.existsSync(headLockPath), false, '恢复路径前必须释放分支锁')
+    fs.renameSync(abandonPath, taskPath)
+    return OK()
+  })
+  git.on(['worktree', 'remove', '--force', abandonPath], () => {
+    rmSync(abandonPath, { recursive: true, force: true })
+    return OK()
+  })
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  try {
+    const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /工作区.*变化|分支.*不一致/)
+    assert.equal(statusChecks, 2)
+    assert.equal(fs.existsSync(racePath), true, '并发新增文件必须保留')
+    assert.equal(fs.existsSync(abandonPath), false, '恢复原路径后不得留下临时工作区')
+    assert.equal(git.count(['worktree', 'remove', '--force', abandonPath]), 0, '漂移后不得强制移除工作区')
+    assert.equal(git.count(['branch', '-D', 'wtm/t']), 0, '漂移后不得删除账本分支')
+    assert.equal(fs.existsSync(headLockPath), false, '状态漂移后不得遗留分支锁')
+    assert.equal(loadLedger(vault).records.length, 1, '漂移后必须保留管理记录')
+    assert.equal(loadLedger(vault).records[0].path, taskPath, '账本仍须指向恢复后的工作区路径')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('finishTask：abandon 状态检查取消时恢复原工作区和账本路径', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault, taskGitDir } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  const abandonPath = join(vault, '.t.abandon-pending')
+  const headLockPath = join(taskGitDir, 'HEAD.lock')
+  const statusArgs = ['status', '--porcelain=v2', '--branch', '--untracked-files=all']
+  const controller = new AbortController()
+  let statusChecks = 0
+  git.on(statusArgs, (/** @type {{cwd: string | undefined}} */ ctx) => {
+    assert.equal(ctx.cwd, statusChecks === 0 ? taskPath : abandonPath)
+    statusChecks += 1
+    if (statusChecks === 1) return OK(`# branch.oid ${'2'.repeat(40)}\n# branch.head wtm/t\n`)
+    controller.abort()
+    return FAIL('operation aborted')
+  })
+  git.on(['worktree', 'move', taskPath, abandonPath], (/** @type {{signal?: AbortSignal}} */ ctx) => {
+    assert.equal(ctx.signal, undefined, '工作区路径移动不能被取消打断')
+    return OK()
+  })
+  git.on(['worktree', 'move', abandonPath, taskPath], (/** @type {{signal?: AbortSignal}} */ ctx) => {
+    assert.equal(ctx.signal, undefined, '取消后恢复移动不能复用已中止的信号')
+    return OK()
+  })
+
+  try {
+    const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null, signal: controller.signal })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /取消|aborted/i)
+    assert.equal(statusChecks, 2)
+    assert.equal(fs.existsSync(headLockPath), false)
+    assert.equal(git.count(['worktree', 'remove', '--force', abandonPath]), 0)
+    assert.equal(loadLedger(vault).records[0].path, taskPath)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('finishTask：keep 模式仅解除管理，不触碰工作区与分支', async () => {
