@@ -6,8 +6,8 @@
  * 不抛异常（调用方：dsh 工具层、CLI）。
  */
 
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, rmSync, statSync } from 'node:fs'
+import { basename, dirname, join, resolve } from 'node:path'
 import {
   slugifyTask,
   deriveBranch,
@@ -875,6 +875,64 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   const branchCheck = checkWorktreeBranch(wt, rec)
   if (!branchCheck.ok) return { ok: false, error: branchCheck.error }
 
+  /** @type {string | undefined} */
+  let abandonWorktreeState
+  /** @type {string | undefined} */
+  let abandonWorktreePath
+  /** @type {string | undefined} */
+  let abandonHeadLockPath
+  /** @type {boolean} */
+  let abandonLedgerPathPersisted = false
+  const originalWorktreePath = rec.path
+  const restoreAbandonWorktree = async () => {
+    if (abandonHeadLockPath) {
+      rmSync(abandonHeadLockPath, { force: true })
+      abandonHeadLockPath = undefined
+    }
+    const restore = await git.run(['worktree', 'move', rec.path, originalWorktreePath], { cwd: root })
+    if (!restore.ok) {
+      upsertRecord(ledger, rec)
+      try {
+        saveLedger(vault, ledger)
+        abandonLedgerPathPersisted = true
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false, error: `恢复原工作区路径失败：${restore.stderr.trim() || 'git worktree move 失败'}；更新账本失败：${message}` }
+      }
+      return { ok: false, error: `恢复原工作区路径失败：${restore.stderr.trim() || 'git worktree move 失败'}` }
+    }
+    rec.path = originalWorktreePath
+    upsertRecord(ledger, rec)
+    if (abandonLedgerPathPersisted) {
+      try {
+        saveLedger(vault, ledger)
+        abandonLedgerPathPersisted = false
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false, error: `工作区已恢复原路径，但恢复账本记录失败：${message}` }
+      }
+    }
+    return { ok: true }
+  }
+  if (mode === 'abandon') {
+    const state = await git.run(['status', '--porcelain=v2', '--branch', '--untracked-files=all'], {
+      cwd: rec.path,
+      signal: opts.signal,
+    })
+    if (!state.ok) {
+      return { ok: false, error: `检查任务工作区状态失败：${state.stderr.trim() || 'git status 失败'}；已保留工作区与账本记录` }
+    }
+    const currentBranch = /^# branch\.head (.+)$/m.exec(state.stdout)?.[1]
+    if (currentBranch !== rec.branch) {
+      const hint = currentBranch ? `当前在 ${currentBranch}` : '当前处于 detached HEAD'
+      return {
+        ok: false,
+        error: `任务工作区分支与账本记录不一致（账本：${rec.branch}，${hint}）；已保留工作区与账本记录`,
+      }
+    }
+    abandonWorktreeState = state.stdout
+  }
+
   let committed = false
   let merged = false
   /** @type {string | undefined} */
@@ -916,18 +974,113 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
     }
   }
 
+  // abandon 先把工作区移到临时路径，再锁住 Git 的 HEAD 更新，避免分支切换越过最终检查。
+  // 状态变化时先恢复路径和账本，不触发强制删除。
+  if (mode === 'abandon') {
+    abandonWorktreePath = join(dirname(rec.path), `.${basename(rec.path)}.abandon-pending`)
+    // Finish this path transition even if cancellation arrives mid-command; later checks can roll it back safely.
+    const move = await git.run(['worktree', 'move', rec.path, abandonWorktreePath], { cwd: root })
+    if (!move.ok) {
+      return { ok: false, error: `隔离任务工作区失败：${move.stderr.trim() || 'git worktree move 失败'}；已保留工作区与账本记录`, warnings }
+    }
+    rec.path = abandonWorktreePath
+
+    const gitDir = await git.run(['rev-parse', '--absolute-git-dir'], { cwd: rec.path, signal: opts.signal })
+    if (!gitDir.ok || !gitDir.stdout.trim()) {
+      const cause = `读取隔离工作区 Git 目录失败：${gitDir.stderr.trim() || 'git rev-parse 失败'}`
+      const restore = await restoreAbandonWorktree()
+      return {
+        ok: false,
+        error: `${cause}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
+        warnings,
+      }
+    }
+    const headLockPath = join(gitDir.stdout.trim(), 'HEAD.lock')
+    /** @type {number | undefined} */
+    let headLockFd
+    try {
+      headLockFd = openSync(headLockPath, 'wx')
+      abandonHeadLockPath = headLockPath
+      closeSync(headLockFd)
+      headLockFd = undefined
+    } catch (error) {
+      if (headLockFd !== undefined) {
+        try { closeSync(headLockFd) } catch { /* lock path cleanup below is authoritative */ }
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      const restore = await restoreAbandonWorktree()
+      return {
+        ok: false,
+        error: `锁定任务工作区分支失败：${message}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
+        warnings,
+      }
+    }
+
+    const state = await git.run(['status', '--porcelain=v2', '--branch', '--untracked-files=all'], {
+      cwd: rec.path,
+      signal: opts.signal,
+    })
+    if (!state.ok || state.stdout !== abandonWorktreeState) {
+      const cause = state.ok
+        ? '任务工作区在检查后发生变化，已拒绝强制移除'
+        : `隔离后检查任务工作区状态失败：${state.stderr.trim() || 'git status 失败'}`
+      const restore = await restoreAbandonWorktree()
+      if (restore.ok) {
+        return { ok: false, error: `${cause}；工作区与账本记录已恢复，请检查后重试`, warnings }
+      }
+      return {
+        ok: false,
+        error: `${cause}；工作区与账本记录保留在 ${rec.path}，${restore.error}`,
+        warnings,
+      }
+    }
+    upsertRecord(ledger, rec)
+    try {
+      saveLedger(vault, ledger)
+      abandonLedgerPathPersisted = true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const restore = await restoreAbandonWorktree()
+      return {
+        ok: false,
+        error: `记录隔离工作区路径失败：${message}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
+        warnings,
+      }
+    }
+  }
+
   // 移除工作区：commit 用安全移除，abandon 用 --force
   const removeArgs = mode === 'abandon'
-    ? ['worktree', 'remove', '--force', rec.path]
+    ? ['worktree', 'remove', '--force', abandonWorktreePath ?? rec.path]
     : ['worktree', 'remove', rec.path]
-  const remove = await git.run(removeArgs, { cwd: root, signal: opts.signal })
+  const remove = await git.run(removeArgs, mode === 'abandon' ? { cwd: root } : { cwd: root, signal: opts.signal })
   if (!remove.ok) {
+    if (mode === 'abandon' && abandonWorktreePath) {
+      const restore = await restoreAbandonWorktree()
+      if (restore.ok) {
+        return {
+          ok: false,
+          error: `移除工作区失败：${remove.stderr.trim()}；工作区与账本记录已恢复原路径`,
+          warnings,
+        }
+      }
+      return {
+        ok: false,
+        error: `移除工作区失败：${remove.stderr.trim()}；工作区与账本记录保留在 ${abandonWorktreePath}，${restore.error}`,
+        warnings,
+      }
+    }
     return {
       ok: false,
       error: `移除工作区失败：${remove.stderr.trim()}（如存在未跟踪文件，可改用 abandon 模式强制清理）`,
       warnings,
     }
   }
+  if (abandonHeadLockPath) {
+    rmSync(abandonHeadLockPath, { force: true })
+    abandonHeadLockPath = undefined
+  }
+  rec.path = originalWorktreePath
 
   // Finish commit 条件删除合并时的 OID，避免误删前进后的尖端。
   // update-ref 不检查其他工作区是否检出该分支，因此先刷新列表核对。
