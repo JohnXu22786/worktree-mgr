@@ -691,7 +691,7 @@ test('finishTask：commit 模式执行 on_merge 触发器', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp)
   git.on(['worktree', 'remove', join(vault, 't')], OK())
-  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
   /** @type {Array<{shell: string, args: string[], opts: object}>} */
   const triggerCalls = []
   const repo = { triggers: { on_merge: ['mark-merge'] } }
@@ -749,7 +749,7 @@ test('finishTask：任务分支已合并时跳过 on_merge 触发器', async () 
   const { cfg, git, vault } = mergeFixture(tmp)
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], OK())
   git.on(['worktree', 'remove', join(vault, 't')], OK())
-  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
   let triggerCalls = 0
 
   const r = await finishTask({
@@ -775,7 +775,7 @@ test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
   git.on(['worktree', 'remove', join(vault, 't')], OK())
-  git.on(['branch', '-d', 'wtm/t'], OK('Deleted branch wtm/t'))
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
   const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
   assert.equal(r.ok, true)
   assert.equal(r.merged, true)
@@ -783,8 +783,105 @@ test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 
   assert.equal(r.removed, true)
   assert.equal(r.branchDeleted, true)
   assert.ok(git.called(['worktree', 'remove', join(vault, 't')]))
-  assert.ok(git.called(['branch', '-d', 'wtm/t']))
+  assert.ok(git.called(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)]))
   assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：合并后分支尖端前进时恢复工作区并保留账本记录', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  let branchTip = '2'.repeat(40)
+  let branchTipReads = 0
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], () => {
+    branchTipReads += 1
+    if (branchTipReads === 5) {
+      const readTip = branchTip
+      queueMicrotask(() => { branchTip = '4'.repeat(40) })
+      return OK(`${readTip}\n`)
+    }
+    return OK(`${branchTip}\n`)
+  })
+  git.on(['worktree', 'remove', taskPath], OK())
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], FAIL('permission denied', 1))
+  git.on(['worktree', 'add', taskPath, 'wtm/t'], OK())
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /分支删除失败/)
+  assert.equal(loadLedger(vault).records.length, 1)
+  assert.ok(git.called(['worktree', 'add', taskPath, 'wtm/t']))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：条件删除前分支尖端前进时保留新提交', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  let branchTip = '2'.repeat(40)
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], () => OK(`${branchTip}\n`))
+  git.on(['worktree', 'remove', taskPath], OK())
+  git.on(['branch', '-d', 'wtm/t'], () => {
+    branchTip = '4'.repeat(40)
+    return OK('Deleted branch wtm/t')
+  })
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], () => {
+    branchTip = '4'.repeat(40)
+    return FAIL('reference changed', 1)
+  })
+  git.on(['worktree', 'add', taskPath, 'wtm/t'], OK())
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /分支删除失败/)
+  assert.equal(loadLedger(vault).records.length, 1)
+  assert.ok(git.called(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)]))
+  assert.ok(git.called(['worktree', 'add', taskPath, 'wtm/t']))
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：分支在其他工作区检出时不删除引用', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  let worktreeLists = 0
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => {
+    worktreeLists += 1
+    const taskWorktree = `worktree ${taskPath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/wtm/t\n`
+    const otherWorktree = `worktree C:/other\nHEAD ${'4'.repeat(40)}\nbranch refs/heads/wtm/t\n`
+    return WORKTREES(`worktree C:/repo\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n${worktreeLists === 1 ? taskWorktree : otherWorktree}`)
+  })
+  git.on(['worktree', 'remove', taskPath], OK())
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.branchDeleted, false)
+  assert.ok(r.warnings?.some((warning) => /其他工作区/.test(warning)), JSON.stringify(r))
+  assert.equal(git.count(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)]), 0)
+  assert.equal(worktreeLists, 2)
+  assert.equal(loadLedger(vault).records.length, 0)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：分支尖端未变化时保留删除警告并完成清理', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  git.on(['worktree', 'remove', taskPath], OK())
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], FAIL('permission denied'))
+
+  const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.branchDeleted, false)
+  assert.ok(r.warnings?.some((warning) => /分支删除失败/.test(warning)), JSON.stringify(r))
+  assert.equal(loadLedger(vault).records.length, 0)
+  assert.equal(git.count(['worktree', 'add', taskPath, 'wtm/t']), 0)
   rmSync(tmp, { recursive: true, force: true })
 })
 
