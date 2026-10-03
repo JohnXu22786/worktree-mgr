@@ -1,11 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { GitRunner, resolveToplevel, samePath } from '../src/git.js'
+import { createMergeGuard } from '../src/merge-guard.js'
 import { begin, mergeTask, finishTask, listStatus } from '../src/ops.js'
 import { loadLedger } from '../src/vault.js'
 import { apply } from '../index.js'
@@ -42,6 +43,33 @@ async function makeRepo() {
 /** 集成测试的 vault 必须放在仓库之外（否则主工作区会被 vault 目录弄脏） */
 function makeVault() {
   return mkdtempSync(join(tmpdir(), 'wtm-it-vault-'))
+}
+
+/** @param {string} value */
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`
+}
+
+/** @param {string} directory @param {string} name @param {string} body */
+function installHook(directory, name, body) {
+  mkdirSync(directory, { recursive: true })
+  const path = join(directory, name)
+  writeFileSync(path, body, 'utf8')
+  chmodSync(path, 0o755)
+}
+
+class MergeRaceGit extends GitRunner {
+  /** @param {() => void} beforeMerge */
+  constructor(beforeMerge) {
+    super()
+    this.beforeMerge = beforeMerge
+  }
+
+  /** @param {string[]} args @param {Parameters<GitRunner['run']>[1]} opts */
+  async run(args, opts) {
+    if (args.includes('merge')) this.beforeMerge()
+    return super.run(args, opts)
+  }
 }
 
 for (const directory of [
@@ -378,6 +406,633 @@ test('集成：merge 在基分支脏时拒绝', { skip: !HAS_GIT, timeout: 12000
     assert.match(readFileSync(join(root, 'a.txt'), 'utf8'), /dirty-main/)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('集成：GIT_CONFIG_PARAMETERS 中的 core.hooksPath 不能绕过 merge guard', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new GitRunner()
+  const priorParameters = process.env.GIT_CONFIG_PARAMETERS
+  try {
+    const b = await begin({ root, task: 'Merge Guard Inherited Hooks', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+
+    const hookDirectory = join(vault, 'caller-hooks')
+    const hookLog = join(vault, 'inherited-hook-config')
+    installHook(hookDirectory, 'pre-merge-commit', `#!/bin/sh
+git config --get wtm.testInheritedParameter > ${shellQuote(hookLog)} || exit $?
+printf 'base\\n+hook-race\\n' > ${shellQuote(join(root, 'a.txt'))}
+git add a.txt
+`)
+    const configPath = hookDirectory.replaceAll('\\', '/')
+    process.env.GIT_CONFIG_PARAMETERS = `'core.hooksPath'='${configPath}' 'wtm.testInheritedParameter'='preserved'`
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Inherited Hooks', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(existsSync(hookLog), true, 'the original caller hook must be forwarded')
+    assert.equal(m.ok, false, `caller hook changes must be rejected by the merge-time guard: ${JSON.stringify(m)}`)
+    assert.match(m.error ?? '', /base index became dirty during merge/i)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead, 'guard must not commit the hook-modified tree')
+    assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'base\n+hook-race\n', 'the caller hook must run through the guard wrapper')
+    assert.equal(readFileSync(hookLog, 'utf8'), 'preserved\n', 'the caller hook must retain inherited Git configuration')
+  } finally {
+    if (priorParameters === undefined) delete process.env.GIT_CONFIG_PARAMETERS
+    else process.env.GIT_CONFIG_PARAMETERS = priorParameters
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-guard-inherited-hooks'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：最终检查后出现非冲突的基分支改动时 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new MergeRaceGit(() => {
+    writeFileSync(join(root, 'base-race.txt'), 'written after preflight\n')
+  })
+  try {
+    const b = await begin({ root, task: 'Merge Guard Final Edit', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Final Edit', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, false)
+    assert.match(m.error ?? '', /base worktree became dirty during merge/i)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead, 'base changes must not enter a merge commit')
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-guard-final-edit'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：最终检查后切换基分支时 merge-time guard 拒绝', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new MergeRaceGit(() => {
+    assert.equal(gitOk(['checkout', '-b', 'develop'], root).status, 0)
+  })
+  try {
+    const b = await begin({ root, task: 'Merge Guard Final Checkout', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Final Checkout', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, false)
+    assert.match(m.error ?? '', /base branch changed during merge/i)
+    assert.equal(gitOk(['branch', '--show-current'], root).stdout.trim(), 'develop')
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead, 'must not merge on the wrong branch')
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-guard-final-checkout'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：commit hook 不能把受保护的 merge 重定向到其他分支', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const branch = 'wtm/merge-guard-redirect'
+  try {
+    assert.equal(gitOk(['branch', 'develop'], root).status, 0)
+    const b = await begin({ root, task: 'Merge Guard Redirect', cfg, git: new GitRunner(), repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    installHook(join(root, '.git', 'hooks'), 'prepare-commit-msg', `#!/bin/sh
+git symbolic-ref HEAD refs/heads/develop
+`)
+    const baseHead = gitOk(['rev-parse', 'refs/heads/main'], root).stdout.trim()
+    const otherHead = gitOk(['rev-parse', 'refs/heads/develop'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Merge Guard Redirect', mode: 'refuse', cfg, git: new GitRunner(), repo: null })
+
+    assert.equal(m.ok, false, JSON.stringify(m))
+    assert.match(m.error ?? '', /base (?:branch changed|index became dirty)|does not update the expected base ref/i)
+    assert.equal(gitOk(['rev-parse', 'refs/heads/main'], root).stdout.trim(), baseHead)
+    assert.equal(gitOk(['rev-parse', 'refs/heads/develop'], root).stdout.trim(), otherHead)
+  } finally {
+    gitOk(['symbolic-ref', 'HEAD', 'refs/heads/main'], root)
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', branch], root)
+    gitOk(['branch', '-D', 'develop'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：merge-time guard 检查 status 隐藏的 hook 新增未跟踪文件', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const branch = 'wtm/merge-guard-untracked-hook'
+  const hookFile = join(root, 'hook-only.txt')
+  try {
+    const b = await begin({ root, task: 'Merge Guard Untracked Hook', cfg, git: new GitRunner(), repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+    assert.equal(gitOk(['config', 'status.showUntrackedFiles', 'no'], root).status, 0)
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    installHook(join(root, '.git', 'hooks'), 'pre-merge-commit', `#!/bin/sh
+printf 'hook data\\n' > ${shellQuote(hookFile)}
+`)
+
+    const m = await mergeTask({ root, task: 'Merge Guard Untracked Hook', mode: 'commit', cfg, git: new GitRunner(), repo: null })
+
+    assert.equal(m.ok, false, JSON.stringify(m))
+    assert.match(m.error ?? '', /untracked/i)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+    const status = gitOk(['status', '--porcelain'], root).stdout
+    assert.match(status, /task\.txt/, 'the failed merge should leave its staged task tree recoverable')
+    assert.doesNotMatch(status, /hook-only\.txt/, 'the configured status output should hide the untracked hook file')
+    assert.equal(readFileSync(hookFile, 'utf8'), 'hook data\n')
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', branch], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：immutable merge guard pins the tree before hooks change merge configuration', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const branch = 'wtm/merge-guard-config-mutation'
+  try {
+    mkdirSync(join(root, 'old'))
+    writeFileSync(join(root, 'old', 'base.txt'), 'base\n')
+    assert.equal(gitOk(['add', 'old'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'directory base'], root).status, 0)
+    assert.equal(gitOk(['config', 'merge.directoryRenames', 'true'], root).status, 0)
+    const b = await begin({ root, task: 'Merge Guard Config Mutation', cfg, git: new GitRunner(), repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    assert.equal(gitOk(['mv', 'old', 'new'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'rename directory'], worktreePath).status, 0)
+    writeFileSync(join(root, 'old', 'added.txt'), 'main\n')
+    assert.equal(gitOk(['add', 'old/added.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'add under old directory'], root).status, 0)
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    const expectedTree = gitOk(['merge-tree', '--write-tree', 'HEAD', `refs/heads/${branch}`], root).stdout.trim()
+    const alternateTree = gitOk(['-c', 'merge.directoryRenames=false', 'merge-tree', '--write-tree', 'HEAD', `refs/heads/${branch}`], root).stdout.trim()
+    assert.notEqual(expectedTree, alternateTree, 'the changed merge config must yield a different clean tree')
+    installHook(join(root, '.git', 'hooks'), 'pre-merge-commit', `#!/bin/sh
+git config merge.directoryRenames false || exit $?
+`)
+
+    const m = await mergeTask({ root, task: 'Merge Guard Config Mutation', mode: 'refuse', cfg, git: new GitRunner(), repo: null })
+
+    assert.equal(m.ok, true, JSON.stringify(m))
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim() === baseHead, false)
+    assert.equal(gitOk(['rev-parse', 'HEAD^{tree}'], root).stdout.trim(), expectedTree)
+    assert.equal(gitOk(['config', '--get', 'merge.directoryRenames'], root).stdout.trim(), 'false')
+  } finally {
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', branch], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：tree preflight uses the same locale as the guarded merge driver', { skip: !HAS_GIT || process.platform === 'win32', timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const branch = 'wtm/merge-guard-locale-driver'
+  const priorLang = process.env.LANG
+  const priorLcAll = process.env.LC_ALL
+  try {
+    const driver = join(vault, 'locale-merge-driver.sh')
+    writeFileSync(driver, '#!/bin/sh\nprintf \'%s\\n\' "$LANG" > "$2"\n')
+    chmodSync(driver, 0o755)
+    assert.equal(gitOk(['config', 'merge.locale.name', 'locale'], root).status, 0)
+    assert.equal(gitOk(['config', 'merge.locale.driver', `${shellQuote(driver)} %O %A %B`], root).status, 0)
+    writeFileSync(join(root, '.gitattributes'), 'conflict.txt merge=locale\n')
+    writeFileSync(join(root, 'conflict.txt'), 'base\n')
+    assert.equal(gitOk(['add', '.gitattributes', 'conflict.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'add locale merge driver'], root).status, 0)
+
+    const b = await begin({ root, task: 'Merge Guard Locale Driver', cfg, git: new GitRunner(), repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'conflict.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'conflict.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task conflict'], worktreePath).status, 0)
+    writeFileSync(join(root, 'conflict.txt'), 'main\n')
+    assert.equal(gitOk(['add', 'conflict.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'main conflict'], root).status, 0)
+
+    process.env.LANG = 'fr_TEST'
+    delete process.env.LC_ALL
+    const m = await mergeTask({ root, task: 'Merge Guard Locale Driver', mode: 'refuse', cfg, git: new GitRunner(), repo: null })
+
+    assert.equal(m.ok, true, JSON.stringify(m))
+    assert.equal(readFileSync(join(root, 'conflict.txt'), 'utf8'), 'C\n')
+  } finally {
+    if (priorLang === undefined) delete process.env.LANG
+    else process.env.LANG = priorLang
+    if (priorLcAll === undefined) delete process.env.LC_ALL
+    else process.env.LC_ALL = priorLcAll
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', branch], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：proposed commit guard validates its immutable tree even when the index matches Git result', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const git = new GitRunner()
+  const branch = 'wtm/merge-guard-proposed-tree'
+  /** @type {{hooksPath: string} | undefined} */
+  let guard
+  try {
+    assert.equal(gitOk(['checkout', '-b', branch], root).status, 0)
+    writeFileSync(join(root, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], root).status, 0)
+    const branchHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.equal(gitOk(['checkout', 'main'], root).status, 0)
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    const expectedTree = gitOk(['merge-tree', '--write-tree', 'HEAD', `refs/heads/${branch}`], root).stdout.trim()
+    const wrongTree = gitOk(['rev-parse', 'HEAD^{tree}'], root).stdout.trim()
+    const wrongCommit = gitOk(['commit-tree', wrongTree, '-p', baseHead, '-p', branchHead, '-m', 'wrong merge tree'], root).stdout.trim()
+    assert.ok(expectedTree)
+    assert.ok(wrongCommit)
+    assert.notEqual(wrongTree, expectedTree)
+
+    guard = await createMergeGuard(root, git, undefined, 'main', {
+      expectedTree,
+      expectedBaseHead: baseHead,
+      expectedMergeHead: branchHead,
+    })
+    const hookLog = join(root, 'reference-hook-ran')
+    installHook(join(root, '.git', 'hooks'), 'reference-transaction', `#!/bin/sh
+input=$(mktemp "\${TMPDIR:-/tmp}/wtm-reference-test.XXXXXX") || exit 1
+trap 'rm -f "$input"' 0 HUP INT TERM
+cat >"$input" || exit 1
+if [ "$1" = prepared ] && grep -q ' refs/heads/main$' "$input"; then
+  printf 'prepared\\n' > ${shellQuote(hookLog)}
+  git read-tree ${shellQuote(expectedTree)} || exit $?
+  git checkout-index -a -f || exit $?
+fi
+`)
+    const result = spawnSync('git', [
+      '-c', `core.hooksPath=${guard.hooksPath}`,
+      'update-ref', 'refs/heads/main', wrongCommit, baseHead,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        WTM_EXPECTED_BASE: 'main',
+      },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /proposed merge commit tree/i)
+    assert.equal(readFileSync(hookLog, 'utf8'), 'prepared\n')
+    assert.equal(gitOk(['write-tree'], root).stdout.trim(), expectedTree)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+  } finally {
+    if (guard) rmSync(guard.hooksPath, { recursive: true, force: true })
+    gitOk(['branch', '-D', branch], root)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('集成：proposed commit guard pins its target and rejects extra parents', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const git = new GitRunner()
+  const branch = 'wtm/merge-guard-pinned-target'
+  const otherBranch = 'wtm/merge-guard-wrong-target'
+  /** @type {{hooksPath: string} | undefined} */
+  let guard
+  try {
+    assert.equal(gitOk(['checkout', '-b', branch], root).status, 0)
+    writeFileSync(join(root, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], root).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], root).status, 0)
+    const expectedMergeHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.equal(gitOk(['checkout', '-b', otherBranch], root).status, 0)
+    assert.equal(gitOk(['commit', '--allow-empty', '-m', 'alternate target'], root).status, 0)
+    const wrongMergeHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    assert.equal(gitOk(['checkout', 'main'], root).status, 0)
+    const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+    const expectedTree = gitOk(['merge-tree', '--write-tree', baseHead, expectedMergeHead], root).stdout.trim()
+    const wrongParentTree = gitOk(['merge-tree', '--write-tree', 'HEAD', wrongMergeHead], root).stdout.trim()
+    assert.equal(wrongParentTree, expectedTree)
+    const wrongParentCommit = gitOk([
+      'commit-tree', wrongParentTree, '-p', baseHead, '-p', wrongMergeHead, '-m', 'wrong merge target',
+    ], root).stdout.trim()
+    const extraParentCommit = gitOk([
+      'commit-tree', expectedTree, '-p', baseHead, '-p', expectedMergeHead, '-p', wrongMergeHead, '-m', 'extra merge parent',
+    ], root).stdout.trim()
+    assert.ok(wrongParentTree)
+    assert.ok(wrongParentCommit)
+    assert.ok(extraParentCommit)
+
+    guard = await createMergeGuard(root, git, undefined, 'main', {
+      expectedTree,
+      expectedBaseHead: baseHead,
+      expectedMergeHead,
+    })
+    const hookLog = join(root, '.git', 'reference-hook-ran')
+    installHook(join(root, '.git', 'hooks'), 'reference-transaction', `#!/bin/sh
+input=$(mktemp "\${TMPDIR:-/tmp}/wtm-reference-test.XXXXXX") || exit 1
+trap 'rm -f "$input"' 0 HUP INT TERM
+cat >"$input" || exit 1
+if [ "$1" = prepared ] && grep -q ' refs/heads/main$' "$input"; then
+  printf 'prepared\\n' > ${shellQuote(hookLog)}
+  git read-tree ${shellQuote(wrongParentTree)} || exit $?
+  git checkout-index -a -f || exit $?
+fi
+`)
+    const result = spawnSync('git', [
+      '-c', `core.hooksPath=${guard.hooksPath}`,
+      'update-ref', 'refs/heads/main', wrongParentCommit, baseHead,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        WTM_EXPECTED_BASE: 'main',
+      },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /proposed merge commit does not use the expected merge target/i)
+    assert.equal(readFileSync(hookLog, 'utf8'), 'prepared\n')
+    assert.equal(gitOk(['write-tree'], root).stdout.trim(), wrongParentTree)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+
+    const extraParentResult = spawnSync('git', [
+      '-c', `core.hooksPath=${guard.hooksPath}`,
+      'update-ref', 'refs/heads/main', extraParentCommit, baseHead,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        WTM_EXPECTED_BASE: 'main',
+      },
+    })
+    assert.notEqual(extraParentResult.status, 0, 'a guarded two-head merge must reject a proposed commit with a third parent')
+    assert.match(extraParentResult.stderr, /exactly two parents/i)
+    assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+  } finally {
+    if (guard) rmSync(guard.hooksPath, { recursive: true, force: true })
+    gitOk(['branch', '-D', branch], root)
+    gitOk(['branch', '-D', otherBranch], root)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('集成：临时 merge hooks 保留原有 hook 链和继承配置', { skip: !HAS_GIT || process.platform === 'win32', timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const originalHooksDirectory = join(vault, 'original hooks ')
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  let worktreePath
+  const git = new GitRunner()
+  const inheritedConfigEnv = Object.fromEntries(
+    ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_PARAMETERS']
+      .map((name) => [name, process.env[name]]),
+  )
+  try {
+    assert.equal(gitOk(['config', 'core.hooksPath', originalHooksDirectory], root).status, 0)
+    const b = await begin({ root, task: 'Merge Hook Chain', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'task.txt'), 'task\n')
+    assert.equal(gitOk(['add', 'task.txt'], worktreePath).status, 0)
+    assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+
+    const hookLog = join(vault, 'hook-log')
+    const nestedHookLog = join(vault, 'nested-hook-log')
+    const referenceHookLog = join(vault, 'reference-hook-log')
+    const inheritedConfigLog = join(vault, 'inherited-config-log')
+    const inheritedParameterLog = join(vault, 'inherited-parameter-log')
+    process.env.GIT_CONFIG_COUNT = '1'
+    process.env.GIT_CONFIG_KEY_0 = 'wtm.testInheritedConfig'
+    process.env.GIT_CONFIG_VALUE_0 = 'preserved'
+    process.env.GIT_CONFIG_PARAMETERS = "'wtm.testInheritedParameter'='preserved'"
+    installHook(originalHooksDirectory, 'pre-commit', `#!/bin/sh
+printf '%s\\n' pre-commit >> ${shellQuote(hookLog)}
+`)
+    installHook(originalHooksDirectory, 'prepare-commit-msg', `#!/bin/sh
+printf '%s\\n' prepare-commit-msg >> ${shellQuote(hookLog)}
+`)
+    installHook(originalHooksDirectory, 'commit-msg', `#!/bin/sh
+printf '%s\\n' commit-msg >> ${shellQuote(hookLog)}
+git config --get wtm.testInheritedConfig > ${shellQuote(inheritedConfigLog)}
+git config --get wtm.testInheritedParameter > ${shellQuote(inheritedParameterLog)}
+git rev-parse --git-path hooks > ${shellQuote(nestedHookLog)}
+`)
+    installHook(originalHooksDirectory, 'post-merge', `#!/bin/sh
+printf '%s\\n' post-merge >> ${shellQuote(hookLog)}
+`)
+    installHook(originalHooksDirectory, 'reference-transaction', `#!/bin/sh
+printf 'phase=%s\\n' "$1" >> ${shellQuote(referenceHookLog)}
+cat >> ${shellQuote(referenceHookLog)}
+git config --get wtm.testInheritedParameter >> ${shellQuote(referenceHookLog)}
+`)
+
+    const m = await mergeTask({ root, task: 'Merge Hook Chain', mode: 'refuse', cfg, git, repo: null })
+
+    assert.equal(m.ok, true, m.error ?? '')
+    assert.equal(m.merged, true)
+    assert.equal(readFileSync(hookLog, 'utf8'), 'pre-commit\nprepare-commit-msg\ncommit-msg\npost-merge\n')
+    assert.equal(readFileSync(inheritedConfigLog, 'utf8'), 'preserved\n')
+    assert.equal(readFileSync(inheritedParameterLog, 'utf8'), 'preserved\n')
+    assert.equal(readFileSync(nestedHookLog, 'utf8'), `${originalHooksDirectory}\n`)
+    const referenceHookOutput = readFileSync(referenceHookLog, 'utf8')
+    assert.match(referenceHookOutput, /phase=prepared/)
+    assert.match(referenceHookOutput, /refs\/heads\/main/)
+    assert.match(referenceHookOutput, /preserved/)
+  } finally {
+    for (const [name, value] of Object.entries(inheritedConfigEnv)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    gitOk(['merge', '--abort'], root)
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/merge-hook-chain'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：两 token 的 -s ours 与 -X theirs 的 guard 树匹配 Git 合并结果', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  for (const scenario of [
+    { option: '-s ours', task: 'Merge Strategy Ours', oracle: 'base' },
+    { option: "-s 'ours'", task: 'Merge Quoted Strategy Ours', oracle: 'base' },
+    { option: '-X theirs', task: 'Merge X Theirs', oracle: 'merge-tree' },
+    { option: "-X 'theirs'", task: 'Merge Quoted X Theirs', oracle: 'merge-tree' },
+  ]) {
+    const root = await makeRepo()
+    const vault = makeVault()
+    const cfg = {
+      vault, prefix: 'wtm',
+      commitMessage: 'snapshot {task}',
+      mergeMessage: 'fold {task} into {base}',
+      warnings: [],
+    }
+    let worktreePath
+    const git = new GitRunner()
+    const branch = `wtm/${scenario.task.toLowerCase().replaceAll(' ', '-')}`
+    try {
+      assert.equal(gitOk(['config', 'branch.main.mergeOptions', scenario.option], root).status, 0)
+      const b = await begin({ root, task: scenario.task, cfg, git, repo: null })
+      assert.equal(b.ok, true, b.error ?? '')
+      worktreePath = /** @type {string} */ (b.path)
+      writeFileSync(join(worktreePath, 'a.txt'), 'base\n+task\n')
+      writeFileSync(join(worktreePath, 'task-only.txt'), 'task\n')
+      assert.equal(gitOk(['add', '-A'], worktreePath).status, 0)
+      assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+      writeFileSync(join(root, 'a.txt'), 'base\n+main\n')
+      assert.equal(gitOk(['add', 'a.txt'], root).status, 0)
+      assert.equal(gitOk(['commit', '-m', 'main'], root).status, 0)
+
+      const baseTree = gitOk(['rev-parse', 'HEAD^{tree}'], root).stdout.trim()
+      const expectedTree = scenario.oracle === 'base'
+        ? baseTree
+        : gitOk(['merge-tree', '--write-tree', '-X', 'theirs', 'HEAD', `refs/heads/${branch}`], root).stdout.trim().split(/\r?\n/)[0]
+      assert.ok(expectedTree)
+      const m = await mergeTask({ root, task: scenario.task, mode: 'refuse', cfg, git, repo: null })
+
+      assert.equal(m.ok, true, m.error ?? '')
+      assert.equal(m.merged, true)
+      const actualTree = gitOk(['rev-parse', 'HEAD^{tree}'], root).stdout.trim()
+      assert.equal(actualTree, expectedTree, 'guard must accept exactly the tree Git creates for the configured merge options')
+    } finally {
+      gitOk(['merge', '--abort'], root)
+      if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+      gitOk(['branch', '-D', branch], root)
+      rmSync(root, { recursive: true, force: true })
+      rmSync(vault, { recursive: true, force: true })
+    }
+  }
+})
+
+test('集成：guard 在启动 merge 前拒绝不支持的策略', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  for (const scenario of [
+    { options: '-s subtree', task: 'Merge Unsupported Strategy', error: /不支持.*策略.*subtree/i },
+    { options: '-s ours -s ort', task: 'Merge Multiple Strategies', error: /配置了多个 merge strategy/i },
+  ]) {
+    const root = await makeRepo()
+    const vault = makeVault()
+    const cfg = {
+      vault, prefix: 'wtm',
+      commitMessage: 'snapshot {task}',
+      mergeMessage: 'fold {task} into {base}',
+      warnings: [],
+    }
+    let worktreePath
+    let mergeStarted = false
+    const git = new MergeRaceGit(() => { mergeStarted = true })
+    const branch = `wtm/${scenario.task.toLowerCase().replaceAll(' ', '-')}`
+    try {
+      assert.equal(gitOk(['config', 'branch.main.mergeOptions', scenario.options], root).status, 0)
+      const b = await begin({ root, task: scenario.task, cfg, git, repo: null })
+      assert.equal(b.ok, true, b.error ?? '')
+      worktreePath = /** @type {string} */ (b.path)
+      writeFileSync(join(worktreePath, 'task-only.txt'), 'task\n')
+      assert.equal(gitOk(['add', 'task-only.txt'], worktreePath).status, 0)
+      assert.equal(gitOk(['commit', '-m', 'task'], worktreePath).status, 0)
+      writeFileSync(join(root, 'main-only.txt'), 'main\n')
+      assert.equal(gitOk(['add', 'main-only.txt'], root).status, 0)
+      assert.equal(gitOk(['commit', '-m', 'main'], root).status, 0)
+      const baseHead = gitOk(['rev-parse', 'HEAD'], root).stdout.trim()
+
+      const m = await mergeTask({ root, task: scenario.task, mode: 'refuse', cfg, git, repo: null })
+
+      assert.equal(m.ok, false)
+      assert.match(m.error ?? '', scenario.error)
+      assert.equal(mergeStarted, false, 'unsupported strategies must be rejected before git merge starts')
+      assert.equal(gitOk(['rev-parse', 'HEAD'], root).stdout.trim(), baseHead)
+    } finally {
+      gitOk(['merge', '--abort'], root)
+      if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+      gitOk(['branch', '-D', branch], root)
+      rmSync(root, { recursive: true, force: true })
+      rmSync(vault, { recursive: true, force: true })
+    }
   }
 })
 
