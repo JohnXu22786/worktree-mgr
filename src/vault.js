@@ -16,6 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   closeSync,
   existsSync,
+  fstatSync,
   futimesSync,
   linkSync,
   lstatSync,
@@ -594,18 +595,37 @@ async function acquireReclaimMarker(reclaimPath, token, staleMs, heartbeatMs, de
       fd = null
       return { path: markerPath, token, heartbeat }
     } catch (err) {
+      let creationFileStat = null
       if (fd !== null) {
-        try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+        try { creationFileStat = fstatSync(fd) } catch { /* 继续尽力清理 */ }
+        if (process.platform === 'win32') {
+          // Windows requires the handle closed before the lease path can be renamed.
+          try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+          fd = null
+        }
       }
       let cleanupError
       try {
         if (markerCreated) {
-          await releaseLeasePath(markerPath, token, heartbeat, 'reclaim marker creation cleanup failed', true)
+          await releaseLeasePath(
+            markerPath,
+            token,
+            heartbeat,
+            'reclaim marker creation cleanup failed',
+            true,
+            creationFileStat,
+          )
         } else {
           await stopLeaseHeartbeat(heartbeat)
         }
       } catch (cleanupErr) {
         cleanupError = cleanupErr
+      } finally {
+        // Keep the descriptor open through rename so its inode cannot be reused
+        // by a successor before tombstone ownership is checked.
+        if (fd !== null) {
+          try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+        }
       }
       if (cleanupError !== undefined) {
         throw new AggregateError([err, cleanupError], 'reclaim marker creation failed')
@@ -638,8 +658,9 @@ function canPublishGuard(reclaimPath, token, staleMs) {
  * @param {Worker | null} heartbeat
  * @param {string} errorMessage
  * @param {boolean} [allowEmpty]
+ * @param {import('node:fs').Stats | null} [creationFileStat]
  */
-async function releaseLeasePath(path, token, heartbeat, errorMessage, allowEmpty = false) {
+async function releaseLeasePath(path, token, heartbeat, errorMessage, allowEmpty = false, creationFileStat = null) {
   const tombstonePath = `${path}.released-${token}`
   let moved = false
   let heartbeatStopped = false
@@ -682,7 +703,21 @@ async function releaseLeasePath(path, token, heartbeat, errorMessage, allowEmpty
         }
         throw err
       }
-      if (content === token || (allowEmpty && content === '')) {
+      const isEmptyCreationFile = allowEmpty && content === ''
+      const isPartialToken = content.length > 0 && content.length < token.length && token.startsWith(content)
+      let isCreatedFile = false
+      if (creationFileStat !== null && (content === token || isEmptyCreationFile || isPartialToken)) {
+        try {
+          const tombstoneStat = lstatSync(tombstonePath)
+          isCreatedFile = tombstoneStat.dev === creationFileStat.dev && tombstoneStat.ino === creationFileStat.ino
+        } catch (err) {
+          if (/** @type {any} */ (err).code !== 'ENOENT') throw err
+        }
+      }
+      if (
+        (content === token && (creationFileStat === null || isCreatedFile)) ||
+        (isCreatedFile && (isEmptyCreationFile || isPartialToken))
+      ) {
         removeGuardArtifact(tombstonePath)
         moved = false
         return
@@ -764,19 +799,36 @@ async function acquireLeaseGuard(reclaimPath, token, staleMs, heartbeatMs, deadl
     }
     return { path: reclaimPath, token, heartbeat }
   } catch (err) {
+    let creationFileStat = null
     if (fd !== null) {
-      try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+      try { creationFileStat = fstatSync(fd) } catch { /* 继续尽力清理 */ }
+      if (process.platform === 'win32') {
+        // Windows requires the handle closed before the lease path can be renamed.
+        try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
+        fd = null
+      }
     }
     let cleanupError
-    if (guardCreated) {
-      try {
-        await releaseLeasePath(reclaimPath, token, heartbeat, 'guard creation cleanup failed', true)
-      } catch (cleanupErr) {
-        cleanupError = cleanupErr
+    try {
+      if (guardCreated) {
+        await releaseLeasePath(
+          reclaimPath,
+          token,
+          heartbeat,
+          'guard creation cleanup failed',
+          true,
+          creationFileStat,
+        )
+      } else {
+        await stopLeaseHeartbeat(heartbeat)
       }
-    } else {
-      try { await stopLeaseHeartbeat(heartbeat) } catch (stopError) {
-        cleanupError = stopError
+    } catch (cleanupErr) {
+      cleanupError = cleanupErr
+    } finally {
+      // Keep the descriptor open through rename so its inode cannot be reused
+      // by a successor before tombstone ownership is checked.
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* 继续报告原始错误 */ }
       }
     }
     if (cleanupError !== undefined) {
