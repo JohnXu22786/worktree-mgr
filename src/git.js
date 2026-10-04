@@ -112,6 +112,20 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
+ * 读取 git worktree list 的机器可读输出。
+ * Git 2.36 之前不支持 -z，遇到选项错误时回退到 legacy porcelain。
+ * @param {{run: Function}} git
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>}} [opts]
+ * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
+ */
+export async function runWorktreeList(git, opts) {
+  const nul = await git.run(['worktree', 'list', '--porcelain', '-z'], opts)
+  // Git uses exit status 129 for command-line option errors, independent of locale.
+  if (nul.ok || nul.code !== 129) return nul
+  return git.run(['worktree', 'list', '--porcelain'], opts)
+}
+
+/**
  * 解析 `git worktree list --porcelain -z` 输出（兼容原有换行分隔格式）。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}

@@ -27,7 +27,7 @@ import {
   upsertRecord,
   removeRecord,
 } from './vault.js'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath } from './git.js'
+import { runWorktreeList, parseWorktreeList, parseAheadBehind, isDirty, samePath } from './git.js'
 import { calculateMergeTree, createMergeGuard, createSnapshotGuard, readMergeOptions } from './merge-guard.js'
 import { runTriggers } from './triggers.js'
 
@@ -326,7 +326,7 @@ export async function begin(opts) {
           // A killed `worktree add` can still have registered the worktree and
           // created its branch. Keep those identifiers in the ledger instead of
           // rolling them back or leaving them discoverable only by manual search.
-          const afterInterruptedAdd = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root })
+          const afterInterruptedAdd = await runWorktreeList(git, { cwd: root })
           const registered = afterInterruptedAdd.ok
             ? parseWorktreeList(afterInterruptedAdd.stdout).find((worktree) => samePath(worktree.path, wtPath))
             : undefined
@@ -565,7 +565,7 @@ export async function listStatus(opts) {
   const vault = vaultResult.vault
   try {
     const ledger = loadLedger(vault)
-    const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+    const wl = await runWorktreeList(git, { cwd: root, signal: opts.signal })
     if (wl.aborted || isAborted(opts.signal)) return abortResult()
     if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
     const worktrees = parseWorktreeList(wl.stdout)
@@ -1032,7 +1032,7 @@ async function checkBaseState(opts, rec) {
 async function syncCore(opts, { vault, ledger, rec, mode }) {
   const { root, git, repo } = opts
   const task = rec.task
-  const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  const wl = await runWorktreeList(git, { cwd: root, signal: opts.signal })
   if (wl.aborted || isAborted(opts.signal)) return abortResult()
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
@@ -1176,7 +1176,7 @@ async function acquireWorktreeHeadLock(opts, rec) {
  */
 async function checkRegisteredWorktreeBranch(opts, rec) {
   const { root, git } = opts
-  const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  const wl = await runWorktreeList(git, { cwd: root, signal: opts.signal })
   if (wl.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const wt = parseWorktreeList(wl.stdout).find((worktree) => samePath(worktree.path, rec.path))
@@ -1220,7 +1220,7 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   }
 
   // 工作区已消失（stale：注册表缺失或目录被外部删除）：直接清记录
-  const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  const wl = await runWorktreeList(git, { cwd: root, signal: opts.signal })
   if (wl.aborted || isAborted(opts.signal)) return abortResult()
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
@@ -1479,7 +1479,7 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   // Commit and merge hooks can change the task worktree after the initial
   // validation. Bind removal to the same registered path and branch immediately
   // before cleanup; abandon restores its staged path if this check fails.
-  const latestWorktrees = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  const latestWorktrees = await runWorktreeList(git, { cwd: root, signal: opts.signal })
   if (latestWorktrees.aborted || isAborted(opts.signal)) {
     return rejectAfterWorktreeRecheck(
       `读取收尾前 worktree 列表失败：${latestWorktrees.stderr.trim() || '取消期间未完成复验'}`,
@@ -1550,7 +1550,7 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
       : ['branch', '-d', rec.branch]
   let del
   if (mode === 'commit' && restoreOnBranchDeleteFailure && mergedBranchHead) {
-    const remainingWorktrees = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+    const remainingWorktrees = await runWorktreeList(git, { cwd: root, signal: opts.signal })
     const otherWorktree = remainingWorktrees.ok
       ? parseWorktreeList(remainingWorktrees.stdout).find((other) => !samePath(other.path, rec.path) && other.branch === rec.branch)
       : undefined
