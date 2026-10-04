@@ -349,6 +349,19 @@ test('parseWorktreeList：路径内 HEAD 和 branch 字段不提前截断', () =
   }])
 })
 
+test('parseWorktreeList：路径内 HEAD 和 branch 字段在 bare 记录中不提前截断', () => {
+  const path = '/tmp/wt\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/path-text'
+  const text = [`worktree ${path}`, 'bare', ''].join('\n')
+
+  assert.deepEqual(parseWorktreeList(text), [{
+    path,
+    branch: null,
+    detached: false,
+    bare: true,
+    locked: false,
+  }])
+})
+
 test('parseWorktreeList：多行锁定原因中的 HEAD 字段不影响记录边界', () => {
   const text = [
     'worktree /tmp/wt',

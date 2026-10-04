@@ -155,9 +155,9 @@ export function parseWorktreeList(text) {
   // before it must remain part of the path. Keep the path separator LF-only
   // so a POSIX path ending in CR remains intact.
   // Likewise, a HEAD and branch pair in the path is not a boundary when the
-  // branch-like line is immediately followed by the real HEAD field.
+  // branch-like line is followed by the real HEAD field or authoritative bare marker.
   // The /m flag makes $ line-relative; use (?![\s\S]) for true EOF checks.
-  const records = [...text.matchAll(/^worktree ([\s\S]*?)\n(HEAD [0-9a-f]+(\r?)\n(?!(?:branch refs\/heads\/[^\r\n]*\r?\nHEAD [0-9a-f]+(?:\r?\n|$)))(?=(?:branch refs\/heads\/|detached(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))|bare(\r?)(?=(?:(?:\r?\n(?:locked|prunable)(?: [^\r\n]*)?)*(?:\r?\n\r?\n(?=worktree |(?![\s\S]))|\r?\n(?![\s\S])|(?![\s\S])))))/gm)]
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\n(HEAD [0-9a-f]+(\r?)\n(?!(?:branch refs\/heads\/[^\r\n]*\r?\n(?:HEAD [0-9a-f]+(?:\r?\n|$)|bare(?:\r?\n|$))))(?=(?:branch refs\/heads\/|detached(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))|bare(\r?)(?=(?:(?:\r?\n(?:locked|prunable)(?: [^\r\n]*)?)*(?:\r?\n\r?\n(?=worktree |(?![\s\S]))|\r?\n(?![\s\S])|(?![\s\S])))))/gm)]
   const hasLfRecordEnding = records.some((record) => {
     if (record[2]?.startsWith('HEAD ')) return record[3] !== '\r'
     if (record[2]?.startsWith('bare')) {
