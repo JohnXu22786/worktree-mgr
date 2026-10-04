@@ -6,8 +6,22 @@
  * 触发器失败只产生警告，绝不中断主流程。
  */
 
-import { spawn, spawnSync } from 'node:child_process'
-import { readdirSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { accessSync, constants, promises as fs, readFileSync } from 'node:fs'
+import { delimiter, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
+
+const TERM_GRACE_MS = 120
+const KILL_CONFIRM_MS = 80
+const CLEANUP_DEADLINE_MS = 700
+const HAS_SETSID = process.platform !== 'win32' && (process.env.PATH ?? '').split(delimiter).some((dir) => {
+  try {
+    accessSync(join(dir, 'setsid'), constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+})
 
 /**
  * @typedef {object} TriggerContext
@@ -20,25 +34,35 @@ import { readdirSync, readFileSync } from 'node:fs'
 
 /**
  * 顺序执行一组触发器命令。
- * @param {string[] | undefined} commands
+ * @param {unknown[] | undefined} commands
  * @param {TriggerContext} ctx
- * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal, terminate?: (child: any) => Promise<{ok: boolean, detail?: string}>}} [opts]
- *        可注入 spawn 用于测试；cwd 指定命令的工作目录（默认继承进程目录）；signal 用于中止触发器进程
- * @returns {Promise<{warnings: string[], aborted?: boolean, cleanupFailed?: boolean}>}
+ * @param {{spawn?: (shell: string, args: string[], opts: object) => object, cwd?: string, signal?: AbortSignal, platform?: NodeJS.Platform}} [opts]
+ *        可注入 spawn 用于测试；platform 可用于测试平台专属清理；cwd 指定命令的工作目录
+ *        （默认继承进程目录），signal 用于取消
+ * @returns {Promise<{warnings: string[], cancelled?: boolean, cleanupConfirmed?: boolean, cleanupError?: string}>}
  */
-export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal, terminate = terminateProcessTree } = {}) {
+export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, signal, platform = process.platform } = {}) {
   /** @type {string[]} */
   const warnings = []
-  if (!Array.isArray(commands)) return { warnings }
-  let aborted = false
-  let cleanupFailed = false
-  const isWin = process.platform === 'win32'
-  for (const cmd of commands) {
+  let completedCommand = false
+  if (signal?.aborted) return { warnings, cancelled: true, cleanupConfirmed: true }
+  if (commands === undefined) return { warnings, cleanupConfirmed: true }
+  if (!Array.isArray(commands)) {
+    warnings.push('触发器配置类型无效，必须是命令数组，已忽略')
+    return { warnings, cleanupConfirmed: true }
+  }
+  const isWin = platform === 'win32'
+  for (const [index, cmd] of commands.entries()) {
     if (signal?.aborted) {
-      aborted = true
-      break
+      return completedCommand
+        ? { warnings, cancelled: true, cleanupConfirmed: false, cleanupError: '取消在触发器 shell 关闭后才被观察到，无法排除未跟踪的 escaped 后代' }
+        : { warnings, cancelled: true, cleanupConfirmed: true }
     }
-    if (typeof cmd !== 'string' || cmd.trim() === '') continue
+    if (typeof cmd !== 'string') {
+      warnings.push(`触发器配置项无效（索引 ${index}），必须是字符串，已忽略`)
+      continue
+    }
+    if (cmd.trim() === '') continue
     const shell = isWin ? 'cmd' : 'sh'
     const args = isWin ? ['/d', '/s', '/c', cmd] : ['-c', cmd]
     const env = {
@@ -49,20 +73,32 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
       WTM_PATH: ctx.path ?? '',
       WTM_ROOT: ctx.root ?? '',
     }
-    const result = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal }, terminate)
-    if (!result.ok && !result.aborted) warnings.push(`触发器失败 [${cmd}]: ${result.detail}`)
-    if (result.cleanupFailed) {
-      cleanupFailed = true
-      warnings.push(`触发器终止失败 [${cmd}]: ${result.detail}`)
+    const priorCommandCompleted = completedCommand
+    const outcome = await runOne(spawnFn, shell, args, { env, ...(cwd ? { cwd } : {}), signal, platform })
+    if (outcome.started) completedCommand = true
+    if (outcome.cancelled) {
+      if (outcome.spawnError) warnings.push(`触发器失败 [${cmd}]: ${outcome.spawnError}`)
+      const partialOutput = [outcome.stdout?.trim(), outcome.stderr?.trim()].filter(Boolean).join('\n')
+      if (partialOutput) warnings.push(`触发器取消前输出 [${cmd}]: ${partialOutput}`)
+      const cleanupError = [
+        outcome.cleanupError,
+        priorCommandCompleted ? '此前完成的触发器命令可能仍有 escaped 后代' : undefined,
+      ].filter(Boolean).join('; ')
+      return {
+        warnings,
+        cancelled: true,
+        cleanupConfirmed: outcome.cleanupConfirmed === true && !priorCommandCompleted,
+        ...(cleanupError ? { cleanupError } : {}),
+      }
     }
-    if (result.aborted || signal?.aborted) {
-      aborted = true
-      break
+    if (!outcome.ok) warnings.push(`触发器失败 [${cmd}]: ${outcome.detail}`)
+    if (signal?.aborted) {
+      return completedCommand
+        ? { warnings, cancelled: true, cleanupConfirmed: false, cleanupError: '取消在触发器 shell 关闭后才被观察到，无法排除未跟踪的 escaped 后代' }
+        : { warnings, cancelled: true, cleanupConfirmed: true }
     }
   }
-  return aborted
-    ? { warnings, aborted: true, ...(cleanupFailed ? { cleanupFailed: true } : {}) }
-    : { warnings }
+  return { warnings, ...(!completedCommand ? { cleanupConfirmed: true } : {}) }
 }
 
 /**
@@ -70,425 +106,591 @@ export async function runTriggers(commands, ctx, { spawn: spawnFn = spawn, cwd, 
  * @param {(shell: string, args: string[], opts: object) => object} spawnFn
  * @param {string} shell
  * @param {string[]} args
- * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal}} opts
- * @param {(child: any) => Promise<{ok: boolean, detail?: string}>} terminate
- * @returns {Promise<{ok: boolean, detail: string, aborted?: boolean, cleanupFailed?: boolean}>}
+ * @param {{env: Record<string, string>, cwd?: string, signal?: AbortSignal, platform: NodeJS.Platform}} opts
+ * @returns {Promise<{ok: boolean, detail: string, started?: boolean, spawnError?: string, stdout?: string, stderr?: string, cancelled?: boolean, cleanupConfirmed?: boolean, cleanupError?: string}>}
  */
-function runOne(spawnFn, shell, args, opts, terminate) {
+function runOne(spawnFn, shell, args, opts) {
   return new Promise((resolve) => {
     /** @type {any} */
     let child
+    const { signal, platform, ...spawnOpts } = opts
+    const useSetsid = platform !== 'win32' && HAS_SETSID
+    const launchCommand = useSetsid ? 'exec setsid sh -c "$1"' : 'exec sh -c "$1"'
+    const actualArgs = platform === 'win32'
+      ? args
+      : ['-c', `IFS= read -r _wtm_start <&3 || exit 0; exec 3<&-; ${launchCommand}`, 'wtm-trigger', args.at(-1) ?? '']
+    try {
+      child = spawnFn(shell, actualArgs, {
+        ...spawnOpts,
+        windowsHide: true,
+        detached: platform !== 'win32' && !useSetsid,
+        ...(platform !== 'win32' ? { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] } : {}),
+      })
+    } catch (err) {
+      resolve({ ok: false, started: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}` })
+      return
+    }
+
     let stdout = ''
     let stderr = ''
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    let outputFlushed = false
+    let collectingOutput = true
+    let closeObserved = false
+    let exitObserved = false
+    let spawnFailed = false
+    /** @type {string | undefined} */
+    let spawnError
+    let cancellationStarted = false
     let settled = false
-    let aborting = false
-    let abortPending = false
-    let abortDetail = '操作已取消（aborted）'
-    let exitSeen = false
-    let closeSeen = false
-    let terminationStarted = false
-    let terminationDone = false
-    let terminationFailure = ''
-    /** @type {number | null} */
-    let exitCode = null
-    /** @type {string | null} */
-    let exitSignal = null
-    const signal = opts.signal
-    /** @type {() => void} */
-    let onAbort = () => {}
+    const startupGate = platform !== 'win32' && typeof child.stdio?.[3]?.end === 'function'
+      ? child.stdio[3]
+      : undefined
+    let commandStarted = startupGate === undefined
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let cleanupTimeout
+    // Process tracking is needed only when the caller can cancel this command.
+    // Keep the POSIX startup gate in place so the no-signal path still opens fd 3.
+    const processTracker = createProcessTracker(
+      signal ? child.pid : undefined,
+      platform,
+      () => !exitObserved && child.exitCode == null && child.signalCode == null,
+    )
+    const flushOutput = () => {
+      if (outputFlushed) return
+      outputFlushed = true
+      stdout += stdoutDecoder.end()
+      stderr += stderrDecoder.end()
+    }
     /**
-     * @param {{ok: boolean, detail: string, aborted?: boolean, cleanupFailed?: boolean}} result
+     * @param {{ok: boolean, detail: string, started?: boolean, spawnError?: string, stdout?: string, stderr?: string, cancelled?: boolean, cleanupConfirmed?: boolean, cleanupError?: string}} result
      */
     const done = (result) => {
-      if (!settled) {
-        settled = true
-        signal?.removeEventListener('abort', onAbort)
-        for (const stream of [child?.stdout, child?.stderr]) {
-          try { stream?.destroy?.() } catch { /* 输出流可能已经关闭 */ }
-        }
-        resolve(result)
-      }
-    }
-    const finishAborted = () => {
-      if ((aborting || signal?.aborted) && closeSeen && terminationDone) {
-        done({
-          ok: false,
-          detail: abortDetail,
-          aborted: true,
-          ...(terminationFailure ? { cleanupFailed: true } : {}),
-        })
-      }
-    }
-    const startTermination = () => {
-      if (!child || terminationStarted) return
-      terminationStarted = true
-      let termination
-      try {
-        termination = terminate(child)
-      } catch (err) {
-        termination = Promise.reject(err)
-      }
-      Promise.resolve(termination)
-        .catch((err) => ({ ok: false, detail: `终止触发器失败：${err instanceof Error ? err.message : String(err)}` }))
-        .then((result) => {
-          terminationDone = true
-          if (!result.ok) {
-            terminationFailure = result.detail || '无法确认触发器后代已终止'
-            abortDetail = `${abortDetail}；${terminationFailure}`
-          }
-          finishAborted()
-        })
-    }
-    onAbort = () => {
-      if (settled || aborting) return
-      aborting = true
-      abortPending = true
-      startTermination()
-      finishAborted()
-    }
-    // Register before spawn: Node's child_process AbortSignal handler otherwise
-    // kills the shell before we can snapshot descendants that escaped its group.
-    signal?.addEventListener('abort', onAbort, { once: true })
-    if (signal?.aborted) onAbort()
-    try {
-      child = spawnFn(shell, args, {
-        ...opts,
-        windowsHide: true,
-        ...(process.platform === 'win32' ? {} : { detached: true }),
-      })
-    } catch (err) {
-      const aborted = /** @type {Error} */ (err).name === 'AbortError' || aborting || opts.signal?.aborted
-      signal?.removeEventListener('abort', onAbort)
-      resolve({ ok: false, detail: `无法启动 shell: ${/** @type {Error} */ (err).message}`, aborted })
-      return
-    }
-    child.stdout?.on('data', (/** @type {any} */ d) => { stdout += d })
-    child.stderr?.on('data', (/** @type {any} */ d) => { stderr += d })
-    child.on('error', (/** @type {any} */ err) => {
-      if (err.name === 'AbortError' || aborting || signal?.aborted) {
-        aborting = true
-        abortDetail = `${stderr.trim() || err.message || abortDetail}`
-        startTermination()
-        finishAborted()
-        return
-      }
-      done({ ok: false, detail: `${stderr.trim() || err.message}` })
-    })
-    child.on('exit', (/** @type {any} */ code, /** @type {any} */ sig) => {
-      exitSeen = true
-      exitCode = code
-      exitSignal = sig
-      if (aborting || signal?.aborted) {
-        finishAborted()
-      }
-    })
-    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
-      closeSeen = true
-      if (exitCode === null && exitSignal === null) {
-        exitCode = code
-        exitSignal = sig
-      }
-      if (aborting || signal?.aborted) {
-        finishAborted()
-      } else if (!settled) {
-        const detail = exitCode === 0
-          ? ''
-          : `退出码 ${exitCode ?? exitSignal}: ${stderr.trim() || stdout.trim() || '无输出'}`
-        done({ ok: exitCode === 0, detail })
-      }
-    })
-    if (abortPending) startTermination()
-  })
-}
-
-/**
- * 终止触发器进程组，避免 shell 的后代在取消后继续执行。
- * @param {any} child
- * @param {{platform?: string, spawnFn?: (command: string, args: string[], opts: object) => any, killFn?: (pid: number, signal: string) => (boolean | void)}} [opts]
- * @returns {Promise<{ok: boolean, detail?: string}>}
- */
-export function terminateProcessTree(child, { platform = process.platform, spawnFn = spawn, killFn = process.kill } = {}) {
-  const pid = child?.pid
-  if (Number.isInteger(pid) && pid > 0) {
-    if (platform === 'win32') {
-      return new Promise((resolve) => {
-        let settled = false
-        /** @type {number | null | undefined} */
-        let exitCode
-        const killDirectChild = () => {
-          try {
-            if (typeof child?.kill !== 'function') return false
-            return child.kill('SIGKILL') !== false
-          } catch {
-            return false
-          }
-        }
-        const reportFailure = (/** @type {string} */ detail) => {
-          if (settled) return
-          settled = true
-          const direct = killDirectChild()
-          Promise.resolve(terminateWindowsDescendants(pid, spawnFn))
-            .then((treeResult) => {
-              const directDetail = direct
-                ? '已尝试直接终止 shell'
-                : '直接终止 shell 也失败'
-              const treeDetail = treeResult.ok
-                ? '已尝试终止 Windows 后代树，但无法确认 taskkill 失败后的完整清理'
-                : (treeResult.detail || 'Windows 后代树回退清理失败')
-              resolve({ ok: false, detail: `${detail}；${treeDetail}；${directDetail}` })
-            })
-            .catch((err) => {
-              resolve({
-                ok: false,
-                detail: `${detail}；Windows 后代树回退清理异常：${err instanceof Error ? err.message : String(err)}；` +
-                  (direct ? '已尝试直接终止 shell' : '直接终止 shell 也失败'),
-              })
-            })
-        }
-        const reportSuccess = () => {
-          if (settled) return
-          settled = true
-          resolve({ ok: true })
-        }
-        let killer
-        try {
-          killer = spawnFn('taskkill', ['/pid', String(pid), '/t', '/f'], {
-            windowsHide: true,
-            stdio: 'ignore',
-          })
-        } catch (err) {
-          reportFailure(`启动 taskkill 失败：${err instanceof Error ? err.message : String(err)}`)
-          return
-        }
-        killer.on('error', (/** @type {Error} */ err) => reportFailure(`taskkill 失败：${err.message}`))
-        killer.on('exit', (/** @type {number | null} */ code) => { exitCode = code })
-        killer.on('close', (/** @type {number | null} */ code) => {
-          const finalCode = code ?? exitCode
-          if (finalCode === 0) reportSuccess()
-          else reportFailure(`taskkill 失败（退出码 ${finalCode ?? 'unknown'}）`)
-        })
-      })
-    } else {
-      return terminatePosixProcessTree(child, pid, killFn, platform)
-    }
-  }
-  let direct = false
-  try {
-    if (typeof child?.kill === 'function') direct = child.kill('SIGKILL') !== false
-  } catch { /* 进程可能已经结束 */ }
-  return Promise.resolve(direct
-    ? { ok: true }
-    : { ok: false, detail: '无法终止触发器 shell，后代状态未知' })
-}
-
-/**
- * 终止 POSIX 触发器进程组以及可能通过 setsid 脱离进程组的后代。
- * @param {any} child
- * @param {number} pid
- * @param {(pid: number, signal: string) => (boolean | void)} killFn
- * @param {string} platform
- * @returns {Promise<{ok: boolean, detail?: string}>}
- */
-function terminatePosixProcessTree(child, pid, killFn, platform) {
-  const descendants = collectDescendantPids(pid, platform)
-  let groupError = ''
-  let groupKilled = false
-  try {
-    const result = killFn(-pid, 'SIGKILL')
-    if (result === false) throw new Error('进程组终止返回失败')
-    groupKilled = true
-  } catch (err) {
-    groupError = err instanceof Error ? err.message : String(err)
-  }
-
-  /** @type {string[]} */
-  const descendantFailures = []
-  for (const descendantPid of descendants.pids) {
-    try {
-      const result = killFn(descendantPid, 'SIGKILL')
-      if (result === false) descendantFailures.push(`${descendantPid} 返回失败`)
-    } catch (err) {
-      if (/** @type {{code?: string}} */ (err).code !== 'ESRCH') {
-        descendantFailures.push(`${descendantPid}：${err instanceof Error ? err.message : String(err)}`)
-      }
-    }
-  }
-
-  if (!groupKilled) {
-    let direct = false
-    try {
-      if (typeof child?.kill === 'function') direct = child.kill('SIGKILL') !== false
-    } catch { /* 进程可能已经结束 */ }
-    return Promise.resolve({
-      ok: false,
-      detail: `进程组终止失败：${groupError || '未知错误'}；` +
-        (direct ? '已尝试直接终止 shell，但无法确认后代已结束' : '直接终止 shell 也失败，后代状态未知'),
-    })
-  }
-  if (!descendants.complete) {
-    return Promise.resolve({
-      ok: false,
-      detail: `进程组已终止，但无法枚举脱离进程组的后代：${descendants.error || '未知错误'}`,
-    })
-  }
-  if (descendantFailures.length > 0) {
-    return Promise.resolve({
-      ok: false,
-      detail: `进程组已终止，但部分后代终止失败：${descendantFailures.join('；')}`,
-    })
-  }
-  return Promise.resolve({ ok: true })
-}
-
-/**
- * 获取指定 PID 的后代快照。Linux 优先读取 /proc，其他 POSIX 系统回退到 ps。
- * @param {number} rootPid
- * @param {string} platform
- * @returns {{pids: number[], complete: boolean, error?: string}}
- */
-function collectDescendantPids(rootPid, platform) {
-  /** @type {Map<number, number[]>} */
-  let childrenByParent
-  try {
-    if (platform === 'win32') return { pids: [], complete: true }
-    childrenByParent = readProcParentMap()
-  } catch (procErr) {
-    try {
-      childrenByParent = readPsParentMap()
-    } catch (psErr) {
-      return {
-        pids: [],
-        complete: false,
-        error: `${procErr instanceof Error ? procErr.message : String(procErr)}；` +
-          `${psErr instanceof Error ? psErr.message : String(psErr)}`,
-      }
-    }
-  }
-  /** @type {number[]} */
-  const out = []
-  /** @param {number} parent */
-  const visit = (parent) => {
-    for (const childPid of childrenByParent.get(parent) ?? []) {
-      visit(childPid)
-      out.push(childPid)
-    }
-  }
-  visit(rootPid)
-  return { pids: out, complete: true }
-}
-
-/** @returns {Map<number, number[]>} */
-function readProcParentMap() {
-  /** @type {Map<number, number[]>} */
-  const childrenByParent = new Map()
-  const entries = readdirSync('/proc', { withFileTypes: true })
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry.name)) continue
-    const pid = Number(entry.name)
-    try {
-      const stat = readFileSync(`/proc/${entry.name}/stat`, 'utf8')
-      const closeParen = stat.lastIndexOf(')')
-      if (closeParen < 0) continue
-      const fields = stat.slice(closeParen + 1).trim().split(/\s+/)
-      const parent = Number(fields[1])
-      if (!Number.isInteger(parent) || parent <= 0) continue
-      const children = childrenByParent.get(parent) ?? []
-      children.push(pid)
-      childrenByParent.set(parent, children)
-    } catch { /* 进程可能在扫描时退出 */ }
-  }
-  return childrenByParent
-}
-
-/** @returns {Map<number, number[]>} */
-function readPsParentMap() {
-  const result = spawnSync('ps', ['-eo', 'pid=,ppid='], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  })
-  if (result.status !== 0) throw new Error(`ps 退出码 ${result.status ?? 'unknown'}`)
-  /** @type {Map<number, number[]>} */
-  const childrenByParent = new Map()
-  for (const line of String(result.stdout ?? '').split(/\r?\n/)) {
-    const fields = line.trim().split(/\s+/)
-    if (fields.length < 2) continue
-    const pid = Number(fields[0])
-    const parent = Number(fields[1])
-    if (!Number.isInteger(pid) || !Number.isInteger(parent) || pid <= 0 || parent <= 0) continue
-    const children = childrenByParent.get(parent) ?? []
-    children.push(pid)
-    childrenByParent.set(parent, children)
-  }
-  return childrenByParent
-}
-
-/**
- * Windows taskkill 失败后的后代树回退。PowerShell 先按 ParentProcessId 建树，
- * 再从叶子到根强制终止，即使根 shell 已经退出也能处理遗留后代。
- * @param {number} pid
- * @param {(command: string, args: string[], opts: object) => any} spawnFn
- * @returns {Promise<{ok: boolean, detail?: string}>}
- */
-function terminateWindowsDescendants(pid, spawnFn) {
-  const script = [
-    `$root = ${pid}`,
-    '$processes = @(Get-CimInstance Win32_Process)',
-    '$ids = [System.Collections.Generic.HashSet[int]]::new()',
-    '$queue = [System.Collections.Generic.Queue[int]]::new()',
-    '$ids.Add($root) > $null',
-    '$queue.Enqueue($root)',
-    'while ($queue.Count -gt 0) {',
-    '  $parent = $queue.Dequeue()',
-    '  foreach ($process in $processes) {',
-    '    $processId = [int]$process.ProcessId',
-    '    if ([int]$process.ParentProcessId -eq $parent -and $ids.Add($processId)) {',
-    '      $queue.Enqueue($processId)',
-    '    }',
-    '  }',
-    '}',
-    '$ids | Sort-Object -Descending | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }',
-  ].join('; ')
-  return new Promise((resolve) => {
-    let cleaner
-    try {
-      cleaner = spawnFn('powershell.exe', [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        script,
-      ], {
-        windowsHide: true,
-        stdio: 'ignore',
-      })
-    } catch (err) {
-      resolve({ ok: false, detail: `启动 Windows 后代树回退失败：${err instanceof Error ? err.message : String(err)}` })
-      return
-    }
-    let settled = false
-    /** @type {number | null | undefined} */
-    let exitCode
-    /** @param {number | null | undefined} code */
-    const finish = (code) => {
       if (settled) return
       settled = true
-      if (code === 0) resolve({ ok: true })
-      else resolve({ ok: false, detail: `Windows 后代树回退退出码 ${code ?? 'unknown'}` })
+      collectingOutput = false
+      if (cleanupTimeout !== undefined) clearTimeout(cleanupTimeout)
+      signal?.removeEventListener('abort', abort)
+      processTracker.stop()
+      if (result.cancelled) {
+        child.stdout?.destroy?.()
+        child.stderr?.destroy?.()
+      }
+      resolve(result)
     }
-    try {
-      cleaner.on('error', (/** @type {Error} */ err) => {
-        if (!settled) {
-          settled = true
-          resolve({ ok: false, detail: `Windows 后代树回退失败：${err.message}` })
+    /** @param {{confirmed: boolean, error?: string}} cleanup */
+    const finishCancellation = (cleanup) => {
+      flushOutput()
+      const detail = cleanup.confirmed
+        ? '操作已取消（aborted）'
+        : `操作已取消（aborted）；触发器进程清理未能确认${cleanup.error ? `：${cleanup.error}` : ''}`
+      done({
+        ok: false,
+        detail,
+        started: commandStarted,
+        ...(spawnError ? { spawnError } : {}),
+        stdout,
+        stderr,
+        cancelled: true,
+        cleanupConfirmed: cleanup.confirmed,
+        ...(cleanup.error ? { cleanupError: cleanup.error } : {}),
+      })
+    }
+    const abort = () => {
+      if (settled || cancellationStarted) return
+      cancellationStarted = true
+      cleanupTimeout = setTimeout(() => {
+        finishCancellation({ confirmed: false, error: '触发器进程清理超时' })
+      }, CLEANUP_DEADLINE_MS)
+      if (!commandStarted) {
+        // EOF makes the gated wrapper exit before it can start the trigger command.
+        // This avoids signalling an unverified numeric PID during startup.
+        try { startupGate?.end() } catch { /* final cleanup result will report uncertainty if it stays open */ }
+      }
+      const rootStatus = async () => {
+        if (exitObserved || child.exitCode != null || child.signalCode != null) return 'exited'
+        return await processTracker.rootStatus()
+      }
+      void terminateTrigger(
+        spawnFn,
+        child,
+        processTracker,
+        () => closeObserved,
+        platform,
+        rootStatus,
+        () => commandStarted,
+        () => spawnFailed,
+      )
+        .then((/** @type {{confirmed: boolean, error?: string}} */ cleanup) => finishCancellation(cleanup))
+        .catch((err) => {
+          const message = /** @type {Error} */ (err).message
+          finishCancellation({ confirmed: false, error: message })
+        })
+    }
+
+    child.stdout?.on('data', (/** @type {any} */ data) => {
+      if (collectingOutput) stdout += stdoutDecoder.write(data)
+    })
+    child.stderr?.on('data', (/** @type {any} */ data) => {
+      if (collectingOutput) stderr += stderrDecoder.write(data)
+    })
+    child.on('error', (/** @type {any} */ err) => {
+      if (child.pid === undefined && !exitObserved) {
+        spawnFailed = true
+        commandStarted = false
+        spawnError = stderr.trim() || err.message
+      }
+      if (cancellationStarted) return
+      flushOutput()
+      done({ ok: false, started: commandStarted, detail: `${stderr.trim() || err.message}` })
+    })
+    child.on('exit', () => { exitObserved = true })
+    child.on('close', (/** @type {any} */ code, /** @type {any} */ sig) => {
+      closeObserved = true
+      if (signal?.aborted || cancellationStarted) {
+        abort()
+        return
+      }
+      flushOutput()
+      if (code === 0) {
+        done({ ok: true, started: commandStarted, detail: '' })
+      } else {
+        done({ ok: false, started: commandStarted, detail: `退出码 ${code ?? sig}: ${stderr.trim() || stdout.trim() || '无输出'}` })
+      }
+    })
+    signal?.addEventListener('abort', abort, { once: true })
+    child.stdin?.end()
+    if (signal?.aborted) {
+      abort()
+    } else if (startupGate !== undefined) {
+      void processTracker.ready().then(() => {
+        if (settled) return
+        if (signal?.aborted) {
+          abort()
+          return
         }
+        commandStarted = true
+        startupGate.end('\n')
       })
-      cleaner.on('exit', (/** @type {number | null} */ code) => {
-        exitCode = code
-        finish(code)
-      })
-      cleaner.on('close', (/** @type {number | null} */ code) => finish(code ?? exitCode))
-    } catch (err) {
-      finish(null)
-      if (err) return
     }
   })
+}
+
+/**
+ * Read Linux process identities so descendants can still be signalled after the
+ * shell exits and reparents a setsid child. Start time prevents signalling a reused PID.
+ * @param {number} pid
+ * @returns {{pid: number, ppid: number, pgrp: number, state: string, startTime: string} | undefined}
+ */
+function readProcessIdentity(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const end = stat.lastIndexOf(')')
+    if (end < 0) return undefined
+    const fields = stat.slice(end + 2).trim().split(/\s+/)
+    if (fields.length < 20) return undefined
+    return { pid, state: fields[0], ppid: Number(fields[1]), pgrp: Number(fields[2]), startTime: fields[19] }
+  } catch (err) {
+    const code = /** @type {NodeJS.ErrnoException} */ (err).code
+    if (code === 'ENOENT' || code === 'ESRCH') return undefined
+    throw err
+  }
+}
+
+/**
+ * Track process ancestry while the trigger runs. This preserves the identity of an
+ * escaped descendant after its shell exits and the OS reparents it.
+ * @param {number | undefined} rootPid
+ * @param {NodeJS.Platform} platform
+ * @param {() => boolean} rootStillRunning
+ * @returns {{enabled: boolean, ready: () => Promise<void>, refresh: () => Promise<void>, stop: () => void, stopped: () => boolean, signal: (sig: NodeJS.Signals) => Promise<string[]>, liveCount: () => Promise<number>, complete: () => boolean, groupMayExist: () => Promise<'present' | 'absent' | 'reused' | 'unverified'>, rootStatus: () => Promise<'alive' | 'exited' | 'unverified'>}}
+ */
+function createProcessTracker(rootPid, platform, rootStillRunning) {
+  const enabled = platform === 'linux' && Number.isInteger(rootPid)
+  /** @type {Map<number, string>} */
+  const descendants = new Map()
+  /** @type {Map<number, string>} */
+  const groupMembers = new Map()
+  /** @type {ReturnType<typeof setInterval> | undefined} */
+  let timer
+  /** @type {string | undefined} */
+  let rootStartTime
+  let initialRefreshAttempted = false
+  let complete = true
+  let stopped = false
+  /** @type {Promise<void> | undefined} */
+  let refreshPromise
+  /** @type {Promise<void>} */
+  let initialRefresh = Promise.resolve()
+
+  const refresh = () => {
+    if (!enabled || stopped) return Promise.resolve()
+    if (refreshPromise) return refreshPromise
+    const isInitialRefresh = !initialRefreshAttempted
+    initialRefreshAttempted = true
+    refreshPromise = (async () => {
+      /** @type {string[]} */
+      let entries
+      try {
+        entries = await fs.readdir('/proc', { encoding: 'utf8' })
+      } catch {
+        complete = false
+        return
+      }
+      /** @type {Map<number, {pid: number, ppid: number, pgrp: number, state: string, startTime: string}>} */
+      const processes = new Map()
+      const processEntries = entries.filter((entry) => /^\d+$/.test(entry))
+      for (let offset = 0; offset < processEntries.length; offset += 32) {
+        if (stopped) return
+        for (const entry of processEntries.slice(offset, offset + 32)) {
+          try {
+            const identity = readProcessIdentity(Number(entry))
+            if (identity) processes.set(identity.pid, identity)
+          } catch {
+            complete = false
+          }
+        }
+        if (offset + 32 < processEntries.length) await new Promise((resolve) => setImmediate(resolve))
+      }
+      if (stopped) return
+      const root = processes.get(/** @type {number} */ (rootPid))
+      if (isInitialRefresh && root && rootStillRunning()) {
+        rootStartTime = root.startTime
+      } else if (rootStartTime === undefined && root) {
+        // A later process at the old PID must never become the identity anchor
+        // after the initial read failed, even if its parent/group look familiar.
+        complete = false
+      }
+      const rootIdentityMatches = root !== undefined && rootStartTime !== undefined && root.startTime === rootStartTime
+      // Process-group membership catches children reparented between ancestry polls.
+      // Only adopt members while the original root identity is present: after it
+      // disappears, the numeric PGID could have been reused by an unrelated group.
+      if (rootIdentityMatches) {
+        for (const process of processes.values()) {
+          if (process.pgrp === rootPid) groupMembers.set(process.pid, process.startTime)
+        }
+      }
+      /** @type {Set<number>} */
+      const anchors = new Set()
+      if (rootIdentityMatches) anchors.add(/** @type {NonNullable<typeof root>} */ (root).pid)
+      for (const [pid, startTime] of descendants) {
+        if (processes.get(pid)?.startTime === startTime) anchors.add(pid)
+      }
+      let added = true
+      while (added) {
+        added = false
+        for (const process of processes.values()) {
+          if (!anchors.has(process.ppid) || process.pid === rootPid) continue
+          const previousStartTime = descendants.get(process.pid)
+          if (previousStartTime === undefined) {
+            descendants.set(process.pid, process.startTime)
+            anchors.add(process.pid)
+            added = true
+          } else if (previousStartTime === process.startTime && !anchors.has(process.pid)) {
+            anchors.add(process.pid)
+            added = true
+          }
+        }
+      }
+    })().finally(() => { refreshPromise = undefined })
+    return refreshPromise
+  }
+
+  if (enabled) {
+    initialRefresh = refresh()
+    timer = setInterval(() => { void refresh() }, 10)
+    timer.unref?.()
+  }
+
+  const liveIdentities = async () => {
+    if (stopped) return []
+    /** @type {Map<number, {startTime: string, pgrp: number}>} */
+    const alive = new Map()
+    let checked = 0
+    for (const [pid, startTime] of descendants) {
+      if (stopped) return []
+      try {
+        const current = readProcessIdentity(pid)
+        if (current?.startTime === startTime && current.state !== 'Z' && current.state !== 'X') {
+          alive.set(pid, { startTime, pgrp: current.pgrp })
+        }
+      } catch {
+        complete = false
+      }
+      checked += 1
+      if (checked % 32 === 0) await new Promise((resolve) => setImmediate(resolve))
+    }
+    for (const [pid, startTime] of groupMembers) {
+      if (stopped) return []
+      try {
+        const current = readProcessIdentity(pid)
+        if (current?.startTime === startTime && current.pgrp === rootPid && current.state !== 'Z' && current.state !== 'X') {
+          alive.set(pid, { startTime, pgrp: current.pgrp })
+        }
+      } catch {
+        complete = false
+      }
+      checked += 1
+      if (checked % 32 === 0) await new Promise((resolve) => setImmediate(resolve))
+    }
+    return [...alive].map(([pid, identity]) => ({ pid, ...identity }))
+  }
+  return {
+    enabled,
+    ready: () => initialRefresh,
+    refresh,
+    stop: () => {
+      stopped = true
+      if (timer !== undefined) clearInterval(timer)
+    },
+    stopped: () => stopped,
+    signal: async (/** @type {NodeJS.Signals} */ sig) => {
+      /** @type {string[]} */
+      const failures = []
+      const tracked = new Map([...descendants, ...groupMembers])
+      let index = 0
+      for (const [pid, startTime] of tracked) {
+        if (stopped) break
+        try {
+          // Recheck each PID immediately before signaling it; an earlier full-tree
+          // snapshot may be stale by the time this PID's turn arrives.
+          const current = readProcessIdentity(pid)
+          if (!current || current.startTime !== startTime || current.state === 'Z' || current.state === 'X') continue
+          process.kill(pid, sig)
+        } catch (err) {
+          if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'ESRCH') {
+            complete = false
+            failures.push(`${pid}: ${errorText(err)}`)
+          }
+        }
+        index += 1
+        if (index % 32 === 0) await new Promise((resolve) => setImmediate(resolve))
+      }
+      return failures
+    },
+    liveCount: async () => (await liveIdentities()).length,
+    complete: () => complete,
+    rootStatus: async () => {
+      if (!enabled || rootPid === undefined) return 'alive'
+      if (rootStartTime === undefined) {
+        complete = false
+        return 'unverified'
+      }
+      // Read just the direct child so a slow whole-tree snapshot cannot delay
+      // its best-effort termination. Group and descendant signals still use
+      // their own start-time and membership checks.
+      try {
+        const root = readProcessIdentity(rootPid)
+        if (!root) return 'exited'
+        return root.startTime !== rootStartTime || root.state === 'Z' || root.state === 'X'
+          ? 'exited'
+          : 'alive'
+      } catch {
+        complete = false
+        return 'unverified'
+      }
+    },
+    groupMayExist: async () => {
+      if (!enabled || rootPid === undefined) return 'absent'
+      await refresh()
+      if (stopped) return 'unverified'
+      let root
+      try {
+        root = readProcessIdentity(rootPid)
+      } catch {
+        complete = false
+        return 'unverified'
+      }
+      if (root && rootStartTime === undefined) return 'unverified'
+      if (root && rootStartTime !== undefined && root.startTime !== rootStartTime) return 'reused'
+      if (root && root.pgrp === rootPid && root.state !== 'Z' && root.state !== 'X') return 'present'
+      const live = await liveIdentities()
+      if (stopped) return 'unverified'
+      if (live.some((descendant) => descendant.pgrp === rootPid)) return 'present'
+      if (!root || !complete) return 'unverified'
+      return complete ? 'absent' : 'unverified'
+    },
+  }
+}
+
+/** @param {unknown} err */
+function errorText(err) {
+  const error = /** @type {NodeJS.ErrnoException} */ (err)
+  return error.code ?? error.message ?? String(err)
+}
+
+/** @param {any} child @param {() => boolean} isClosed @param {number} timeoutMs @returns {Promise<boolean>} */
+function waitForClose(child, isClosed, timeoutMs) {
+  if (isClosed()) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    /** @type {ReturnType<typeof setTimeout>} */
+    let timer
+    const onClose = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    timer = setTimeout(() => {
+      child.removeListener?.('close', onClose)
+      resolve(false)
+    }, timeoutMs)
+    child.once?.('close', onClose)
+    if (isClosed()) onClose()
+  })
+}
+
+/**
+ * Terminate the shell process group and the descendants captured while it was alive.
+ * The latter includes setsid children that have left the shell's process group.
+ * @param {(shell: string, args: string[], opts: object) => object} spawnFn
+ * @param {any} child
+ * @param {ReturnType<typeof createProcessTracker>} processTracker
+ * @param {() => boolean} isClosed
+ * @param {NodeJS.Platform} platform
+ * @param {() => Promise<'alive' | 'exited' | 'unverified'>} rootStatus
+ * @param {() => boolean} commandStarted
+ * @param {() => boolean} spawnFailed
+ * @returns {Promise<{confirmed: boolean, error?: string}>}
+ */
+async function terminateTrigger(spawnFn, child, processTracker, isClosed, platform, rootStatus, commandStarted, spawnFailed) {
+  if (!commandStarted()) {
+    const closed = await waitForClose(child, isClosed, CLEANUP_DEADLINE_MS)
+    return closed
+      ? { confirmed: true }
+      : { confirmed: false, error: '触发器启动 wrapper 在关闭 startup gate 后仍未退出' }
+  }
+  /** @type {string[]} */
+  const failures = []
+  const pid = Number.isInteger(child.pid) ? child.pid : undefined
+  const isWin = platform === 'win32'
+  /** @param {number} target @param {NodeJS.Signals} sig */
+  const signalPid = (target, sig) => {
+    try {
+      process.kill(target, sig)
+      return true
+    } catch (err) {
+      const code = /** @type {NodeJS.ErrnoException} */ (err).code
+      if (code === 'ESRCH') return true
+      failures.push(`${sig} ${target}: ${errorText(err)}`)
+      return false
+    }
+  }
+  /** @param {NodeJS.Signals} sig */
+  const signalGroup = async (sig) => {
+    if (isWin || pid === undefined || !commandStarted()) return true
+    if (!processTracker.enabled && await rootStatus() === 'exited') {
+      failures.push(`${sig} process group root exited; skipped unverified group signal`)
+      return false
+    }
+    if (processTracker.enabled) {
+      try {
+        const exists = await processTracker.groupMayExist()
+        if (exists === 'reused') {
+          failures.push(`${sig} process group root PID was reused; skipped group signal`)
+          return false
+        }
+        if (exists === 'unverified') {
+          failures.push(`${sig} process group root identity could not be verified; skipped group signal`)
+          return false
+        }
+        if (exists === 'absent') return true
+      } catch (err) {
+        failures.push(`${sig} process group inspection: ${errorText(err)}`)
+        return false
+      }
+    }
+    return signalPid(-pid, sig)
+  }
+  /** @param {NodeJS.Signals} sig */
+  const signalChild = async (sig) => {
+    if (spawnFailed()) return true
+    // ChildProcess.kill() targets its stored numeric PID. If that PID has been
+    // reused after the shell exits, skip it instead of signalling an unrelated process.
+    const status = await rootStatus()
+    if (status === 'exited') return true
+    if (status === 'unverified') {
+      failures.push(`${sig} child identity could not be verified; skipped numeric PID signal`)
+      return false
+    }
+    try {
+      const sent = child.kill?.(sig)
+      if (sent === false && child.exitCode === null && child.signalCode === null) {
+        failures.push(`${sig} child: kill returned false`)
+        return false
+      }
+      return true
+    } catch (err) {
+      const code = /** @type {NodeJS.ErrnoException} */ (err).code
+      if (code === 'ESRCH') return true
+      failures.push(`${sig} child: ${errorText(err)}`)
+      return false
+    }
+  }
+  const signalDescendants = async (/** @type {NodeJS.Signals} */ sig) => {
+    if (!commandStarted()) return
+    try {
+      for (const failure of await processTracker.signal(sig)) failures.push(`${sig} descendants: ${failure}`)
+    } catch (err) {
+      failures.push(`${sig} descendants: ${errorText(err)}`)
+    }
+  }
+
+  if (isWin) {
+    const rootAlreadyExited = await rootStatus() === 'exited'
+    if (!rootAlreadyExited && !isClosed()) await signalChild('SIGKILL')
+    await delay(KILL_CONFIRM_MS)
+    if (pid === undefined && spawnFailed() && isClosed()) return { confirmed: true }
+    if (!isClosed()) failures.push('触发器输出管道仍未关闭')
+    const treeCleanupError = rootAlreadyExited
+      ? '触发器 shell 已退出，跳过可能已复用的 PID 进程树清理'
+      : '无法验证 Windows 触发器进程树的 PID 身份，已跳过数字 PID 清理'
+    return { confirmed: false, error: [treeCleanupError, ...failures].join('; ') }
+  }
+
+  const rootAlreadyExited = await rootStatus() === 'exited'
+  await signalChild('SIGTERM')
+  await signalDescendants('SIGTERM')
+  const escalation = delay(TERM_GRACE_MS).then(async () => {
+    await signalChild('SIGKILL')
+    await signalDescendants('SIGKILL')
+  })
+  await processTracker.refresh()
+  await signalGroup('SIGTERM')
+  await signalDescendants('SIGTERM')
+  await delay(TERM_GRACE_MS)
+  await escalation
+
+  await processTracker.refresh()
+  await signalGroup('SIGKILL')
+  await signalDescendants('SIGKILL')
+  await delay(KILL_CONFIRM_MS)
+  await processTracker.refresh()
+
+  const noLiveDescendants = await processTracker.liveCount() === 0
+  const signalsHandled = failures.length === 0 || spawnFailed()
+  const cannotInspectEscapedDescendants = !processTracker.enabled
+  const commandWasStarted = commandStarted()
+  const escapedDescendantsPossible = commandWasStarted && (processTracker.enabled || cannotInspectEscapedDescendants)
+  const confirmed = processTracker.enabled
+    ? processTracker.complete() && noLiveDescendants && signalsHandled && isClosed() && !escapedDescendantsPossible
+    : isClosed() && signalsHandled && !escapedDescendantsPossible
+  if (confirmed) return { confirmed: true }
+
+  if (processTracker.enabled && !processTracker.complete()) failures.push('无法完整检查触发器后代进程')
+  if (!noLiveDescendants) failures.push('触发器后代进程仍可能存活')
+  if (!isClosed()) failures.push('触发器输出管道仍未关闭，无法确认所有进程已终止')
+  if (!signalsHandled) failures.push('无法确认触发器进程已终止')
+  if (rootAlreadyExited && !spawnFailed()) {
+    failures.push('触发器 shell 在取消前已退出，无法排除未跟踪的 escaped 后代')
+  }
+  if (processTracker.enabled && commandWasStarted && !rootAlreadyExited && !spawnFailed()) {
+    failures.push('触发器命令已启动，无法排除未跟踪的 escaped 后代')
+  }
+  if (cannotInspectEscapedDescendants && commandWasStarted && !spawnFailed()) failures.push('此 POSIX 平台无法检查 escaped 后代，不能确认清理')
+  return { confirmed: false, error: failures.join('; ') || '触发器进程仍可能存活' }
+}
+
+/** @param {number} ms */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }

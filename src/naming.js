@@ -7,10 +7,11 @@
  *   2. validateBranch 完整实现 git 的 ref 规则，作为显式分支参数的边界校验。
  */
 
-const MAX_BRANCH_LENGTH = 255
+const MAX_BRANCH_BYTES = 255
 const MAX_SLUG_LENGTH = 60
-const MIN_SLUG_UTF16_LENGTH = 2
+const MIN_SLUG_UTF8_BYTES = 4
 const MAX_TASK_LENGTH = 200
+const WINDOWS_DEVICE_NAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/u
 
 /**
  * @param {string} slug
@@ -26,19 +27,30 @@ function normalizeTruncatedSlug(slug) {
     .filter((seg) => seg !== '')
     .join('/')
     .replace(/-+/g, '-')
-    .replace(/^[-.]+|[-.]+$/g, '')
+    .replace(/^[-./]+|[-./]+$/g, '')
 }
 
 /**
  * @param {string} value
- * @param {number} maxLength
+ * @returns {number}
+ */
+function utf8ByteLength(value) {
+  return Buffer.byteLength(value, 'utf8')
+}
+
+/**
+ * @param {string} value
+ * @param {number} maxBytes
  * @returns {string}
  */
-function truncateByUtf16Length(value, maxLength) {
+function truncateByUtf8Bytes(value, maxBytes) {
   let result = ''
+  let length = 0
   for (const ch of value) {
-    if (result.length + ch.length > maxLength) break
+    const chLength = utf8ByteLength(ch)
+    if (length + chLength > maxBytes) break
     result += ch
+    length += chLength
   }
   return result
 }
@@ -90,9 +102,9 @@ export function slugifyTask(task) {
  */
 export function deriveBranch(task, prefix = 'wtm') {
   const slug = slugifyTask(task)
-  const maxSlugLength = MAX_BRANCH_LENGTH - prefix.length - 1
-  const boundedSlug = slug.length > maxSlugLength
-    ? normalizeTruncatedSlug(truncateByUtf16Length(slug, maxSlugLength))
+  const maxSlugBytes = MAX_BRANCH_BYTES - utf8ByteLength(prefix) - 1
+  const boundedSlug = utf8ByteLength(slug) > maxSlugBytes
+    ? normalizeTruncatedSlug(truncateByUtf8Bytes(slug, maxSlugBytes))
     : slug
   return `${prefix}/${boundedSlug}`
 }
@@ -105,8 +117,8 @@ export function deriveBranch(task, prefix = 'wtm') {
 export function validateBranch(branch) {
   if (typeof branch !== 'string') return { ok: false, reason: '分支名必须是字符串' }
   if (branch.length === 0) return { ok: false, reason: '分支名为空' }
-  if (branch.length > MAX_BRANCH_LENGTH) {
-    return { ok: false, reason: `分支名超过 ${MAX_BRANCH_LENGTH} 字符` }
+  if (utf8ByteLength(branch) > MAX_BRANCH_BYTES) {
+    return { ok: false, reason: `分支名超过 ${MAX_BRANCH_BYTES} 字节` }
   }
   if (branch.startsWith('-')) return { ok: false, reason: '分支名不能以 - 开头' }
   if (branch.startsWith('/')) return { ok: false, reason: '分支名不能以 / 开头' }
@@ -116,8 +128,8 @@ export function validateBranch(branch) {
   if (branch.includes('//')) return { ok: false, reason: '分支名不能包含连续 /' }
   if (branch.includes('..')) return { ok: false, reason: '分支名不能包含 ..' }
   if (branch.includes('@{')) return { ok: false, reason: '分支名不能包含 @{' }
-  // git check-ref-format 拒绝整个 refname 为单独的 @（它是 HEAD 的简写）
-  if (branch === '@') return { ok: false, reason: '分支名不能是单独的 @' }
+  // HEAD 是 Git 的保留伪引用，不能作为分支名
+  if (branch === 'HEAD') return { ok: false, reason: '分支名不能是保留的 HEAD' }
   // 逐字符黑名单：空格、~ ^ : ? * [ \、控制字符
   for (const ch of branch) {
     if (/\s/u.test(ch)) return { ok: false, reason: `分支名不能包含空白字符: ${JSON.stringify(ch)}` }
@@ -139,9 +151,10 @@ export function validateBranch(branch) {
  */
 export function validatePrefix(prefix) {
   const r = validateBranch(prefix)
-  if (!r.ok) return r
+  // HEAD is reserved only as a complete branch name, not as a prefix such as HEAD/task.
+  if (!r.ok && prefix !== 'HEAD') return r
   if (prefix.includes('/')) return { ok: false, reason: '前缀必须是单段，不能包含 /' }
-  if (prefix.length > MAX_BRANCH_LENGTH - 1 - MIN_SLUG_UTF16_LENGTH) {
+  if (utf8ByteLength(prefix) > MAX_BRANCH_BYTES - 1 - MIN_SLUG_UTF8_BYTES) {
     return { ok: false, reason: '前缀过长，无法为派生 slug 留出空间' }
   }
   return { ok: true }
@@ -158,6 +171,12 @@ export function validateTask(task) {
   }
   if (task.length > MAX_TASK_LENGTH) {
     return { ok: false, reason: `任务名超过 ${MAX_TASK_LENGTH} 字符` }
+  }
+  const deviceName = slugifyTask(task)
+    .split('/')
+    .find((segment) => WINDOWS_DEVICE_NAME_RE.test(segment))
+  if (deviceName) {
+    return { ok: false, reason: `任务名会生成 Windows 保留设备名工作区目录: ${deviceName}` }
   }
   return { ok: true }
 }

@@ -1,9 +1,11 @@
 import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, unlinkSync, statSync, lstatSync, symlinkSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep, toNamespacedPath } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   VaultError,
   repoSlug,
@@ -11,6 +13,7 @@ import {
   loadLedger,
   saveLedger,
   withLock,
+  isWithin,
   findRecord,
   upsertRecord,
   removeRecord,
@@ -20,6 +23,144 @@ import {
 function makeTmp() {
   const dir = mkdtempSync(join(tmpdir(), 'wtm-vault-test-'))
   return dir
+}
+
+/**
+ * @param {string} dir
+ * @param {string} mode
+ * @returns {Promise<{code: number | null, signal: NodeJS.Signals | null, stderr: string, timedOut: boolean}>}
+ */
+function runLockChild(dir, mode) {
+  const childScript = `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+    import { join } from 'node:path'
+    import { pathToFileURL } from 'node:url'
+
+    const dir = process.env.WTM_TEST_VAULT_DIR
+    const lockPath = join(dir, '.lock')
+    const sourcePath = process.env.WTM_TEST_VAULT_SOURCE
+    const originalStatSync = fs.statSync
+    const originalRenameSync = fs.renameSync
+    const originalWriteFileSync = fs.writeFileSync
+    const originalUtimesSync = fs.utimesSync
+
+    if (process.env.WTM_TEST_LOCK_MODE === 'stat') {
+      fs.statSync = (target, ...args) => {
+        if (target === lockPath) {
+          const error = new Error('simulated stat failure')
+          error.code = 'EIO'
+          throw error
+        }
+        return originalStatSync(target, ...args)
+      }
+    }
+    if (process.env.WTM_TEST_LOCK_MODE === 'reclaim') {
+      fs.renameSync = (source, target, ...args) => {
+        if (source === lockPath && target.includes('.stale-')) {
+          const error = new Error('simulated stale artifact reclaim failure')
+          error.code = 'EIO'
+          throw error
+        }
+        return originalRenameSync(source, target, ...args)
+      }
+    }
+    if (process.env.WTM_TEST_LOCK_MODE === 'recreate') {
+      fs.renameSync = (source, target, ...args) => {
+        const result = originalRenameSync(source, target, ...args)
+        if (source === lockPath && target.includes('.stale-')) {
+          const staleTime = new Date(Date.now() - 60_000)
+          originalWriteFileSync(lockPath, 'recreated stale lock', 'utf8')
+          originalUtimesSync(lockPath, staleTime, staleTime)
+        }
+        return result
+      }
+    }
+    syncBuiltinESMExports()
+
+    const { withLock } = await import(pathToFileURL(sourcePath).href)
+    try {
+      await withLock(dir, async () => {}, { timeoutMs: 100, staleMs: 10 })
+      console.error('lock unexpectedly acquired')
+      process.exitCode = 1
+    } catch (error) {
+      if (error?.name !== 'VaultError') {
+        console.error(error)
+        process.exitCode = 2
+      }
+    }
+  `
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+      env: {
+        ...process.env,
+        WTM_TEST_VAULT_DIR: dir,
+        WTM_TEST_VAULT_SOURCE: fileURLToPath(new URL('../src/vault.js', import.meta.url)),
+        WTM_TEST_LOCK_MODE: mode,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+    }, 1000)
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('close', (code, signal) => {
+      clearTimeout(timer)
+      resolve({ code, signal, stderr, timedOut })
+    })
+  })
+}
+
+/**
+ * @param {string} path
+ * @param {number} [timeoutMs]
+ */
+async function waitForFile(path, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${path}`)
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
+/**
+ * @param {string[]} paths
+ * @param {number} [timeoutMs]
+ */
+async function waitForAnyFile(paths, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (!paths.some((path) => existsSync(path))) {
+    if (Date.now() >= deadline) throw new Error(`等待测试标记超时：${paths.join(', ')}`)
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
+/**
+ * @returns {{wasInjected: () => boolean, partialToken: () => string | null}}
+ */
+function injectPartialLeaseTokenWriteFailure() {
+  const originalWriteFileSync = fs.writeFileSync
+  let injected = false
+  /** @type {string | null} */
+  let partialToken = null
+  /** @type {typeof fs.writeFileSync} */
+  const writeFileSyncWithPartialFailure = (...args) => {
+    const [target, data] = args
+    if (!injected && typeof target === 'number' && typeof data === 'string' && /^\d+-[a-f0-9]{16}$/.test(data)) {
+      partialToken = data.slice(0, 4)
+      originalWriteFileSync(target, partialToken)
+      injected = true
+      throw Object.assign(new Error('simulated partial token write failure'), { code: 'EIO' })
+    }
+    return originalWriteFileSync(...args)
+  }
+  mock.method(fs, 'writeFileSync', writeFileSyncWithPartialFailure)
+  syncBuiltinESMExports()
+  return { wasInjected: () => injected, partialToken: () => partialToken }
 }
 
 test('repoSlug：仓库名 + 路径哈希，同名仓库不同路径区分', () => {
@@ -34,7 +175,113 @@ test('resolveVault：显式 vault 生效（相对路径以仓库路径解析）'
   const rootPath = process.platform === 'win32' ? 'C:/repo' : '/repo'
   assert.equal(resolveVault({ rootPath: 'C:/repo', vault: 'D:/v' }), 'D:/v')
   assert.equal(resolveVault({ rootPath, vault: './v' }), join(rootPath, 'v'))
+  assert.equal(resolveVault({ rootPath, vault: '.' }), resolve(rootPath))
+  assert.equal(resolveVault({ rootPath, vault: './' }), resolve(rootPath))
+  assert.equal(resolveVault({ rootPath, vault: 'D:foo' }), resolve(rootPath, 'D:foo'))
+  const withParent = `link${sep}..${sep}vault`
+  assert.equal(
+    resolveVault({ rootPath, vault: withParent }),
+    `${resolve(rootPath)}${sep}${withParent}`,
+  )
   assert.equal(resolveVault({ rootPath, vault: '' }), null) // 空串视为未设置
+})
+
+test('isWithin：POSIX 下反斜杠是文件名字符而非路径分隔符', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const externalVault = join(dir, 'repo\\vault')
+  mkdirSync(root)
+  mkdirSync(externalVault)
+  assert.equal(isWithin(root, externalVault), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：指向仓库内缺失路径的悬空符号链接仍视为位于仓库内', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const link = join(dir, 'vault-link')
+  mkdirSync(root)
+  symlinkSync(join(root, 'future-vault'), link)
+  assert.equal(isWithin(root, link), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：符号链接和 .. 的路径解析与平台文件系统语义一致', () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const outside = join(dir, 'outside')
+  const link = join(outside, 'link')
+  mkdirSync(root)
+  mkdirSync(join(root, 'inside'))
+  mkdirSync(outside)
+  symlinkSync(join(root, 'inside'), link, process.platform === 'win32' ? 'junction' : 'dir')
+
+  const vault = `${link}${sep}..${sep}vault`
+  mkdirSync(vault)
+  const followsLinkBeforeParent = process.platform !== 'win32'
+  assert.equal(existsSync(join(root, 'vault')), followsLinkBeforeParent)
+  assert.equal(existsSync(join(outside, 'vault')), !followsLinkBeforeParent)
+  assert.equal(isWithin(root, vault), followsLinkBeforeParent)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：Windows 下识别扩展长度路径别名', { skip: process.platform !== 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const target = join(root, 'vault')
+  mkdirSync(root)
+  mkdirSync(target)
+  try {
+    assert.equal(isWithin(root, toNamespacedPath(target)), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('isWithin：相对符号链接目标从符号链接目录解析', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const outside = join(dir, 'outside')
+  const link = join(outside, 'link')
+  mkdirSync(root)
+  mkdirSync(join(root, 'inside'))
+  mkdirSync(outside)
+  symlinkSync('../repo/inside', link)
+
+  const vault = `${link}${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(root, 'vault')), true)
+  assert.equal(existsSync(join(outside, 'vault')), false)
+  assert.equal(isWithin(root, vault), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：重复解析符号链接时仍处理后续 ..，拒绝仓库外路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const link = join(root, 'link')
+  mkdirSync(root)
+  symlinkSync(root, link)
+
+  const vault = `${link}${sep}link${sep}..${sep}vault`
+  mkdirSync(vault)
+  assert.equal(existsSync(join(dir, 'vault')), true)
+  assert.equal(existsSync(join(root, 'vault')), false)
+  assert.equal(isWithin(root, vault), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('isWithin：符号链接循环时拒绝未解析路径', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTmp()
+  const root = join(dir, 'repo')
+  const first = join(root, 'first')
+  const second = join(root, 'second')
+  mkdirSync(root)
+  symlinkSync('second', first)
+  symlinkSync('first', second)
+
+  assert.equal(isWithin(root, `${first}${sep}vault`), false)
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test('loadLedger：缺失时返回空账本，不创建文件', () => {
@@ -180,6 +427,147 @@ test('withLock：竞争时等待对方释放（并发交错）', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('withLock：等待期间 signal 中止时立即抛出 AbortError', async () => {
+  const dir = makeTmp()
+  let firstInside = false
+  /** @type {((value?: unknown) => void) | undefined} */
+  let release
+  const gate = new Promise((r) => { release = r })
+  const p1 = withLock(dir, async () => {
+    firstInside = true
+    await gate
+  })
+  while (!firstInside) await new Promise((r) => setTimeout(r, 5))
+
+  const ac = new AbortController()
+  let p2Ran = false
+  const p2 = withLock(dir, async () => { p2Ran = true }, {
+    timeoutMs: 5000,
+    signal: ac.signal,
+  })
+  await new Promise((r) => setTimeout(r, 50))
+  ac.abort()
+
+  await assert.rejects(p2, (error) => error instanceof Error && error.name === 'AbortError')
+  assert.equal(p2Ran, false)
+  assert.ok(release, 'release 应已赋值')
+  release()
+  await p1
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：signal 中止会打断持锁文件的重试等待', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  writeFileSync(lockPath, 'legacy-lock-token')
+  const ac = new AbortController()
+  const originalRenameSync = fs.renameSync
+  let abortedAt = 0
+  ac.signal.addEventListener('abort', () => { abortedAt = Date.now() }, { once: true })
+  mock.method(fs, 'renameSync', (
+    /** @type {string} */ source,
+    /** @type {string} */ target,
+  ) => {
+    const result = originalRenameSync(source, target)
+    if (source === reclaimPath && target.includes('.released-')) {
+      queueMicrotask(() => ac.abort())
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 5000, staleMs: 60_000, signal: ac.signal }),
+      (error) => error instanceof Error && error.name === 'AbortError',
+    )
+    assert.ok(abortedAt > 0, 'test should abort after the first guard is released')
+    assert.ok(Date.now() - abortedAt < 50, 'abort should not wait for the retry delay')
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('withLock：重试陈旧 reclaim marker 时 signal 中止可及时生效', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const markerPath = `${reclaimPath}.reclaiming`
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(reclaimPath, 'stale-guard-token')
+  utimesSync(reclaimPath, past, past)
+
+  const originalOpenSync = fs.openSync
+  const originalWriteFileSync = fs.writeFileSync
+  const originalUtimesSync = fs.utimesSync
+  let markerAttempts = 0
+  mock.method(fs, 'openSync', (
+    /** @type {string} */ target,
+    /** @type {string | number} */ flags,
+    /** @type {number | undefined} */ mode,
+  ) => {
+    if (target === markerPath && flags === 'wx') {
+      markerAttempts += 1
+      originalWriteFileSync(markerPath, 'stale-marker-token')
+      originalUtimesSync(markerPath, past, past)
+      throw Object.assign(new Error('simulated stale marker collision'), { code: 'EEXIST' })
+    }
+    return originalOpenSync(target, flags, mode)
+  })
+  syncBuiltinESMExports()
+  const ac = new AbortController()
+  const pending = withLock(dir, async () => {}, {
+    timeoutMs: 1500,
+    staleMs: 10,
+    heartbeatMs: 10,
+    signal: ac.signal,
+  })
+
+  try {
+    const attemptsDeadline = Date.now() + 500
+    while (markerAttempts < 2 && Date.now() < attemptsDeadline) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    assert.ok(markerAttempts >= 2, 'stale marker should be retried before abort')
+    const abortedAt = Date.now()
+    ac.abort()
+    await assert.rejects(pending, (error) => error instanceof Error && error.name === 'AbortError')
+    assert.ok(Date.now() - abortedAt < 250, 'abort should not wait for the lock timeout')
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('withLock：锁获取后 signal 中止时不执行临界区并释放锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const ac = new AbortController()
+  const originalLinkSync = fs.linkSync
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = originalLinkSync(source, target)
+    ac.abort()
+    return result
+  })
+  syncBuiltinESMExports()
+  let ran = false
+  try {
+    await assert.rejects(
+      withLock(dir, async () => { ran = true }, { signal: ac.signal }),
+      (error) => error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(ran, false)
+  assert.equal(existsSync(lockPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('withLock：超时抛出 VaultError', async () => {
   const dir = makeTmp()
   mkdirSync(dir, { recursive: true })
@@ -192,16 +580,596 @@ test('withLock：超时抛出 VaultError', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('withLock：过期锁被回收（stale）', async () => {
+test('withLock：statSync 持续失败时仍遵守 timeout', async () => {
+  const dir = makeTmp()
+  writeFileSync(join(dir, '.lock'), String(process.pid))
+  const result = await runLockChild(dir, 'stat')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：悬空 .lock 符号链接仍遵守 timeout', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  symlinkSync(join(dir, 'missing-lock-target'), join(dir, '.lock'))
+  const result = await runLockChild(dir, 'normal')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：回收锁删除失败时仍遵守 timeout', async () => {
   const dir = makeTmp()
   const lockPath = join(dir, '.lock')
   writeFileSync(lockPath, String(process.pid))
   const past = new Date(Date.now() - 60_000)
+  utimesSync(lockPath, past, past)
+  const result = await runLockChild(dir, 'reclaim')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：stale 锁持续被重新创建时仍遵守 timeout', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  writeFileSync(lockPath, String(process.pid))
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(lockPath, past, past)
+  const result = await runLockChild(dir, 'recreate')
+  assert.equal(result.timedOut, false, `子进程不应无限自旋：${result.stderr}`)
+  assert.equal(result.code, 0, result.stderr)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：恢复新鲜 stale tombstone 时不覆盖后继锁', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const successorToken = 'successor-lock-token'
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'stale-lock-token')
+  utimesSync(lockPath, past, past)
+
+  const originalRenameSync = fs.renameSync
+  const originalLinkSync = fs.linkSync
+  const originalUtimesSync = fs.utimesSync
+  let tombstoneMadeFresh = false
+  let successorPublished = false
+  const publishSuccessor = (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorPublished && target === lockPath && source.startsWith(`${lockPath}.stale-`)) {
+      successorPublished = true
+      writeFileSync(target, successorToken)
+    }
+  }
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    const result = originalRenameSync(source, target)
+    if (!tombstoneMadeFresh && source === lockPath && target.startsWith(`${lockPath}.stale-`)) {
+      tombstoneMadeFresh = true
+      const now = new Date()
+      originalUtimesSync(target, now, now)
+    }
+    return result
+  })
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    return originalLinkSync(source, target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 1000, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(tombstoneMadeFresh, true)
+  assert.equal(successorPublished, true)
+  assert.equal(readFileSync(lockPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：崩溃留下的空 guard 不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  mkdirSync(reclaimPath)
+  writeFileSync(join(reclaimPath, 'reclaiming'), 'legacy-reclaimer')
+  const past = new Date(Date.now() - 120_000)
+  utimesSync(reclaimPath, past, past)
+
+  let ran = false
+  await withLock(dir, async () => { ran = true }, { timeoutMs: 1000, staleMs: 60_000 })
+  assert.equal(ran, true)
+  assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：guard token 部分写入失败后不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(existsSync(reclaimPath), false)
+
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 })
+  assert.equal(acquired, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：reclaim marker token 部分写入失败后不阻塞后续获取', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const markerPath = `${reclaimPath}.reclaiming`
+  writeFileSync(reclaimPath, 'stale-guard-token')
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(reclaimPath, past, past)
+
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 1000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(existsSync(markerPath), false)
+
+  let acquired = false
+  await withLock(dir, async () => { acquired = true }, { timeoutMs: 500, staleMs: 1000, heartbeatMs: 10 })
+  assert.equal(acquired, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：部分 token 清理时保留被替换的后继 guard', async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const originalWriteFileSync = fs.writeFileSync
+  const originalRenameSync = fs.renameSync
+  const writeFailure = injectPartialLeaseTokenWriteFailure()
+  let successorReplaced = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorReplaced && source === reclaimPath && target.startsWith(`${reclaimPath}.released-`)) {
+      successorReplaced = true
+      unlinkSync(source)
+      const successorBytes = writeFailure.partialToken()
+      assert.ok(successorBytes)
+      originalWriteFileSync(source, successorBytes)
+    }
+    return originalRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 250, staleMs: 5000, heartbeatMs: 10 }),
+      (error) => /** @type {NodeJS.ErrnoException} */ (error).code === 'EIO',
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(writeFailure.wasInjected(), true)
+  assert.equal(successorReplaced, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), writeFailure.partialToken())
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放清理失败时显式失败且不遗留锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const cleanupError = Object.assign(new Error('guard cleanup failed'), { code: 'EIO' })
+  const bodyError = new Error('body failed')
+  const realRenameSync = fs.renameSync
+  let failCleanup = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (failCleanup && source === reclaimPath && target.includes('.released-')) throw cleanupError
+    return realRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {
+        failCleanup = true
+        throw bodyError
+      }),
+      (error) => error instanceof AggregateError &&
+        error.errors.includes(bodyError) && error.errors.includes(cleanupError),
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(lockPath), false)
+  assert.equal(existsSync(reclaimPath), true)
+  utimesSync(reclaimPath, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
+  await withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10 })
+  assert.equal(existsSync(reclaimPath), false)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放 guard 时后继 guard 不会被旧流程删除', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const successorToken = 'successor-guard-token'
+  const realRenameSync = fs.renameSync
+  let replaced = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!replaced && source === reclaimPath && target.includes('.released-')) {
+      replaced = true
+      unlinkSync(source)
+      writeFileSync(source, successorToken)
+    }
+    return realRenameSync(source, target)
+  })
+  syncBuiltinESMExports()
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(replaced, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：释放 reclaim marker 时后继 marker 不会被旧流程删除', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const markerPath = `${reclaimPath}.reclaiming`
+  const successorToken = 'successor-marker-token'
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(reclaimPath, 'stale-guard-token')
+  utimesSync(reclaimPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let replaced = false
+  let successorMoved = false
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!replaced && source === markerPath && target.includes('.released-')) {
+      replaced = true
+      unlinkSync(source)
+      writeFileSync(source, successorToken)
+      utimesSync(source, past, past)
+    }
+    const result = realRenameSync(source, target)
+    if (replaced && source === markerPath && target.includes('.released-')) {
+      successorMoved = readFileSync(target, 'utf8') === successorToken
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(replaced, true)
+  assert.equal(successorMoved, true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：恢复 release tombstone 时不覆盖后继 guard', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const successorToken = 'successor-guard-at-restore-token'
+  const tombstoneToken = 'foreign-guard-tombstone-token'
+  const originalRenameSync = fs.renameSync
+  const originalLinkSync = fs.linkSync
+  let tombstoneChanged = false
+  let successorPublished = false
+  const publishSuccessor = (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!successorPublished && target === reclaimPath && source.startsWith(`${reclaimPath}.released-`)) {
+      successorPublished = true
+      writeFileSync(target, successorToken)
+    }
+  }
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    if (!tombstoneChanged && source === reclaimPath && target.startsWith(`${reclaimPath}.released-`)) {
+      const result = originalRenameSync(source, target)
+      tombstoneChanged = true
+      writeFileSync(target, tombstoneToken)
+      return result
+    }
+    publishSuccessor(source, target)
+    return originalRenameSync(source, target)
+  })
+  mock.method(fs, 'linkSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    publishSuccessor(source, target)
+    return originalLinkSync(source, target)
+  })
+  syncBuiltinESMExports()
+
+  try {
+    await withLock(dir, async () => {}, { timeoutMs: 1000, staleMs: 10, heartbeatMs: 10 })
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.equal(tombstoneChanged, true)
+  assert.equal(successorPublished, true)
+  assert.equal(readFileSync(reclaimPath, 'utf8'), successorToken)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：陈旧检查与持有者心跳不会竞态回收活动锁', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const readyPath = join(dir, '.owner-ready')
+  const heartbeatPath = join(dir, '.owner-heartbeat')
+  const continuePath = join(dir, '.owner-continue')
+  const releasePath = join(dir, '.owner-release')
+  const donePath = join(dir, '.owner-done')
+  const childScript = `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+
+    const realFutimesSync = fs.futimesSync
+    let blockHeartbeat = false
+    const waitBuffer = new Int32Array(new SharedArrayBuffer(4))
+    fs.futimesSync = (...args) => {
+      if (blockHeartbeat && !fs.existsSync(process.env.WTM_TEST_CONTINUE)) {
+        fs.writeFileSync(process.env.WTM_TEST_HEARTBEAT, '')
+        while (!fs.existsSync(process.env.WTM_TEST_CONTINUE)) {
+          Atomics.wait(waitBuffer, 0, 0, 5)
+        }
+      }
+      return realFutimesSync(...args)
+    }
+    syncBuiltinESMExports()
+
+    const { withLock } = await import(process.env.WTM_TEST_VAULT_MODULE)
+    await withLock(process.env.WTM_TEST_DIR, async () => {
+      blockHeartbeat = true
+      fs.writeFileSync(process.env.WTM_TEST_READY, '')
+      while (!fs.existsSync(process.env.WTM_TEST_RELEASE)) await new Promise((resolve) => setTimeout(resolve, 5))
+    }, { heartbeatMs: 10, staleMs: 50 })
+    fs.writeFileSync(process.env.WTM_TEST_DONE, '')
+  `
+  const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    env: {
+      ...process.env,
+      WTM_TEST_DIR: dir,
+      WTM_TEST_VAULT_MODULE: new URL('../src/vault.js', import.meta.url).href,
+      WTM_TEST_READY: readyPath,
+      WTM_TEST_HEARTBEAT: heartbeatPath,
+      WTM_TEST_CONTINUE: continuePath,
+      WTM_TEST_RELEASE: releasePath,
+      WTM_TEST_DONE: donePath,
+    },
+    stdio: 'ignore',
+  })
+  /** @type {Promise<{code: number | null, signal: NodeJS.Signals | null}>} */
+  const childExit = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  })
+
+  let contenderRan = false
+  try {
+    await waitForFile(readyPath)
+    await waitForFile(heartbeatPath)
+    const past = new Date(Date.now() - 60_000)
+    utimesSync(lockPath, past, past)
+    utimesSync(join(dir, '.lock.reclaim'), past, past)
+    const contender = withLock(dir, async () => { contenderRan = true }, { timeoutMs: 150, staleMs: 50 })
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(contenderRan, false)
+    writeFileSync(continuePath, '')
+    await assert.rejects(contender, VaultError)
+    writeFileSync(releasePath, '')
+    await waitForFile(donePath)
+    const result = await childExit
+    assert.equal(result.code, 0, `owner 子进程异常退出：${result.signal ?? result.code}`)
+  } finally {
+    writeFileSync(continuePath, '')
+    writeFileSync(releasePath, '')
+    if (child.exitCode === null) child.kill()
+    await childExit.catch(() => {})
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('withLock：多个陈旧回收者不会同时进入临界区', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  const releasePath = join(dir, '.release')
+  const enteredPaths = [join(dir, '.entered-a'), join(dir, '.entered-b')]
+  const donePaths = [join(dir, '.done-a'), join(dir, '.done-b')]
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'dead-process-token')
+  writeFileSync(reclaimPath, 'dead-guard-token')
+  utimesSync(lockPath, past, past)
+  utimesSync(reclaimPath, past, past)
+
+  const childScript = `
+    import fs from 'node:fs'
+    const { withLock } = await import(process.env.WTM_TEST_VAULT_MODULE)
+    await withLock(process.env.WTM_TEST_DIR, async () => {
+      fs.writeFileSync(process.env.WTM_TEST_ENTERED, '')
+      while (!fs.existsSync(process.env.WTM_TEST_RELEASE)) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    }, { timeoutMs: 5000, staleMs: 500, heartbeatMs: 10 })
+    fs.writeFileSync(process.env.WTM_TEST_DONE, '')
+  `
+  const children = enteredPaths.map((enteredPath, index) => spawn(
+    process.execPath,
+    ['--input-type=module', '-e', childScript],
+    {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      env: {
+        ...process.env,
+        WTM_TEST_DIR: dir,
+        WTM_TEST_VAULT_MODULE: new URL('../src/vault.js', import.meta.url).href,
+        WTM_TEST_ENTERED: enteredPath,
+        WTM_TEST_RELEASE: releasePath,
+        WTM_TEST_DONE: donePaths[index],
+      },
+      stdio: 'ignore',
+    },
+  ))
+  const exits = children.map((child) => new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  }))
+
+  try {
+    await waitForAnyFile(enteredPaths, 10_000)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(enteredPaths.filter((path) => existsSync(path)).length, 1)
+    writeFileSync(releasePath, '')
+    await Promise.all(donePaths.map((path) => waitForFile(path, 10_000)))
+    const results = await Promise.all(exits)
+    for (const result of results) {
+      assert.equal(result.code, 0, `回收者子进程异常退出：${result.signal ?? result.code}`)
+    }
+  } finally {
+    writeFileSync(releasePath, '')
+    for (const child of children) {
+      if (child.exitCode === null) child.kill()
+    }
+    await Promise.all(exits.map((exit) => exit.catch(() => {})))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('withLock：陈旧锁持续重建时仍按 timeoutMs 退出', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(lockPath, 'stale-lock-token')
+  utimesSync(lockPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let rebuilds = 0
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = realRenameSync(source, target)
+    if (source === lockPath && target.includes('.stale-')) {
+      rebuilds += 1
+      writeFileSync(lockPath, 'rebuilt-stale-lock')
+      utimesSync(lockPath, past, past)
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  const started = Date.now()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.ok(rebuilds > 1, `应持续重建陈旧锁，实际 ${rebuilds} 次`)
+  assert.ok(Date.now() - started < 1000, '持续重建陈旧锁不应阻塞超过 timeoutMs')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：陈旧回收标记持续重建时仍按 timeoutMs 退出', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const markerPath = join(dir, '.lock.reclaim.reclaiming')
+  const past = new Date(Date.now() - 60_000)
+  writeFileSync(markerPath, 'stale-marker-token')
+  utimesSync(markerPath, past, past)
+
+  const realRenameSync = fs.renameSync
+  let rebuilds = 0
+  mock.method(fs, 'renameSync', (/** @type {string} */ source, /** @type {string} */ target) => {
+    const result = realRenameSync(source, target)
+    if (source === markerPath && target.includes('.stale-')) {
+      rebuilds += 1
+      writeFileSync(markerPath, 'rebuilt-stale-marker')
+      utimesSync(markerPath, past, past)
+    }
+    return result
+  })
+  syncBuiltinESMExports()
+  const started = Date.now()
+  try {
+    await assert.rejects(
+      withLock(dir, async () => {}, { timeoutMs: 500, staleMs: 10, heartbeatMs: 10 }),
+      VaultError,
+    )
+  } finally {
+    mock.restoreAll()
+    syncBuiltinESMExports()
+  }
+  assert.ok(rebuilds > 1, `应持续重建陈旧标记，实际 ${rebuilds} 次`)
+  assert.ok(Date.now() - started < 1500, '持续重建陈旧标记不应阻塞超过 timeoutMs')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：过期锁被回收（stale）', async () => {
+  const dir = makeTmp()
+  const lockPath = join(dir, '.lock')
+  const reclaimPath = join(dir, '.lock.reclaim')
+  writeFileSync(lockPath, String(process.pid))
+  // guard token 中的 PID 仍然是当前进程，但这个 lease 已停止续租；
+  // PID 存活不能阻止 stale lease 回收。
+  writeFileSync(reclaimPath, `${process.pid}-old-guard`)
+  const past = new Date(Date.now() - 60_000)
   utimesSync(lockPath, past, past) // 锁文件时间戳拨回 1 分钟前
+  utimesSync(reclaimPath, past, past)
   let ran = false
   await withLock(dir, async () => { ran = true }, { timeoutMs: 2000, staleMs: 10_000 })
   assert.equal(ran, true)
+  assert.equal(existsSync(reclaimPath), false)
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('withLock：陈旧 guard 符号链接清理保留目标目录内容', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTmp()
+  const guardPath = join(dir, '.lock.reclaim')
+  const targetDir = join(dir, 'guard-target')
+  mkdirSync(targetDir)
+  writeFileSync(join(targetDir, 'token'), 'guard-token')
+  writeFileSync(join(targetDir, 'reclaiming'), 'reclaim-token')
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(targetDir, past, past)
+  symlinkSync(targetDir, guardPath, 'dir')
+
+  try {
+    let ran = false
+    let guardReplaced = false
+    let lockError = null
+    try {
+      await withLock(dir, async () => {
+        ran = true
+        guardReplaced = !lstatSync(guardPath).isSymbolicLink()
+      }, { timeoutMs: 1000, staleMs: 10_000 })
+    } catch (err) {
+      lockError = err
+    }
+    assert.equal(readFileSync(join(targetDir, 'token'), 'utf8'), 'guard-token')
+    assert.equal(readFileSync(join(targetDir, 'reclaiming'), 'utf8'), 'reclaim-token')
+    assert.equal(ran, true)
+    assert.equal(guardReplaced, true)
+    assert.equal(lockError, null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('withLock：锁被其他进程回收后，释放时不删除后继锁（token 校验）', async () => {
@@ -225,6 +1193,7 @@ test('withLock：长任务期间心跳刷新 mtime，不被陈旧判定窃取', 
     await new Promise((r) => setTimeout(r, 300))
   }, { heartbeatMs: 50, staleMs: 100 })
   // 等锁建立，记录 mtime；150ms 后（远超 staleMs=100）再比较
+  await waitForFile(lockPath)
   await new Promise((r) => setTimeout(r, 60))
   const t0 = statSync(lockPath).mtimeMs
   await new Promise((r) => setTimeout(r, 150))

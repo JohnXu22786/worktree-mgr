@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createToolSet } from '../src/tools.js'
+import { createToolSet, readRepoConfig } from '../src/tools.js'
+import { GitRunner } from '../src/git.js'
+import { EMPTY_LEDGER, saveLedger, upsertRecord } from '../src/vault.js'
 
 class FakeGit {
   /** @type {Array<{args: string[], cwd: string | undefined}>} */
@@ -29,14 +31,17 @@ class FakeGit {
    */
   async run(args, opts = {}) {
     this.calls.push({ args, cwd: opts.cwd })
-    const key = args.join(' ')
-    const a = this.answers.get(key)
+    const mergeIndex = args.indexOf('merge')
+    const normalized = mergeIndex === -1 ? args : args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+    const key = normalized.join(' ')
+    const a = this.answers.get(args.join(' ')) ?? this.answers.get(key)
     if (a === undefined) throw new Error(`FakeGit: 未预设答案: ${key}`)
     return typeof a === 'function' ? a() : a
   }
 }
 
 const OK = (stdout = '') => ({ ok: true, code: 0, stdout, stderr: '' })
+const WORKTREES = (text = '') => OK(text.replaceAll('\n', '\0'))
 const FAIL = (stderr = 'nope') => ({ ok: false, code: 128, stdout: '', stderr })
 
 function makeSignal() {
@@ -65,6 +70,88 @@ test('createToolSet：注册 5 个工具，参数为对象 schema 且 render 返
   }
 })
 
+test('formatRecoveryCommand：Windows 安全值同时提供 cmd 与 PowerShell 提示', async () => {
+  const { formatRecoveryCommand } = await import('../src/tools.js')
+  const text = formatRecoveryCommand({
+    path: 'C:\\work & ^tree',
+    branch: 'wtm/needs$bang',
+    task: 'Add Search Box',
+    finishCommand: 'wtm finish',
+    platform: 'win32',
+  })
+  assert.ok(text.startsWith('cmd.exe: git -C "C:\\work & ^tree" switch "wtm/needs$bang"'))
+  assert.ok(text.includes("PowerShell: git -C 'C:\\work & ^tree' switch 'wtm/needs$bang'"))
+})
+
+test('formatRecoveryCommand：cmd 无法安全表示的值只提供 PowerShell 提示', async () => {
+  const { formatRecoveryCommand, quoteShellArg } = await import('../src/tools.js')
+  const cases = [
+    { path: 'C:\\work %TEMP% tree', branch: 'wtm/task', task: 'task', literal: 'C:\\work %TEMP% tree' },
+    { path: 'C:\\work tree', branch: 'wtm/%TEMP%', task: 'task', literal: 'wtm/%TEMP%' },
+    { path: 'C:\\work tree', branch: 'wtm/task', task: 'Add %TEMP% Box', literal: 'Add %TEMP% Box' },
+    { path: 'C:\\work tree', branch: 'wtm/task', task: 'task!name', literal: 'task!name' },
+    { path: 'C:\\work tree\\', branch: 'wtm/task', task: 'task', literal: 'C:\\work tree\\' },
+    { path: 'C:\\work tree', branch: 'wtm/task', task: 'Add\nSearch', literal: 'Add\nSearch' },
+  ]
+  for (const values of cases) {
+    const text = formatRecoveryCommand({
+      ...values,
+      finishCommand: 'wtm finish',
+      platform: 'win32',
+    })
+    assert.match(text, /^PowerShell only:/)
+    assert.doesNotMatch(text, /cmd\.exe:/)
+    assert.ok(text.includes(`'${values.literal}'`), text)
+    assert.throws(() => quoteShellArg(values.literal, 'cmd'), /cmd\.exe/)
+  }
+})
+
+test('wtm_purge：渲染分支删除状态和收尾警告', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const purge = tools.find((t) => t.name === 'wtm_purge')
+  assert.ok(purge, '工具 purge 应存在')
+
+  const rendered = purge.output.render({}, {
+    ok: true,
+    results: [{
+      task: 'T',
+      ok: true,
+      branchDeleted: false,
+      warnings: ['分支删除失败（wtm/t）：branch is not fully merged'],
+    }],
+  })
+  const text = rendered[0].text
+  assert.match(text, /T/)
+  assert.match(text, /分支未删除/)
+  assert.match(text, /分支删除失败/)
+})
+
+test('wtm_purge：无任务时渲染顶层仓库配置警告', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    writeFileSync(join(tmp, '.wtm.json'), '{broken')
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
+    const tools = createToolSet({ config: { root: tmp, vault: join(tmp, 'vault') }, git })
+    const purge = tools.find((t) => t.name === 'wtm_purge')
+    assert.ok(purge, '工具 purge 应存在')
+
+    const value = /** @type {{ok: boolean, results?: Array<object>, warnings?: string[]}} */ (
+      await purge.execute({ all: true }, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, true)
+    assert.deepEqual(value.results, [])
+    assert.ok(value.warnings?.some((w) => /\.wtm\.json/i.test(w)), JSON.stringify(value))
+
+    const rendered = purge.output.render({}, value)
+    assert.match(rendered[0].text, /批量清理完成（0 个任务）/)
+    assert.match(rendered[0].text, /\.wtm\.json/i)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('createToolSet：必填参数声明在 schema.required 中', () => {
   const git = new FakeGit()
   const tools = createToolSet({ config: {}, git })
@@ -84,7 +171,7 @@ test('wtm_begin：经工具入口完成创建并落账本', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/new-task'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
-  git.on(['worktree', 'add', join(tmp, 'new-task'), '-b', 'wtm/new-task', 'main'], OK())
+  git.on(['worktree', 'add', join(tmp, 'new-task'), '-b', 'wtm/new-task', 'refs/heads/main'], OK())
   const tools = createToolSet({ config: { root: 'C:/repo', vault: tmp }, git })
   const begin = tools.find((t) => t.name === 'wtm_begin')
   assert.ok(begin, '工具 begin 应存在')
@@ -108,7 +195,7 @@ test('wtm_begin：失败时合并并渲染操作警告', async () => {
   git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK())
-  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'main'], () => {
+  git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'refs/heads/main'], () => {
     // 让 worktree 创建后账本写入失败，从而进入 begin() 的回滚路径。
     mkdirSync(indexPath)
     return OK()
@@ -132,6 +219,45 @@ test('wtm_begin：失败时合并并渲染操作警告', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('wtm_begin：add 失败时渲染安全的手动检查提示', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  const root = join(tmp, 'repo')
+  const vault = join(tmp, 'vault;echo-unsafe')
+  const worktreePath = join(vault, 't')
+  const branch = 'wtm/t";echo'
+  mkdirSync(root)
+  const git = new FakeGit()
+  git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', `refs/heads/${branch}`], FAIL())
+  git.on(['status', '--porcelain'], OK())
+  git.on(['worktree', 'list', '--porcelain'], WORKTREES(
+    `worktree ${worktreePath}\nHEAD deadbeef\nbranch refs/heads/${branch}\n`,
+  ))
+  git.on(['worktree', 'add', worktreePath, '-b', branch, 'refs/heads/main'], FAIL('partial add'))
+
+  try {
+    const tools = createToolSet({ config: { root, vault }, git })
+    const begin = tools.find((tool) => tool.name === 'wtm_begin')
+    assert.ok(begin, '工具 begin 应存在')
+    const value = /** @type {{ok: boolean, warnings?: string[]}} */ (
+      await begin.execute({ task: 'T', branch }, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.equal(git.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'), false)
+    assert.equal(git.calls.some((call) => call.args[0] === 'branch' && call.args[1] === '-D'), false)
+
+    const text = begin.output.render({}, value)[0].text
+    assert.match(text, /手动检查/)
+    assert.ok(text.includes(JSON.stringify(worktreePath)), text)
+    assert.ok(text.includes(JSON.stringify(branch)), text)
+    assert.doesNotMatch(text, /git worktree remove --force|git branch -D/)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('wtm_begin：非 git 目录返回友好错误（不抛异常）', async () => {
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], FAIL('fatal: not a git repository'))
@@ -152,7 +278,7 @@ test('wtm_begin：显式 root 参数优先于配置', async () => {
     git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
     git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
     git.on(['status', '--porcelain'], OK(''))
-    git.on(['worktree', 'add', join(tmp, 't'), '-b', 'wtm/t', 'main'], OK())
+    git.on(['worktree', 'add', join(tmp, 't'), '-b', 'wtm/t', 'refs/heads/main'], OK())
     const tools = createToolSet({ config: { root: 'C:/wrong', vault: tmp }, git })
     const begin = tools.find((t) => t.name === 'wtm_begin')
     assert.ok(begin, '工具 begin 应存在')
@@ -163,45 +289,6 @@ test('wtm_begin：显式 root 参数优先于配置', async () => {
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
-})
-
-test('wtm_begin：失败时合并准备阶段与操作阶段警告', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'wtm-tools-root-'))
-  const vault = mkdtempSync(join(tmpdir(), 'wtm-tools-vault-'))
-  writeFileSync(join(root, '.wtm.json'), JSON.stringify({ extra: true }))
-  const git = new FakeGit()
-  git.on(['rev-parse', '--show-toplevel'], OK(root + '\n'))
-  git.on(['branch', '--show-current'], OK('main\n'))
-  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
-  git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
-  git.on(['status', '--porcelain'], OK(' M dirty.txt\n'))
-  git.on(['worktree', 'add', join(vault, 't'), '-b', 'wtm/t', 'main'], FAIL('add failed'))
-  try {
-    const tools = createToolSet({ config: { root, vault }, git })
-    const begin = tools.find((tool) => tool.name === 'wtm_begin')
-    assert.ok(begin, '工具 begin 应存在')
-    const value = /** @type {{ok: boolean, warnings?: string[]}} */ (await begin.execute({ task: 'T' }, { signal: makeSignal() }))
-    assert.equal(value.ok, false)
-    assert.ok(value.warnings?.some((warning) => /未提交/.test(warning)), JSON.stringify(value))
-    assert.ok(value.warnings?.some((warning) => /extra|未知/.test(warning)), JSON.stringify(value))
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-    rmSync(vault, { recursive: true, force: true })
-  }
-})
-
-test('wtm_begin：失败渲染包含操作阶段 warnings', () => {
-  const git = new FakeGit()
-  const tools = createToolSet({ config: {}, git })
-  const begin = tools.find((tool) => tool.name === 'wtm_begin')
-  assert.ok(begin, '工具 begin 应存在')
-  const rendered = begin.output.render({}, {
-    ok: false,
-    error: '操作已取消（aborted）',
-    warnings: ['工作区创建未完成，且回滚失败：branch -D 失败'],
-  })
-  assert.match(rendered[0].text, /操作已取消/)
-  assert.match(rendered[0].text, /回滚失败/)
 })
 
 test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 命令', async () => {
@@ -217,12 +304,31 @@ test('wtm_begin：aborted signal 直接返回取消错误，不执行任何 git 
   assert.equal(git.calls.length, 0)
 })
 
+test('wtm_begin：root 解析期间中止时返回取消错误而非非 git 仓库错误', async () => {
+  const git = new FakeGit()
+  const ac = new AbortController()
+  git.on(['rev-parse', '--show-toplevel'], () => {
+    ac.abort()
+    return FAIL('rev-parse aborted')
+  })
+  const tools = createToolSet({ config: {}, git })
+  const begin = tools.find((t) => t.name === 'wtm_begin')
+  assert.ok(begin, '工具 begin 应存在')
+
+  const value = /** @type {{ok: boolean, error?: string}} */ (
+    await begin.execute({ task: 'T' }, { signal: ac.signal })
+  )
+  assert.equal(value.ok, false)
+  assert.match(value.error ?? '', /取消|abort/i)
+  assert.doesNotMatch(value.error ?? '', /不是 git 仓库/)
+})
+
 test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
   writeFileSync(join(tmp, '.wtm.json'), '{broken')
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: {}, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')
@@ -231,7 +337,145 @@ test('wtm_status：损坏的仓库配置 .wtm.json 以警告呈现而非崩溃',
   assert.ok(value.warnings, '应有 warnings')
   assert.ok(value.warnings.length >= 1, JSON.stringify(value.warnings))
   assert.match(value.warnings[0], /\.wtm\.json/i)
+  assert.deepEqual(value.rows, [])
+  const rendered = status.output.render({}, value)
+  assert.match(rendered[0].text, /\.wtm\.json/i)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('wtm_status：工作区分支漂移时渲染可操作提示而非工作区缺失', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    const vault = join(tmp, 'vault')
+    const taskPath = join(vault, 't')
+    mkdirSync(taskPath, { recursive: true })
+    const ledger = structuredClone(EMPTY_LEDGER)
+    upsertRecord(ledger, {
+      task: 'Add Search Box', branch: 'wtm/add-search$box', base: 'main', path: taskPath,
+      createdAt: 'c', updatedAt: 'u',
+    })
+    saveLedger(vault, ledger)
+
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${tmp}\n`))
+    git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES(
+      `worktree ${tmp}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${taskPath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/other\n`,
+    ))
+    const tools = createToolSet({ config: { root: tmp, vault }, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+
+    const value = /** @type {{ok: boolean, rows?: Array<any>}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, true)
+    assert.equal(value.rows?.[0]?.branchDrift, true)
+    assert.equal(value.rows?.[0]?.currentBranch, 'other')
+    const rendered = status.output.render({}, value)
+    const text = rendered[0].text
+    assert.match(text, /分支漂移/)
+    assert.doesNotMatch(text, /工作区缺失/)
+    if (process.platform === 'win32') {
+      assert.match(text, /cmd\.exe: git -C ".+" switch "wtm\/add-search\$box"/)
+      assert.match(text, /PowerShell: git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish "Add Search Box" --mode keep/)
+    } else {
+      assert.match(text, /git -C '.+' switch 'wtm\/add-search\$box'/)
+      assert.match(text, /wtm_finish 'Add Search Box' --mode keep/)
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('wtm_status：root 解析同步失败时返回结构化错误而非抛异常', async () => {
+  const tools = createToolSet({ config: {}, git: new GitRunner() })
+  const status = tools.find((t) => t.name === 'wtm_status')
+  assert.ok(status, '工具 status 应存在')
+
+  const value = /** @type {{ok: boolean, error?: string}} */ (
+    await status.execute({ root: 'bad\0path' }, { signal: makeSignal() })
+  )
+  assert.equal(value.ok, false)
+  assert.match(value.error ?? '', /invalid|argument|path/i)
+})
+
+test('wtm_status：默认 root 的 cwd 不可用时返回结构化错误而非抛异常', async () => {
+  const originalCwd = process.cwd
+  const hadWtmRoot = Object.hasOwn(process.env, 'WTM_ROOT')
+  const originalWtmRoot = process.env.WTM_ROOT
+  delete process.env.WTM_ROOT
+  process.cwd = () => { throw new Error('cwd is unavailable') }
+
+  try {
+    const git = new FakeGit()
+    const tools = createToolSet({ config: {}, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+
+    const value = /** @type {{ok: boolean, error?: string}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /cwd|ENOENT|no such file/i)
+    assert.equal(git.calls.length, 0)
+  } finally {
+    process.cwd = originalCwd
+    if (hadWtmRoot) process.env.WTM_ROOT = originalWtmRoot
+    else delete process.env.WTM_ROOT
+  }
+})
+
+test('wtm_merge/wtm_finish/wtm_purge：失败时渲染操作警告', () => {
+  const git = new FakeGit()
+  const tools = createToolSet({ config: {}, git })
+  const warning = '仓库配置 .wtm.json 解析失败，已忽略'
+
+  for (const name of ['wtm_merge', 'wtm_finish', 'wtm_purge']) {
+    const tool = tools.find((t) => t.name === name)
+    assert.ok(tool, `${name} 工具应存在`)
+    const rendered = tool.output.render({}, {
+      ok: false,
+      error: '操作失败',
+      warnings: [warning],
+    })
+    assert.match(rendered[0].text, /操作失败/)
+    assert.match(rendered[0].text, /\.wtm\.json/)
+  }
+})
+
+test('readRepoConfig：配置文件读取失败时传播文件系统错误', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    mkdirSync(join(tmp, '.wtm.json'))
+    assert.throws(() => readRepoConfig(tmp), (error) => {
+      assert.ok(error instanceof Error && 'code' in error)
+      assert.equal(error.code, 'EISDIR')
+      return true
+    })
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('工具调用：仓库配置读取失败时返回结构化错误', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    mkdirSync(join(tmp, '.wtm.json'))
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${tmp}\n`))
+    const tools = createToolSet({ config: {}, git })
+    const status = tools.find((t) => t.name === 'wtm_status')
+    assert.ok(status, '工具 status 应存在')
+    const value = /** @type {{ok: boolean, error?: string}} */ (
+      await status.execute({}, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /EISDIR/)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('wtm_finish 必填参数与默认 mode', () => {
@@ -248,12 +492,62 @@ test('wtm_finish 必填参数与默认 mode', () => {
   assert.equal(fp.properties.mode?.enum?.includes('keep'), true)
 })
 
+test('wtm_finish：移除工作区失败时保留操作警告', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  try {
+    const root = join(tmp, 'repo')
+    const vault = join(tmp, 'vault')
+    const worktreePath = join(vault, 't')
+    mkdirSync(root, { recursive: true })
+    mkdirSync(worktreePath, { recursive: true })
+    const triggerCommand = 'wtm-test-missing-merge-hook'
+    writeFileSync(join(root, '.wtm.json'), JSON.stringify({ triggers: { on_merge: [triggerCommand] } }))
+
+    const ledger = structuredClone(EMPTY_LEDGER)
+    upsertRecord(ledger, {
+      task: 'T', branch: 'wtm/t', base: 'main', path: worktreePath,
+      createdAt: 'c', updatedAt: 'u',
+    })
+    saveLedger(vault, ledger)
+
+    const git = new FakeGit()
+    git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
+    git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES(
+      `worktree ${root}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${worktreePath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/wtm/t\n`,
+    ))
+    git.on(['status', '--porcelain'], OK())
+    git.on(['branch', '--show-current'], OK('main\n'))
+    git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], { ok: false, code: 1, stdout: '', stderr: 'not an ancestor' })
+    git.on(['config', '--get', 'branch.main.mergeOptions'], { ok: false, code: 1, stdout: '', stderr: '' })
+    git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], OK(`${'2'.repeat(40)}\n`))
+    git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
+    git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
+    git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
+    git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'merge(wtm): fold T into main'], OK('merged'))
+    git.on(['worktree', 'remove', worktreePath], FAIL('cannot remove worktree'))
+
+    const tools = createToolSet({ config: { root, vault }, git })
+    const finish = tools.find((t) => t.name === 'wtm_finish')
+    assert.ok(finish, '工具 finish 应存在')
+    const value = /** @type {{ok: boolean, error?: string, warnings?: string[]}} */ (
+      await finish.execute({ task: 'T' }, { signal: makeSignal() })
+    )
+
+    assert.equal(value.ok, false)
+    assert.match(value.error ?? '', /cannot remove worktree/)
+    assert.ok(value.warnings?.some((w) => w.includes(triggerCommand)), JSON.stringify(value))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('wtm_status：无任务时返回空总览', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
   mkdirSync(join(tmp, 'vault'))
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], OK(tmp + '\n'))
-  git.on(['worktree', 'list', '--porcelain'], OK('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], WORKTREES('worktree ' + tmp + '\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n'))
   const tools = createToolSet({ config: { root: tmp, vault: join(tmp, 'vault') }, git })
   const status = tools.find((t) => t.name === 'wtm_status')
   assert.ok(status, '工具 status 应存在')

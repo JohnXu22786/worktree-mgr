@@ -7,16 +7,18 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
+import { samePathIdentity } from './path-identity.js'
 
 /**
  * 执行一条 git 命令。
  * @param {string[]} args
- * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>, spawnFn?: (command: string, args: string[], opts: object) => any}} [opts]
+ * @param {{cwd?: string, signal?: AbortSignal, env?: Record<string, string>, spawnImpl?: typeof spawn}} [opts]
  * @returns {Promise<{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}>}
  */
-export function runGit(args, { cwd, signal, env, spawnFn = spawn } = {}) {
+export function runGit(args, { cwd, signal, env, spawnImpl = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawnFn(
+    const child = spawnImpl(
       'git',
       ['--no-pager', '-c', 'core.quotepath=false', ...args],
       {
@@ -29,29 +31,47 @@ export function runGit(args, { cwd, signal, env, spawnFn = spawn } = {}) {
     )
     let stdout = ''
     let stderr = ''
-    let aborted = false
-    child.stdout.on('data', (/** @type {any} */ d) => { stdout += d })
-    child.stderr.on('data', (/** @type {any} */ d) => { stderr += d })
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    child.stdout.on('data', (d) => { stdout += stdoutDecoder.write(d) })
+    child.stderr.on('data', (d) => { stderr += stderrDecoder.write(d) })
     let settled = false
     /**
-     * @param {{ok: boolean, code: number | null, stdout: string, stderr: string, aborted: boolean}} result
+     * @param {{ok: boolean, code: number | null, stdout?: string, stderr?: string, aborted: boolean}} result
      */
     const done = (result) => {
       if (!settled) {
         settled = true
-        resolve(result)
+        resolve({
+          ...result,
+          stdout: result.stdout ?? stdout + stdoutDecoder.end(),
+          stderr: result.stderr ?? stderr + stderrDecoder.end(),
+        })
       }
     }
-    child.on('error', (/** @type {any} */ err) => {
-      if (err.name === 'AbortError') {
-        aborted = true
+    let abortPending = false
+    child.on('error', (err) => {
+      const aborted = err.name === 'AbortError'
+      if (aborted) {
+        abortPending = true
         return
       }
-      done({ ok: false, code: -1, stdout, stderr: stderr || err.message, aborted: false })
+      const decodedStdout = stdout + stdoutDecoder.end()
+      const decodedStderr = stderr + stderrDecoder.end()
+      done({
+        ok: false,
+        code: -1,
+        stdout: decodedStdout,
+        stderr: aborted ? '' : decodedStderr || err.message,
+        aborted,
+      })
     })
-    child.on('close', (/** @type {number | null} */ code, /** @type {string | null} */ codeSig) => {
-      const wasAborted = aborted || signal?.aborted === true || codeSig !== null
-      done({ ok: !wasAborted && code === 0, code, stdout, stderr: wasAborted ? '' : stderr, aborted: wasAborted })
+    child.on('close', (code) => {
+      if (abortPending) {
+        done({ ok: false, code: -1, aborted: true })
+        return
+      }
+      done({ ok: code === 0, code, aborted: false })
     })
   })
 }
@@ -92,7 +112,7 @@ export async function resolveToplevel(git, candidate, signal) {
 }
 
 /**
- * 解析 `git worktree list --porcelain` 输出。
+ * 解析 `git worktree list --porcelain -z` 输出（兼容原有换行分隔格式）。
  * @param {string} text
  * @returns {Array<{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean}>}
  */
@@ -101,10 +121,10 @@ export function parseWorktreeList(text) {
   const out = []
   /** @type {{path: string, branch: string | null, detached: boolean, bare: boolean, locked: boolean} | null} */
   let current = null
-  for (const line of text.split(/\r?\n/)) {
+  const consume = (/** @type {string} */ line) => {
     if (line.startsWith('worktree ')) {
       current = {
-        path: line.slice('worktree '.length).trim(),
+        path: line.slice('worktree '.length),
         branch: null,
         detached: false,
         bare: false,
@@ -122,6 +142,49 @@ export function parseWorktreeList(text) {
         current.locked = true
       }
     }
+  }
+
+  if (text.includes('\0')) {
+    for (const field of text.split('\0')) consume(field)
+    return out
+  }
+
+  // Legacy porcelain has no record delimiter. Use the stable HEAD or bare
+  // line and its following field to keep newlines that belong to a path.
+  // A bare marker is authoritative, so a HEAD-like path line immediately
+  // before it must remain part of the path. Keep the path separator LF-only
+  // so a POSIX path ending in CR remains intact.
+  // Likewise, a HEAD and branch pair in the path is not a boundary when the
+  // branch-like line is followed by the real HEAD field or authoritative bare marker.
+  // The /m flag makes $ line-relative; use (?![\s\S]) for true EOF checks.
+  const records = [...text.matchAll(/^worktree ([\s\S]*?)\n(HEAD [0-9a-f]+(\r?)\n(?!(?:branch refs\/heads\/[^\r\n]*\r?\n(?:HEAD [0-9a-f]+(?:\r?\n|$)|bare(?:\r?\n|$))))(?=(?:branch refs\/heads\/|detached(?:\r?\n|$)|locked(?: [^\r\n]*)?(?:\r?\n|$)|prunable(?: [^\r\n]*)?(?:\r?\n|$)|\r?\n|$))|bare(\r?)(?=(?:(?:\r?\n(?:locked|prunable)(?: [^\r\n]*)?)*(?:\r?\n\r?\n(?=worktree |(?![\s\S]))|\r?\n(?![\s\S])|(?![\s\S])))))/gm)]
+  const hasLfRecordEnding = records.some((record) => {
+    if (record[2]?.startsWith('HEAD ')) return record[3] !== '\r'
+    if (record[2]?.startsWith('bare')) {
+      const nextChar = text[(record.index ?? 0) + record[0].length]
+      return record[4] !== '\r' && nextChar === '\n'
+    }
+    return false
+  })
+  if (records.length > 0) {
+    for (let i = 0; i < records.length; i += 1) {
+      const record = records[i]
+      // An EOF bare marker has no line ending of its own, so infer CRLF from
+      // its path boundary only when matched records provide no LF evidence.
+      const bareAtEof = record[2]?.startsWith('bare')
+        && (record.index ?? 0) + record[0].length === text.length
+        && !hasLfRecordEnding
+      const hasCrLfRecordEnding = record[3] === '\r' || record[4] === '\r' || bareAtEof
+      const path = hasCrLfRecordEnding && record[1].endsWith('\r') ? record[1].slice(0, -1) : record[1]
+      consume(`worktree ${path}`)
+      const parsed = out[out.length - 1]
+      if (record[2]?.startsWith('bare') && parsed) parsed.bare = true
+      const start = (record.index ?? 0) + record[0].length
+      const end = records[i + 1]?.index ?? text.length
+      for (const line of text.slice(start, end).split(/\r?\n/)) consume(line)
+    }
+  } else {
+    for (const line of text.split(/\r?\n/)) consume(line)
   }
   return out
 }
@@ -152,12 +215,9 @@ export function isDirty(text) {
  * 统一归一化后再比较，避免同一路径因分隔符差异匹配失败。
  * @param {string} a
  * @param {string} b
+ * @param {string} [platform]
  * @returns {boolean}
  */
-export function samePath(a, b) {
-  const norm = (/** @type {string} */ p) => p.replace(/\\/g, '/')
-  if (process.platform === 'win32') {
-    return norm(a).toLowerCase() === norm(b).toLowerCase()
-  }
-  return a === b
+export function samePath(a, b, platform = process.platform) {
+  return samePathIdentity(a, b, platform)
 }
