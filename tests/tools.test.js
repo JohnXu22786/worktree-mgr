@@ -219,6 +219,46 @@ test('wtm_begin：失败时合并并渲染操作警告', async () => {
   rmSync(tmp, { recursive: true, force: true })
 })
 
+test('wtm_begin：add 失败时渲染安全的手动检查提示', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'wtm-tools-test-'))
+  const root = join(tmp, 'repo')
+  const vault = join(tmp, 'vault"; echo unsafe\nnext-line')
+  const worktreePath = join(vault, 't')
+  const branch = 'wtm/t;echo'
+  mkdirSync(root)
+  const git = new FakeGit()
+  git.on(['rev-parse', '--show-toplevel'], OK(`${root}\n`))
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', `refs/heads/${branch}`], FAIL())
+  git.on(['status', '--porcelain'], OK())
+  git.on(['worktree', 'list', '--porcelain'], WORKTREES(
+    `worktree ${worktreePath}\nHEAD deadbeef\nbranch refs/heads/${branch}\n`,
+  ))
+  git.on(['worktree', 'add', worktreePath, '-b', branch, 'refs/heads/main'], FAIL('partial add'))
+
+  try {
+    const tools = createToolSet({ config: { root, vault }, git })
+    const begin = tools.find((tool) => tool.name === 'wtm_begin')
+    assert.ok(begin, '工具 begin 应存在')
+    const value = /** @type {{ok: boolean, warnings?: string[]}} */ (
+      await begin.execute({ task: 'T', branch }, { signal: makeSignal() })
+    )
+    assert.equal(value.ok, false)
+    assert.equal(git.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'), false)
+    assert.equal(git.calls.some((call) => call.args[0] === 'branch' && call.args[1] === '-D'), false)
+
+    const text = begin.output.render({}, value)[0].text
+    assert.match(text, /手动检查/)
+    assert.ok(text.includes(JSON.stringify(worktreePath)), text)
+    assert.ok(text.includes(JSON.stringify(branch)), text)
+    assert.doesNotMatch(text, /git worktree remove --force|git branch -D/)
+    assert.doesNotMatch(text, /echo unsafe\nnext-line/)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('wtm_begin：非 git 目录返回友好错误（不抛异常）', async () => {
   const git = new FakeGit()
   git.on(['rev-parse', '--show-toplevel'], FAIL('fatal: not a git repository'))

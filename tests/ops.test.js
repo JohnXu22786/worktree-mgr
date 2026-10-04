@@ -9,6 +9,7 @@ import { EventEmitter } from 'node:events'
 import { begin, mergeTask, finishTask, listStatus, purge } from '../src/ops.js'
 import { EMPTY_LEDGER, loadLedger, saveLedger, upsertRecord, withLock } from '../src/vault.js'
 import { resolveToplevel } from '../src/git.js'
+import { slugifyTask } from '../src/naming.js'
 
 // ---- 假 git 执行器 ---------------------------------------------------------
 
@@ -440,6 +441,85 @@ test('begin：worktree add 失败透传 stderr', async () => {
   const r = await begin({ root: 'C:/repo', task: 'T', cfg, git, repo: null })
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /could not create/)
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：worktree add 失败或中止后即使列表匹配也不自动清理', async () => {
+  const tmp = makeTmp()
+  const cases = [
+    { task: 'Failed Add', aborted: false },
+    { task: 'Aborted Add', aborted: true },
+  ]
+
+  for (const item of cases) {
+    const cfg = baseCfg(tmp)
+    const slug = slugifyTask(item.task)
+    const worktreePath = join(tmp, 'vault', slug)
+    const branch = `wtm/${slug}`
+    const git = new FakeGit()
+    const controller = new AbortController()
+    git.on(['branch', '--show-current'], OK('main\n'))
+    git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+    git.on(['show-ref', '--verify', `refs/heads/${branch}`], FAIL())
+    git.on(['status', '--porcelain'], OK(''))
+    git.on(['worktree', 'list', '--porcelain'], WORKTREES(
+      `worktree ${worktreePath}\nHEAD deadbeef\nbranch refs/heads/${branch}\n`,
+    ))
+    git.on(['worktree', 'add', worktreePath, '-b', branch, 'refs/heads/main'], () => {
+      if (item.aborted) {
+        controller.abort()
+        return { ok: false, code: -1, stdout: '', stderr: '', aborted: true }
+      }
+      return FAIL('fatal: worktree add left possible partial state')
+    })
+
+    const result = await begin({
+      root: 'C:/repo', task: item.task, branch, cfg, git, repo: null,
+      signal: controller.signal,
+    })
+
+    assert.equal(result.ok, false)
+    assert.ok(result.warnings?.some((warning) => /手动检查/.test(warning)), JSON.stringify(result.warnings))
+    assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(worktreePath))), JSON.stringify(result.warnings))
+    assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(branch))), JSON.stringify(result.warnings))
+    assert.equal(git.count(['worktree', 'remove', '--force', worktreePath]), 0)
+    assert.equal(git.count(['branch', '-D', branch]), 0)
+    if (item.aborted) assert.match(result.error ?? '', /取消|abort/i)
+  }
+
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('begin：成功 add 后发生失败时独立尝试清理并保留两项清理错误', async () => {
+  const tmp = makeTmp()
+  const cfg = baseCfg(tmp)
+  const worktreePath = join(tmp, 'vault', 't')
+  const branch = 'wtm/t;echo'
+  const indexPath = join(cfg.vault, 'index.json')
+  const removeDetail = 'cannot remove "worktree"; echo unsafe\nnext line'
+  const branchDetail = 'cannot delete "branch"; echo unsafe\nnext line'
+  const git = new FakeGit()
+  git.on(['branch', '--show-current'], OK('main\n'))
+  git.on(['show-ref', '--verify', 'refs/heads/main'], OK())
+  git.on(['show-ref', '--verify', `refs/heads/${branch}`], FAIL())
+  git.on(['status', '--porcelain'], OK(''))
+  git.on(['worktree', 'add', worktreePath, '-b', branch, 'refs/heads/main'], () => {
+    mkdirSync(indexPath)
+    return OK()
+  })
+  git.on(['worktree', 'remove', '--force', worktreePath], () => { throw new Error(removeDetail) })
+  git.on(['branch', '-D', branch], FAIL(branchDetail))
+
+  const result = await begin({ root: 'C:/repo', task: 'T', branch, cfg, git, repo: null })
+
+  assert.equal(result.ok, false)
+  assert.ok(git.called(['worktree', 'remove', '--force', worktreePath]))
+  assert.ok(git.called(['branch', '-D', branch]), 'branch cleanup should run after worktree cleanup throws')
+  assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(removeDetail))), JSON.stringify(result.warnings))
+  assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(branchDetail))), JSON.stringify(result.warnings))
+  assert.ok(result.warnings?.some((warning) => /手动检查/.test(warning)), JSON.stringify(result.warnings))
+  assert.ok(result.warnings?.every((warning) => !/git worktree remove --force|git branch -D/.test(warning)), JSON.stringify(result.warnings))
+
   rmSync(tmp, { recursive: true, force: true })
 })
 

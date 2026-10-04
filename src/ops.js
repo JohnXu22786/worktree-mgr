@@ -132,6 +132,53 @@ function resolveOperationVault(root, cfg) {
 }
 
 /**
+ * Build manual recovery guidance without putting filesystem values into shell syntax.
+ * JSON string notation keeps quotes and line breaks visible as data for inspection.
+ * @param {string} wtPath
+ * @param {string} branchName
+ */
+function manualCleanupHint(wtPath, branchName) {
+  return '请手动检查 Git 工作区列表和分支列表。只有确认它们是本次操作遗留的资源后，才分别清理；' +
+    '若无法确认归属，请保留并联系仓库管理员。' +
+    `工作区路径（JSON 字符串）：${JSON.stringify(wtPath)}；分支（JSON 字符串）：${JSON.stringify(branchName)}`
+}
+
+/**
+ * Roll back resources created by a successful worktree add, attempting each cleanup independently.
+ * @param {{run: Function}} git
+ * @param {string} root
+ * @param {string} wtPath
+ * @param {string} branchName
+ * @returns {Promise<string[]>}
+ */
+async function rollbackCreatedWorktree(git, root, wtPath, branchName) {
+  /** @type {string[]} */
+  const warnings = []
+  try {
+    const remove = await git.run(['worktree', 'remove', '--force', wtPath], { cwd: root })
+    if (!remove.ok) {
+      warnings.push(`工作区回滚失败：${JSON.stringify(remove.stderr.trim() || 'git worktree remove 失败')}`)
+    }
+  } catch (err) {
+    warnings.push(`工作区回滚失败：${JSON.stringify(/** @type {Error} */ (err).message)}`)
+  }
+  try {
+    const branch = await git.run(['branch', '-D', branchName], { cwd: root })
+    if (!branch.ok) {
+      warnings.push(`分支回滚失败：${JSON.stringify(branch.stderr.trim() || 'git branch -D 失败')}`)
+    }
+  } catch (err) {
+    warnings.push(`分支回滚失败：${JSON.stringify(/** @type {Error} */ (err).message)}`)
+  }
+  if (warnings.length === 0) {
+    warnings.push('已回滚未完成的工作区创建（工作区与分支已清理）')
+  } else {
+    warnings.push(manualCleanupHint(wtPath, branchName))
+  }
+  return warnings
+}
+
+/**
  * 检查工作区路径：只有明确的“不存在”才算 stale，其他文件系统错误必须保留给调用方处理。
  * @param {string} path
  * @returns {{exists: boolean, isDirectory?: boolean, error?: string}}
@@ -182,10 +229,12 @@ export async function begin(opts) {
     return { ok: false, error: `vault 目录不能位于仓库工作树内（${vault}）：` +
       '请改用仓库外的路径，或将仓库配置的 vault 指向外部目录（WTM_VAULT / .wtm.json 的 vault 键）' }
   }
+  const wtPath = join(vault, slugifyTask(task))
   /** @type {string[]} */
   const warnings = []
   let result
   let createdWorktree = false
+  let addAttempted = false
   try {
     result = await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -222,7 +271,6 @@ export async function begin(opts) {
         warnings.push('主工作区存在未提交改动，新建的工作区不会包含这些改动，请留意')
       }
 
-      const wtPath = join(vault, slugifyTask(task))
       // 防碰撞：不同任务名可能派生同一 slug（如 "a b" 与 "a-b"），
       // 账本中已有记录指向同一工作区路径时拒绝
       if (ledger.records.some((rec) => samePath(rec.path, wtPath))) {
@@ -233,8 +281,17 @@ export async function begin(opts) {
       }
 
       // 核心动作：创建 worktree
+      addAttempted = true
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseRef], { cwd: root, signal: opts.signal })
-      if (!add.ok) return { ok: false, error: `创建工作区失败：${add.stderr.trim()}` }
+      if (!add.ok) {
+        warnings.push(`worktree add 失败，可能留下部分资源；${manualCleanupHint(wtPath, branchName)}`)
+        return {
+          ok: false,
+          error: add.aborted || isAborted(opts.signal)
+            ? '操作已取消（aborted）'
+            : `创建工作区失败：${add.stderr.trim()}`,
+        }
+      }
       createdWorktree = true
 
       // 种子文件：从主仓库复制到新工作区（防路径穿越：必须位于仓库/工作区之内）
@@ -291,26 +348,17 @@ export async function begin(opts) {
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
     if (createdWorktree && typeof result === 'undefined') {
-      try {
-        const remove = await git.run(['worktree', 'remove', '--force', join(vault, slugifyTask(task))], { cwd: root })
-        const branch = await git.run(['branch', '-D', branchName], { cwd: root })
-        if (remove.ok && branch.ok) {
-          warnings.push('已回滚未完成的工作区创建（worktree 与分支已清理）')
-        } else {
-          const failures = []
-          if (!remove.ok) failures.push(`worktree remove 失败：${remove.stderr.trim() || '命令返回失败'}`)
-          if (!branch.ok) failures.push(`branch -D 失败：${branch.stderr.trim() || '命令返回失败'}`)
-          warnings.push(`工作区创建未完成，且回滚失败：${failures.join('；')}；请手动执行 git worktree remove / branch -D`)
-        }
-      } catch {
-        warnings.push('工作区创建未完成，且回滚失败：请手动执行 git worktree remove / branch -D')
-      }
+      warnings.push(...await rollbackCreatedWorktree(git, root, wtPath, branchName))
+    } else if (addAttempted && !createdWorktree) {
+      warnings.push(`worktree add 未能确认是否完成，可能留下部分资源；${manualCleanupHint(wtPath, branchName)}`)
     }
     if (isAborted(opts.signal)) return { ok: false, error: '操作已取消（aborted）', warnings }
     if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
-  if (!result.ok) return result
+  if (!result.ok) {
+    return warnings.length > 0 ? { ...result, warnings } : result
+  }
   return {
     ok: true,
     task,
