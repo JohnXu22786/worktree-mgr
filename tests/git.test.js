@@ -331,6 +331,44 @@ test('parseWorktreeList：路径内类似 HEAD 字段时不提前截断', () => 
   assert.equal(parseWorktreeList(text)[0].path, '/tmp/worktree\nHEAD 4444444444444444444444444444444444444444')
 })
 
+test('parseWorktreeList：路径内 HEAD 和 branch 字段不提前截断', () => {
+  const path = '/tmp/wt\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/path-text'
+  const text = [
+    `worktree ${path}`,
+    'HEAD 5555555555555555555555555555555555555555',
+    'branch refs/heads/actual',
+    '',
+  ].join('\n')
+
+  assert.deepEqual(parseWorktreeList(text), [{
+    path,
+    branch: 'actual',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
+test('parseWorktreeList：多行锁定原因中的 HEAD 字段不影响记录边界', () => {
+  const text = [
+    'worktree /tmp/wt',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/task',
+    'locked reason before newline',
+    'HEAD 4444444444444444444444444444444444444444',
+    'locked reason after newline',
+    '',
+  ].join('\n')
+
+  assert.deepEqual(parseWorktreeList(text), [{
+    path: '/tmp/wt',
+    branch: 'task',
+    detached: false,
+    bare: false,
+    locked: true,
+  }])
+})
+
 test('parseWorktreeList：保留路径末尾的换行', () => {
   const text = [
     'worktree /tmp/worktree\n',
