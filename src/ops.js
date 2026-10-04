@@ -157,7 +157,7 @@ async function rollbackCreatedWorktree(git, root, wtPath, branchName) {
   try {
     const remove = await git.run(['worktree', 'remove', '--force', wtPath], { cwd: root })
     if (!remove.ok) {
-      warnings.push(`工作区回滚失败：${JSON.stringify(remove.stderr.trim() || 'git worktree remove 失败')}`)
+      warnings.push(`工作区回滚失败：${JSON.stringify(remove.stderr.trim() || '命令返回失败')}`)
     }
   } catch (err) {
     warnings.push(`工作区回滚失败：${JSON.stringify(/** @type {Error} */ (err).message)}`)
@@ -165,7 +165,7 @@ async function rollbackCreatedWorktree(git, root, wtPath, branchName) {
   try {
     const branch = await git.run(['branch', '-D', branchName], { cwd: root })
     if (!branch.ok) {
-      warnings.push(`分支回滚失败：${JSON.stringify(branch.stderr.trim() || 'git branch -D 失败')}`)
+      warnings.push(`分支回滚失败：${JSON.stringify(branch.stderr.trim() || '命令返回失败')}`)
     }
   } catch (err) {
     warnings.push(`分支回滚失败：${JSON.stringify(/** @type {Error} */ (err).message)}`)
@@ -173,6 +173,7 @@ async function rollbackCreatedWorktree(git, root, wtPath, branchName) {
   if (warnings.length === 0) {
     warnings.push('已回滚未完成的工作区创建（工作区与分支已清理）')
   } else {
+    warnings.unshift('工作区创建未完成，且回滚失败')
     warnings.push(manualCleanupHint(wtPath, branchName))
   }
   return warnings

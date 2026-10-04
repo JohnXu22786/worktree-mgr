@@ -517,6 +517,7 @@ test('begin：成功 add 后发生失败时独立尝试清理并保留两项清�
   assert.ok(git.called(['branch', '-D', branch]), 'branch cleanup should run after worktree cleanup throws')
   assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(removeDetail))), JSON.stringify(result.warnings))
   assert.ok(result.warnings?.some((warning) => warning.includes(JSON.stringify(branchDetail))), JSON.stringify(result.warnings))
+  assert.ok(result.warnings?.some((warning) => /工作区创建未完成，且回滚失败/.test(warning)), JSON.stringify(result.warnings))
   assert.ok(result.warnings?.some((warning) => /手动检查/.test(warning)), JSON.stringify(result.warnings))
   assert.ok(result.warnings?.every((warning) => !/git worktree remove --force|git branch -D/.test(warning)), JSON.stringify(result.warnings))
 
@@ -533,8 +534,8 @@ test('begin：回滚命令返回失败对象时保留失败警告', async () => 
   git.on(['show-ref', '--verify', 'refs/heads/wtm/t'], FAIL())
   git.on(['status', '--porcelain'], OK(''))
   git.on(['worktree', 'add', worktreePath, '-b', 'wtm/t', 'refs/heads/main'], OK())
-  git.on(['worktree', 'remove', '--force', worktreePath], FAIL('fatal: cannot remove worktree'))
-  git.on(['branch', '-D', 'wtm/t'], OK())
+  git.on(['worktree', 'remove', '--force', worktreePath], FAIL(''))
+  git.on(['branch', '-D', 'wtm/t'], FAIL(''))
 
   const r = await begin({
     root: 'C:/repo',
@@ -548,7 +549,9 @@ test('begin：回滚命令返回失败对象时保留失败警告', async () => 
 
   assert.equal(r.ok, false)
   assert.ok((r.warnings ?? []).some((w) => /回滚失败/.test(w)), JSON.stringify(r))
-  assert.ok((r.warnings ?? []).some((w) => /cannot remove worktree/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).some((w) => /工作区回滚失败："命令返回失败"/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).some((w) => /分支回滚失败："命令返回失败"/.test(w)), JSON.stringify(r))
+  assert.ok((r.warnings ?? []).every((w) => !/git worktree remove --force|git branch -D/.test(w)), JSON.stringify(r))
   assert.ok(!(r.warnings ?? []).some((w) => /已回滚/.test(w)), JSON.stringify(r))
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
   rmSync(tmp, { recursive: true, force: true })
