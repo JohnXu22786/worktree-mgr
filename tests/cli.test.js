@@ -290,7 +290,8 @@ test('CLI：非 JSON 失败时仍输出工作区回滚警告', { skip: process.p
     assert.equal(result.status, 1)
     assert.match(result.stderr, /错误：创建失败/)
     assert.match(result.stdout, /警告：工作区创建未完成，且回滚失败/)
-    assert.match(result.stdout, /请手动执行 git worktree remove \/ branch -D/)
+    assert.match(result.stdout, /警告：请手动检查 Git 工作区列表和分支列表/)
+    assert.doesNotMatch(result.stdout, /git worktree remove|git branch -D/)
   } finally {
     rmSync(root, { recursive: true, force: true })
     rmSync(vault, { recursive: true, force: true })
