@@ -28,7 +28,7 @@ import {
   removeRecord,
 } from './vault.js'
 import { parseWorktreeList, parseAheadBehind, isDirty, samePath } from './git.js'
-import { calculateMergeTree, createMergeGuard, readMergeOptions } from './merge-guard.js'
+import { calculateMergeTree, createMergeGuard, createSnapshotGuard, readMergeOptions } from './merge-guard.js'
 import { runTriggers } from './triggers.js'
 
 /**
@@ -713,13 +713,99 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
     return { ok: false, committed: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
   }
   const message = opts.message ?? renderTemplate(cfg.commitMessage, { task, branch: rec.branch, base: rec.base })
-  const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
-  if (add.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
-  if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
-  const commit = await git.run(['commit', '-m', message], { cwd: rec.path, signal: opts.signal })
-  if (commit.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
-  if (!commit.ok) return { ok: false, committed: false, error: `快照提交失败：${commit.stderr.trim()}` }
-  return { ok: true, committed: true }
+  const headLock = await acquireWorktreeHeadLock(opts, rec)
+  if (!headLock.ok) {
+    return { ok: false, committed: false, ...(headLock.cancelled ? { cancelled: true } : {}), error: headLock.error }
+  }
+  /** @type {{hooksPath: string} | undefined} */
+  let snapshotGuard
+  let headLockHeld = true
+  const releaseHeadLock = () => {
+    if (headLockHeld) {
+      rmSync(headLock.path, { force: true })
+      headLockHeld = false
+    }
+  }
+  try {
+    const beforeAdd = await checkRegisteredWorktreeBranch(opts, rec)
+    if (!beforeAdd.ok) {
+      return { ok: false, committed: false, ...(beforeAdd.cancelled ? { cancelled: true } : {}), error: beforeAdd.error }
+    }
+    const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
+    if (add.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
+    if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
+    const beforeCommit = await checkRegisteredWorktreeBranch(opts, rec)
+    if (!beforeCommit.ok) {
+      return { ok: false, committed: false, ...(beforeCommit.cancelled ? { cancelled: true } : {}), error: beforeCommit.error }
+    }
+    const branchHeadBeforeCommit = await git.run(
+      ['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`],
+      { cwd: opts.root, signal: opts.signal },
+    )
+    if (branchHeadBeforeCommit.aborted || isAborted(opts.signal)) {
+      return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
+    }
+    if (!branchHeadBeforeCommit.ok || !branchHeadBeforeCommit.stdout.trim()) {
+      return { ok: false, committed: false, error: `读取任务分支尖端失败：${branchHeadBeforeCommit.stderr.trim() || 'git rev-parse 失败'}` }
+    }
+    try {
+      snapshotGuard = await createSnapshotGuard(rec.path, git, opts.signal, rec.branch, branchHeadBeforeCommit.stdout.trim())
+    } catch (error) {
+      if (isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
+      return { ok: false, committed: false, error: `准备快照提交保护钩子失败：${/** @type {Error} */ (error).message}` }
+    }
+    if (isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
+    // Git must acquire its own HEAD.lock; the reference hook validates the ref update before it is written.
+    releaseHeadLock()
+    const commit = await git.run(
+      ['-c', `core.hooksPath=${snapshotGuard.hooksPath}`, 'commit', '-m', message],
+      { cwd: rec.path, signal: opts.signal },
+    )
+    if (commit.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
+    if (!commit.ok) return { ok: false, committed: false, error: `快照提交失败：${commit.stderr.trim()}` }
+    const afterCommit = await checkRegisteredWorktreeBranch(opts, rec)
+    if (!afterCommit.ok) {
+      return { ok: false, committed: true, ...(afterCommit.cancelled ? { cancelled: true } : {}), error: afterCommit.error }
+    }
+    const commitHead = await git.run(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: rec.path, signal: opts.signal })
+    if (commitHead.aborted || isAborted(opts.signal)) {
+      return { ok: false, committed: true, cancelled: true, error: '操作已取消（aborted）' }
+    }
+    if (!commitHead.ok || !commitHead.stdout.trim()) {
+      return { ok: false, committed: true, error: `读取快照提交失败：${commitHead.stderr.trim() || 'git rev-parse 失败'}` }
+    }
+    const commitParent = await git.run(['rev-parse', '--verify', 'HEAD^'], { cwd: rec.path, signal: opts.signal })
+    if (commitParent.aborted || isAborted(opts.signal)) {
+      return { ok: false, committed: true, cancelled: true, error: '操作已取消（aborted）' }
+    }
+    if (!commitParent.ok || !commitParent.stdout.trim()) {
+      return { ok: false, committed: true, error: `读取快照提交父级失败：${commitParent.stderr.trim() || 'git rev-parse 失败'}` }
+    }
+    const branchHeadAfterCommit = await git.run(
+      ['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`],
+      { cwd: opts.root, signal: opts.signal },
+    )
+    if (branchHeadAfterCommit.aborted || isAborted(opts.signal)) {
+      return { ok: false, committed: true, cancelled: true, error: '操作已取消（aborted）' }
+    }
+    if (!branchHeadAfterCommit.ok || !branchHeadAfterCommit.stdout.trim()) {
+      return { ok: false, committed: true, error: `读取任务分支尖端失败：${branchHeadAfterCommit.stderr.trim() || 'git rev-parse 失败'}` }
+    }
+    if (
+      commitParent.stdout.trim() !== branchHeadBeforeCommit.stdout.trim() ||
+      commitHead.stdout.trim() !== branchHeadAfterCommit.stdout.trim()
+    ) {
+      return {
+        ok: false,
+        committed: true,
+        error: `快照提交未落在账本任务分支 ${rec.branch}，已拒绝继续同步`,
+      }
+    }
+    return { ok: true, committed: true }
+  } finally {
+    releaseHeadLock()
+    if (snapshotGuard) rmSync(snapshotGuard.hooksPath, { recursive: true, force: true })
+  }
 }
 
 /**
@@ -1045,6 +1131,57 @@ function checkWorktreeBranch(wt, rec) {
     }
   }
   return { ok: true }
+}
+
+/**
+ * Lock a worktree's HEAD so another Git process cannot switch its branch while
+ * snapshot changes are staged and the registered branch is revalidated.
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true, path: string} | {ok: false, error: string, cancelled?: boolean}>}
+ */
+async function acquireWorktreeHeadLock(opts, rec) {
+  const gitDir = await opts.git.run(['rev-parse', '--absolute-git-dir'], { cwd: rec.path, signal: opts.signal })
+  if (gitDir.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
+  if (!gitDir.ok || !gitDir.stdout.trim()) {
+    return { ok: false, error: `读取任务工作区 Git 目录失败：${gitDir.stderr.trim() || 'git rev-parse 失败'}` }
+  }
+
+  const path = join(gitDir.stdout.trim(), 'HEAD.lock')
+  /** @type {number | undefined} */
+  let fd
+  let created = false
+  try {
+    fd = openSync(path, 'wx')
+    created = true
+    closeSync(fd)
+    fd = undefined
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* cleanup below is authoritative */ }
+    }
+    if (created) rmSync(path, { force: true })
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: `锁定任务工作区分支失败：${message}` }
+  }
+  return { ok: true, path }
+}
+
+/**
+ * Re-read Git's registered worktree state before snapshot writes, because the
+ * worktree may have switched branches since the operation's initial check.
+ * @param {OpOpts} opts
+ * @param {LedgerRecord} rec
+ * @returns {Promise<{ok: true} | {ok: false, error: string, cancelled?: boolean}>}
+ */
+async function checkRegisteredWorktreeBranch(opts, rec) {
+  const { root, git } = opts
+  const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  if (wl.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
+  if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
+  const wt = parseWorktreeList(wl.stdout).find((worktree) => samePath(worktree.path, rec.path))
+  if (!wt) return { ok: false, error: `任务工作区已不存在（${rec.path}），可运行 wtm_purge 清理记录` }
+  return checkWorktreeBranch(wt, rec)
 }
 
 /**

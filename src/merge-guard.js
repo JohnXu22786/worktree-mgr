@@ -146,6 +146,97 @@ export async function calculateMergeTree(root, git, signal, baseHead, mergeHead,
 }
 
 /**
+ * Install a temporary reference-transaction guard for snapshot commits.
+ * @param {string} worktree
+ * @param {{run: Function}} git
+ * @param {AbortSignal | undefined} signal
+ * @param {string} expectedBranch
+ * @param {string} expectedHead
+ * @returns {Promise<{hooksPath: string}>}
+ */
+export async function createSnapshotGuard(worktree, git, signal, expectedBranch, expectedHead) {
+  const hooks = await git.run(['rev-parse', '--git-path', 'hooks'], { cwd: worktree, signal })
+  if (!hooks.ok) {
+    throw new Error(`读取仓库 hooks 路径失败：${hooks.stderr.trim() || 'git rev-parse 失败'}`)
+  }
+
+  const originalHooksPath = resolve(worktree, hooks.stdout.replace(/\r?\n$/, ''))
+  const hooksPath = mkdtempSync(join(tmpdir(), 'wtm-snapshot-hooks-'))
+  try {
+    const branchRef = `refs/heads/${expectedBranch}`
+    /** @param {string} value */
+    const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`
+    const expectedRef = quote(branchRef)
+    const expectedTip = quote(expectedHead)
+    /** @param {string} name */
+    const originalHook = (name) => quote(join(originalHooksPath, name))
+    const inheritedParameters = process.env.GIT_CONFIG_PARAMETERS ?? ''
+    const cleanConfig = `GIT_CONFIG_PARAMETERS=${quote(inheritedParameters)}`
+    /** @param {string} name @param {string} body */
+    const writeHook = (name, body) => {
+      const hookPath = join(hooksPath, name)
+      writeFileSync(hookPath, body, 'utf8')
+      chmodSync(hookPath, 0o755)
+    }
+
+    for (const name of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit']) {
+      writeHook(name, `#!/bin/sh
+hook=${originalHook(name)}
+if [ -x "$hook" ]; then ${cleanConfig} "$hook" "$@" || exit $?; fi
+exit 0
+`)
+    }
+
+    writeHook('reference-transaction', `#!/bin/sh
+input=$(mktemp "\${TMPDIR:-/tmp}/wtm-snapshot-ref-transaction.XXXXXX") || {
+  echo 'wtm: unable to create snapshot transaction input' >&2
+  exit 1
+}
+cleanup() { rm -f "$input"; }
+trap cleanup 0 HUP INT TERM
+cat >"$input" || exit 1
+hook=${originalHook('reference-transaction')}
+if [ -x "$hook" ]; then ${cleanConfig} "$hook" "$@" <"$input" || exit $?; fi
+if [ "$1" = prepared ]; then
+  if update=$(awk -v ref=${expectedRef} '$3 == ref { print $1 " " $2; count++ } END { exit count == 1 ? 0 : 1 }' "$input"); then
+    current_branch=$(GIT_OPTIONAL_LOCKS=0 git symbolic-ref --quiet HEAD 2>/dev/null) || {
+      echo 'wtm: snapshot commit has no symbolic task branch' >&2
+      exit 1
+    }
+    if [ "$current_branch" != ${expectedRef} ]; then
+      echo '快照提交拒绝更新其他分支或分支尖端' >&2
+      exit 1
+    fi
+    old=\${update%% *}
+    new=\${update#* }
+    if [ "$old" != ${expectedTip} ]; then
+      echo '快照提交拒绝更新其他分支或分支尖端' >&2
+      exit 1
+    fi
+    parent=$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "$new^" 2>/dev/null) || {
+      echo '快照提交拒绝更新其他分支或分支尖端' >&2
+      exit 1
+    }
+    if [ "$parent" != ${expectedTip} ]; then
+      echo '快照提交拒绝更新其他分支或分支尖端' >&2
+      exit 1
+    fi
+  elif awk '$NF == "HEAD" || substr($3, 1, 11) == "refs/heads/" { found = 1 } END { exit found ? 0 : 1 }' "$input"; then
+    echo '快照提交拒绝更新其他分支或分支尖端' >&2
+    exit 1
+  fi
+fi
+exit 0
+`)
+
+    return { hooksPath }
+  } catch (err) {
+    rmSync(hooksPath, { recursive: true, force: true })
+    throw err
+  }
+}
+
+/**
  * Install temporary hooks that validate the merge while Git prepares its ref transaction.
  * The returned directory must be removed after the merge command finishes.
  * @param {string} root

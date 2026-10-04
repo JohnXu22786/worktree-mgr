@@ -38,8 +38,8 @@ class FakeGit {
   */
   async run(args, opts = {}) {
     this.calls.push({ args, cwd: opts.cwd })
-    const mergeIndex = args.indexOf('merge')
-    const normalized = mergeIndex === -1 ? args : args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+    const commandIndex = args.findIndex((arg) => arg === 'commit' || arg === 'merge')
+    const normalized = commandIndex === -1 ? args : args.slice(commandIndex).filter((arg) => arg !== '--commit')
     const key = normalized.join(' ')
     const a = this.answers.get(args.join(' ')) ?? this.answers.get(key)
     if (a === undefined) throw new Error(`FakeGit: 未预设答案: ${key}`)
@@ -51,8 +51,8 @@ class FakeGit {
    */
   called(args, cwd) {
     return this.calls.some((c) => {
-      const mergeIndex = c.args.indexOf('merge')
-      const normalized = mergeIndex === -1 ? c.args : c.args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+      const commandIndex = c.args.findIndex((arg) => arg === 'commit' || arg === 'merge')
+      const normalized = commandIndex === -1 ? c.args : c.args.slice(commandIndex).filter((arg) => arg !== '--commit')
       const actual = normalized.join(' ')
       return actual === args.join(' ') && (cwd === undefined || c.cwd === cwd)
     })
@@ -60,8 +60,8 @@ class FakeGit {
   /** @param {string[]} args */
   count(args) {
     return this.calls.filter((c) => {
-      const mergeIndex = c.args.indexOf('merge')
-      const normalized = mergeIndex === -1 ? c.args : c.args.slice(mergeIndex).filter((arg) => arg !== '--commit')
+      const commandIndex = c.args.findIndex((arg) => arg === 'commit' || arg === 'merge')
+      const normalized = commandIndex === -1 ? c.args : c.args.slice(commandIndex).filter((arg) => arg !== '--commit')
       const actual = normalized.join(' ')
       return actual === args.join(' ')
     }).length
@@ -927,9 +927,19 @@ function mergeFixture(tmp, { taskDirty = false, baseDirty = false, taskBranch = 
   git.on(['merge-base', '--is-ancestor', 'refs/heads/wtm/t', 'HEAD'], FAIL('not an ancestor', 1))
   git.on(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main'], OK('Merge made by the "ort" strategy.'))
   git.on(['config', '--get', 'branch.main.mergeOptions'], FAIL('', 1))
-  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], OK(`${'2'.repeat(40)}\n`))
-  git.on(['rev-parse', '--verify', 'HEAD^{commit}'], OK(`${'1'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], () => OK(`${git.count(['commit', '-m', 'snapshot T']) > 0 ? '9'.repeat(40) : '2'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'HEAD^{commit}'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === taskPath || ctx.cwd === abandonPath) {
+      return OK(`${git.count(['commit', '-m', 'snapshot T']) > 0 ? '9'.repeat(40) : '2'.repeat(40)}\n`)
+    }
+    return OK(`${'1'.repeat(40)}\n`)
+  })
+  git.on(['rev-parse', '--verify', 'HEAD^'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd === taskPath || ctx.cwd === abandonPath) return OK(`${'2'.repeat(40)}\n`)
+    return FAIL('unknown commit parent')
+  })
   git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'2'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
+  git.on(['merge-tree', '--write-tree', `${'1'.repeat(40)}`, `${'9'.repeat(40)}`], OK(`${'3'.repeat(40)}\n`))
   git.on(['rev-parse', '--git-path', 'hooks'], OK('.git/hooks\n'))
   return { cfg, git, vault, taskGitDir }
 }
@@ -1354,15 +1364,15 @@ test('finishTask：commit 模式 = 提交 + 合并 + 删工作区 + 删分支 + 
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
   git.on(['worktree', 'remove', join(vault, 't')], OK())
-  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '9'.repeat(40)], OK())
   const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
-  assert.equal(r.ok, true)
+  assert.equal(r.ok, true, r.error ?? '')
   assert.equal(r.merged, true)
   assert.equal(r.committed, true)
   assert.equal(r.removed, true)
   assert.equal(r.branchDeleted, true)
   assert.ok(git.called(['worktree', 'remove', join(vault, 't')]))
-  assert.ok(git.called(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)]))
+  assert.ok(git.called(['update-ref', '-d', 'refs/heads/wtm/t', '9'.repeat(40)]))
   assert.equal(loadLedger(vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
 })
@@ -2814,4 +2824,138 @@ test('purge：all 与 tasks 同时指定时报错', async () => {
   assert.equal(r.ok, false)
   assert.match(r.error ?? '', /二选一/)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('mergeTask：脏检查后工作区分支漂移时拒绝暂存', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault, taskGitDir } = mergeFixture(tmp, { taskDirty: true })
+  const taskPath = join(vault, 't')
+  let taskBranch = 'wtm/t'
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => WORKTREES(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + taskBranch + '\n',
+  ))
+  git.on(['status', '--porcelain'], (/** @type {{cwd: string | undefined}} */ ctx) => {
+    if (ctx.cwd !== taskPath) return OK('')
+    taskBranch = 'other'
+    return OK(' M f.txt\n')
+  })
+
+  try {
+    const result = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error ?? '', /分支与账本记录不一致/)
+    assert.equal(git.count(['add', '-A']), 0, 'drift before staging must not stage task changes')
+    assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
+    assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(loadLedger(vault).records.length, 1)
+    assert.equal(fs.existsSync(join(taskGitDir, 'HEAD.lock')), false, 'rejected snapshot must release HEAD.lock')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('finishTask：暂存期间工作区分支漂移时拒绝快照提交', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault, taskGitDir } = mergeFixture(tmp, { taskDirty: true })
+  const taskPath = join(vault, 't')
+  let taskBranch = 'wtm/t'
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => WORKTREES(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + taskBranch + '\n',
+  ))
+  git.on(['add', '-A'], () => {
+    taskBranch = 'other'
+    return OK()
+  })
+
+  try {
+    const result = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error ?? '', /分支与账本记录不一致/)
+    assert.equal(git.count(['add', '-A']), 1)
+    assert.equal(git.count(['commit', '-m', 'snapshot T']), 0, 'drift after staging must stop the commit')
+    assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(git.count(['worktree', 'remove', taskPath]), 0, 'failed snapshot must preserve the worktree')
+    assert.equal(loadLedger(vault).records.length, 1)
+    assert.equal(fs.existsSync(join(taskGitDir, 'HEAD.lock')), false, 'rejected snapshot must release HEAD.lock')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('mergeTask：git commit 前释放工作区 HEAD 锁', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, taskGitDir } = mergeFixture(tmp, { taskDirty: true })
+  const headLockPath = join(taskGitDir, 'HEAD.lock')
+  let lockObservedAtCommit = false
+  git.on(['commit', '-m', 'snapshot T'], () => {
+    lockObservedAtCommit = fs.existsSync(headLockPath)
+    return OK('[wtm/t 9999999] snapshot T')
+  })
+
+  try {
+    const result = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(result.ok, true)
+    assert.equal(lockObservedAtCommit, false, 'git commit must acquire HEAD.lock itself')
+    assert.equal(fs.existsSync(headLockPath), false, 'snapshot completion must release HEAD.lock')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('mergeTask：commit 期间分支切走再切回时拒绝错误快照', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
+  const taskPath = join(vault, 't')
+  let taskBranch = 'wtm/t'
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => WORKTREES(
+    'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+    'worktree ' + taskPath + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + taskBranch + '\n',
+  ))
+  git.on(['commit', '-m', 'snapshot T'], () => {
+    taskBranch = 'other'
+    taskBranch = 'wtm/t'
+    return OK('[other 9999999] snapshot T')
+  })
+  git.on(['rev-parse', '--verify', 'HEAD^{commit}'], (/** @type {{cwd: string | undefined}} */ ctx) => (
+    ctx.cwd === taskPath ? OK(`${'2'.repeat(40)}\n`) : OK(`${'1'.repeat(40)}\n`)
+  ))
+  git.on(['rev-parse', '--verify', 'refs/heads/wtm/t^{commit}'], OK(`${'2'.repeat(40)}\n`))
+  git.on(['rev-parse', '--verify', 'HEAD^'], OK(`${'1'.repeat(40)}\n`))
+
+  try {
+    const result = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error ?? '', /未落在账本任务分支/)
+    assert.equal(git.count(['commit', '-m', 'snapshot T']), 1)
+    assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(loadLedger(vault).records[0]?.updatedAt, 'u')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('mergeTask：HEAD 已被其他 Git 操作锁定时拒绝快照', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, taskGitDir } = mergeFixture(tmp, { taskDirty: true })
+  const headLockPath = join(taskGitDir, 'HEAD.lock')
+  fs.writeFileSync(headLockPath, '')
+
+  try {
+    const result = await mergeTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error ?? '', /锁定任务工作区分支失败/)
+    assert.equal(git.count(['add', '-A']), 0)
+    assert.equal(git.count(['commit', '-m', 'snapshot T']), 0)
+    assert.equal(git.count(['merge', '--no-ff', 'refs/heads/wtm/t', '-m', 'fold T into main']), 0)
+    assert.equal(fs.existsSync(headLockPath), true, 'snapshot must not remove another Git process\'s lock')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
