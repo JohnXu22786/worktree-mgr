@@ -1348,7 +1348,7 @@ test('listStatus：rev-list 输出格式异常时保留未知计数并返回警�
   rmSync(tmp, { recursive: true, force: true })
 })
 
-test('listStatus：工作区分支漂移时标记为不存在且不计算错误分支状态', async () => {
+test('listStatus：工作区分支漂移时标记状态并不计算错误分支状态', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
   const git = new FakeGit()
@@ -1369,6 +1369,8 @@ test('listStatus：工作区分支漂移时标记为不存在且不计算错误�
   assert.equal(r.ok, true)
   assert.ok(r.rows, '应有 rows')
   assert.equal(r.rows[0].exists, false)
+  assert.equal(r.rows[0].branchDrift, true)
+  assert.equal(r.rows[0].currentBranch, 'other')
   assert.equal(r.rows[0].dirty, false)
   assert.equal(r.rows[0].counts, null)
   assert.equal(git.count(['status', '--porcelain']), 0, '分支漂移时不应读取错误工作区状态')

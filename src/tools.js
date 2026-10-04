@@ -51,6 +51,40 @@ export function readRepoConfig(root) {
 }
 
 /**
+ * Quote a value for a shell command shown in recovery guidance.
+ * @param {string} value
+ * @param {'posix' | 'cmd' | 'powershell'} [shell]
+ * @returns {string}
+ * @throws {Error} If cmd.exe cannot safely represent the value.
+ */
+export function quoteShellArg(value, shell = process.platform === 'win32' ? 'cmd' : 'posix') {
+  if (shell === 'posix') return "'" + value.replace(/'/g, "'\\''") + "'"
+  if (shell === 'powershell') return "'" + value.replace(/'/g, "''") + "'"
+  // cmd.exe expands % despite quotes, may expand !, and quotes, line breaks, or trailing backslashes can change argv.
+  if (shell === 'cmd' && /[%!"]|\\$|[\r\n]/.test(value)) {
+    throw new Error('cmd.exe cannot safely quote values containing expansions, quotes, line breaks, or trailing backslashes')
+  }
+  return '"' + value + '"'
+}
+
+/**
+ * Format recovery commands, using PowerShell when cmd cannot safely represent a Windows value.
+ * @param {{path: string, branch: string, task: string, finishCommand: string, platform?: string}} args
+ * @returns {string}
+ */
+export function formatRecoveryCommand({ path, branch, task, finishCommand, platform = process.platform }) {
+  /** @param {'posix' | 'cmd' | 'powershell'} shell */
+  const render = (shell) =>
+    `git -C ${quoteShellArg(path, shell)} switch ${quoteShellArg(branch, shell)}；` +
+    `或 ${finishCommand} ${quoteShellArg(task, shell)} --mode keep`
+  if (platform !== 'win32') return render('posix')
+  if ([path, branch, task, finishCommand].some((value) => /[%!"]|\\$|[\r\n]/.test(value))) {
+    return `PowerShell only: ${render('powershell')}`
+  }
+  return `cmd.exe: ${render('cmd')}；PowerShell: ${render('powershell')}`
+}
+
+/**
  * 工具定义形态（dsh 工具约定）。
  * @typedef {object} ToolDef
  * @property {string} name
@@ -332,7 +366,18 @@ export function createToolSet(opts) {
         const lines = [`进行中的任务（${rows.length}）：`, '']
         for (const r of rows) {
           const state = []
-          if (!r.exists) state.push('工作区缺失')
+          if (r.branchDrift) {
+            const currentBranch = r.currentBranch ?? 'detached HEAD'
+            state.push(
+              `分支漂移（工作区当前为 ${currentBranch}，账本记录为 ${r.branch}）。` +
+              `请执行 ${formatRecoveryCommand({
+                path: r.path,
+                branch: r.branch,
+                task: r.task,
+                finishCommand: 'wtm_finish',
+              })} 解除管理后手动处理`,
+            )
+          } else if (!r.exists) state.push('工作区缺失')
           else {
             if (r.dirty) state.push('有未提交改动')
             if (r.counts) {
