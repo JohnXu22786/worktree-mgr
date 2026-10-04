@@ -78,6 +78,7 @@ import { runTriggers } from './triggers.js'
  * 操作统一结果。
  * @typedef {object} OpResult
  * @property {boolean} ok
+ * @property {boolean} [cancelled]
  * @property {string} [error]
  * @property {string} [note]
  * @property {string} [task]
@@ -90,7 +91,7 @@ import { runTriggers } from './triggers.js'
  * @property {boolean} [branchDeleted]
  * @property {string[]} [warnings]
  * @property {Array<{task: string, branch: string, base: string, path: string, exists: boolean, branchDrift: boolean, currentBranch: string | null, dirty: boolean | null, counts: {ahead: number, behind: number} | null, updatedAt: string}>} [rows]
- * @property {Array<{task: string, ok: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean, branchDeleted?: boolean, warnings?: string[]}>} [results]
+ * @property {Array<{task: string, ok: boolean, cancelled?: boolean, error?: string, note?: string, merged?: boolean, committed?: boolean, branchDeleted?: boolean, warnings?: string[]}>} [results]
  */
 
 const MERGE_MODES = new Set(['commit', 'refuse'])
@@ -108,7 +109,35 @@ function isAborted(signal) {
 }
 
 function abortResult() {
-  return { ok: false, error: '操作已取消（aborted）' }
+  return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
+}
+
+/**
+ * @param {{cancelled?: boolean, cleanupConfirmed?: boolean, cleanupError?: string}} result
+ * @param {AbortSignal | undefined} signal
+ */
+function triggerWasCancelled(result, signal) {
+  return result.cancelled === true || isAborted(signal)
+}
+
+/**
+ * @param {{cleanupConfirmed?: boolean, cleanupError?: string}} result
+ * @param {string} stage
+ */
+function triggerCancellationError(result, stage) {
+  if (result.cleanupConfirmed !== true) {
+    return `操作已取消（aborted）；${stage}触发器清理未能确认${result.cleanupError ? `：${result.cleanupError}` : ''}`
+  }
+  return '操作已取消（aborted）'
+}
+
+/**
+ * @param {{cleanupConfirmed?: boolean, cleanupError?: string}} result
+ * @param {string} stage
+ */
+function triggerCancellationWarnings(result, stage) {
+  if (result.cleanupConfirmed === true) return []
+  return [`${stage}触发器清理未能确认：${result.cleanupError || '请检查仍运行的触发器进程'}`]
 }
 
 /**
@@ -236,6 +265,8 @@ export async function begin(opts) {
   let result
   let createdWorktree = false
   let addAttempted = false
+  let triggerCleanupUncertain = false
+  let cancellationRollbackUncertain = false
   try {
     result = await withLock(vault, async () => {
       const ledger = loadLedger(vault)
@@ -245,6 +276,7 @@ export async function begin(opts) {
 
       // 基分支：默认当前分支
       const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
+      if (cur.aborted || isAborted(opts.signal)) return abortResult()
       if (!cur.ok) return { ok: false, error: `读取当前分支失败：${cur.stderr.trim()}` }
       const baseName = opts.base ?? cur.stdout.trim()
       if (!baseName) {
@@ -252,19 +284,23 @@ export async function begin(opts) {
       }
       const baseRef = `refs/heads/${baseName}`
       const baseCheck = await git.run(['show-ref', '--verify', baseRef], { cwd: root, signal: opts.signal })
+      if (baseCheck.aborted || isAborted(opts.signal)) return abortResult()
       if (!baseCheck.ok) {
         // 空仓库（无任何提交）时分支尚未诞生，show-ref 会失败——给出明确提示
         const headCheck = await git.run(['rev-parse', '--verify', 'HEAD'], { cwd: root, signal: opts.signal })
+        if (headCheck.aborted || isAborted(opts.signal)) return abortResult()
         const hint = headCheck.ok ? '' : '（仓库尚无任何提交，请先创建首个提交）'
         return { ok: false, error: `基分支不存在：${baseName}${hint}` }
       }
 
       // 分支冲突：git 里已存在
       const existsCheck = await git.run(['show-ref', '--verify', `refs/heads/${branchName}`], { cwd: root, signal: opts.signal })
+      if (existsCheck.aborted || isAborted(opts.signal)) return abortResult()
       if (existsCheck.ok) return { ok: false, error: `分支已存在：${branchName}` }
 
       // 安全检查：主工作区状态不可读时不能继续；脏时新建工作区不会包含未提交改动
       const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
+      if (baseStatus.aborted || isAborted(opts.signal)) return abortResult()
       if (!baseStatus.ok) {
         return { ok: false, error: `读取主工作区状态失败：${baseStatus.stderr.trim() || 'git status 失败'}` }
       }
@@ -285,10 +321,38 @@ export async function begin(opts) {
       addAttempted = true
       const add = await git.run(['worktree', 'add', wtPath, '-b', branchName, baseRef], { cwd: root, signal: opts.signal })
       if (!add.ok) {
+        const addCancelled = add.aborted || isAborted(opts.signal)
+        if (addCancelled) {
+          // A killed `worktree add` can still have registered the worktree and
+          // created its branch. Keep those identifiers in the ledger instead of
+          // rolling them back or leaving them discoverable only by manual search.
+          const afterInterruptedAdd = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root })
+          const registered = afterInterruptedAdd.ok
+            ? parseWorktreeList(afterInterruptedAdd.stdout).find((worktree) => samePath(worktree.path, wtPath))
+            : undefined
+          /** @type {LedgerRecord} */
+          const recoveryRecord = {
+            task,
+            branch: branchName,
+            base: baseName,
+            path: wtPath,
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+          }
+          if (opts.note) recoveryRecord.note = opts.note
+          upsertRecord(ledger, recoveryRecord)
+          saveLedger(vault, ledger)
+          if (registered?.branch === branchName) {
+            warnings.push(`worktree add 已取消，但 Git 已登记工作区和分支，恢复信息已写入账本；${manualCleanupHint(wtPath, branchName)}`)
+          } else {
+            warnings.push(`worktree add 已取消，Git 未能确认工作区和分支状态；待恢复任务、分支和路径已写入账本；${manualCleanupHint(wtPath, branchName)}`)
+          }
+        }
         warnings.push(`worktree add 失败，可能留下部分资源；${manualCleanupHint(wtPath, branchName)}`)
         return {
           ok: false,
-          error: add.aborted || isAborted(opts.signal)
+          ...(addCancelled ? { cancelled: true } : {}),
+          error: addCancelled
             ? '操作已取消（aborted）'
             : `创建工作区失败：${add.stderr.trim()}`,
         }
@@ -324,14 +388,6 @@ export async function begin(opts) {
         }
       }
 
-      // on_begin 触发器（工作目录 = 新工作区）
-      const triggerWarnings = await runTriggers(
-        repo?.triggers?.on_begin,
-        { task, branch: branchName, base: baseName, path: wtPath, root },
-        { spawn: opts.triggerSpawn, cwd: wtPath },
-      )
-      warnings.push(...triggerWarnings.warnings)
-
       /** @type {LedgerRecord} */
       const record = {
         task,
@@ -342,18 +398,68 @@ export async function begin(opts) {
         updatedAt: nowIso(),
       }
       if (opts.note) record.note = opts.note
+
+      // on_begin 触发器（工作目录 = 新工作区）
+      const triggerWarnings = await runTriggers(
+        repo?.triggers?.on_begin,
+        { task, branch: branchName, base: baseName, path: wtPath, root },
+        { spawn: opts.triggerSpawn, cwd: wtPath, signal: opts.signal },
+      )
+      warnings.push(...triggerWarnings.warnings)
+      if (triggerWasCancelled(triggerWarnings, opts.signal)) {
+        if (triggerWarnings.cleanupConfirmed !== true) {
+          triggerCleanupUncertain = true
+          upsertRecord(ledger, record)
+          saveLedger(vault, ledger)
+          warnings.push(
+            `on_begin 触发器清理未能确认，工作区与分支已保留并写入账本以便恢复；${manualCleanupHint(wtPath, branchName)}`,
+          )
+          return {
+            ok: false,
+            cancelled: true,
+            error: triggerCancellationError(triggerWarnings, 'on_begin '),
+            task,
+            branch: branchName,
+            base: baseName,
+            path: wtPath,
+          }
+        }
+        const rollbackWarnings = await rollbackCreatedWorktree(git, root, wtPath, branchName)
+        warnings.push(...rollbackWarnings)
+        if (rollbackWarnings.some((warning) => warning.startsWith('工作区创建未完成，且回滚失败'))) {
+          cancellationRollbackUncertain = true
+          upsertRecord(ledger, record)
+          saveLedger(vault, ledger)
+          warnings.push(
+            `on_begin 触发器清理已确认，但资源回滚未能确认，工作区与分支已写入账本以便恢复；${manualCleanupHint(wtPath, branchName)}`,
+          )
+        }
+        return {
+          ok: false,
+          cancelled: true,
+          error: triggerCancellationError(triggerWarnings, 'on_begin '),
+          task,
+          branch: branchName,
+          base: baseName,
+          path: wtPath,
+        }
+      }
       upsertRecord(ledger, record)
       saveLedger(vault, ledger)
       return { ok: true, base: baseName, path: wtPath }
     }, { signal: opts.signal })
   } catch (err) {
     // worktree 已创建但后续步骤失败：回滚，避免留下孤儿工作区阻塞重试
-    if (createdWorktree && typeof result === 'undefined') {
+    if (createdWorktree && typeof result === 'undefined' && !triggerCleanupUncertain && !cancellationRollbackUncertain) {
       warnings.push(...await rollbackCreatedWorktree(git, root, wtPath, branchName))
+    } else if (triggerCleanupUncertain) {
+      warnings.push(`on_begin 触发器清理未能确认，且恢复账本写入失败：${/** @type {Error} */ (err).message}；${manualCleanupHint(wtPath, branchName)}`)
+    } else if (cancellationRollbackUncertain) {
+      warnings.push(`on_begin 资源回滚失败，且恢复账本写入失败：${/** @type {Error} */ (err).message}；${manualCleanupHint(wtPath, branchName)}`)
     } else if (addAttempted && !createdWorktree) {
       warnings.push(`worktree add 未能确认是否完成，可能留下部分资源；${manualCleanupHint(wtPath, branchName)}`)
     }
-    if (isAborted(opts.signal)) return { ok: false, error: '操作已取消（aborted）', warnings }
+    if (isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）', task, branch: branchName, path: wtPath, warnings }
     if (err instanceof VaultError) return { ok: false, error: err.message, warnings }
     return { ok: false, error: `创建失败：${/** @type {Error} */ (err).message}`, warnings }
   }
@@ -550,6 +656,9 @@ export async function purge(opts) {
         : tasks.map((t) => ({ rec: findRecord(ledger, t), name: t }))
       const results = []
       for (const item of targets) {
+        if (isAborted(opts.signal)) {
+          return { ok: false, cancelled: true, error: '操作已取消（aborted）', results }
+        }
         if (!item.rec) {
           results.push({ task: item.name, ok: false, error: '任务不存在' })
           continue
@@ -558,6 +667,7 @@ export async function purge(opts) {
         results.push({
           task: item.rec.task,
           ok: r.ok,
+          cancelled: r.cancelled,
           error: r.error,
           note: r.note,
           merged: r.merged,
@@ -565,6 +675,14 @@ export async function purge(opts) {
           branchDeleted: r.branchDeleted,
           warnings: r.warnings,
         })
+        if (r.cancelled || isAborted(opts.signal)) {
+          return {
+            ok: false,
+            cancelled: true,
+            error: r.error ?? '操作已取消（aborted）',
+            results,
+          }
+        }
       }
       return { ok: true, results }
     }, { signal: opts.signal })
@@ -583,11 +701,12 @@ export async function purge(opts) {
  * @param {LedgerRecord} rec
  * @param {string} task
  * @param {string} [mode='commit']
- * @returns {Promise<{ok: boolean, committed: boolean, error?: string}>}
+ * @returns {Promise<{ok: boolean, committed: boolean, cancelled?: boolean, error?: string}>}
  */
 async function snapshotCommit(opts, rec, task, mode = 'commit') {
   const { git, cfg } = opts
   const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
+  if (st.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
   if (!st.ok) return { ok: false, committed: false, error: `读取任务工作区状态失败：${st.stderr.trim()}` }
   if (!isDirty(st.stdout)) return { ok: true, committed: false }
   if (mode === 'refuse') {
@@ -595,8 +714,10 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
   }
   const message = opts.message ?? renderTemplate(cfg.commitMessage, { task, branch: rec.branch, base: rec.base })
   const add = await git.run(['add', '-A'], { cwd: rec.path, signal: opts.signal })
+  if (add.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
   if (!add.ok) return { ok: false, committed: false, error: `git add 失败：${add.stderr.trim()}` }
   const commit = await git.run(['commit', '-m', message], { cwd: rec.path, signal: opts.signal })
+  if (commit.aborted || isAborted(opts.signal)) return { ok: false, committed: false, cancelled: true, error: '操作已取消（aborted）' }
   if (!commit.ok) return { ok: false, committed: false, error: `快照提交失败：${commit.stderr.trim()}` }
   return { ok: true, committed: true }
 }
@@ -606,17 +727,26 @@ async function snapshotCommit(opts, rec, task, mode = 'commit') {
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
  * @param {string} task
- * @returns {Promise<{ok: boolean, merged: boolean, branchHead?: string, error?: string, warnings: string[]}>}
+ * @returns {Promise<{ok: boolean, merged: boolean, cancelled?: boolean, branchHead?: string, error?: string, warnings: string[]}>}
  */
 async function mergeIntoBase(opts, rec, task) {
   const { root, git, cfg } = opts
+  /** @returns {{ok: false, merged: false, cancelled: true, error: string, warnings: string[]}} */
+  const cancelled = () => ({ ok: false, merged: false, cancelled: true, error: '操作已取消（aborted）', warnings: [] })
 
   const initialBaseCheck = await checkBaseState(opts, rec)
   if (!initialBaseCheck.ok) {
-    return { ok: false, merged: false, error: initialBaseCheck.error, warnings: [] }
+    return {
+      ok: false,
+      merged: false,
+      ...(initialBaseCheck.cancelled ? { cancelled: true } : {}),
+      error: initialBaseCheck.error,
+      warnings: [],
+    }
   }
 
   const initialMergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+  if (initialMergeHead.aborted || isAborted(opts.signal)) return cancelled()
   if (!initialMergeHead.ok || !initialMergeHead.stdout.trim()) {
     return {
       ok: false,
@@ -629,6 +759,9 @@ async function mergeIntoBase(opts, rec, task) {
 
   // 已合并检测：分支尖端已是基分支祖先时跳过合并（重试场景不再制造空 merge 提交）
   const ancestor = await git.run(['merge-base', '--is-ancestor', `refs/heads/${rec.branch}`, 'HEAD'], { cwd: root, signal: opts.signal })
+  if (ancestor.aborted || isAborted(opts.signal)) {
+    return { ok: false, merged: false, cancelled: true, error: '操作已取消（aborted）', warnings: [] }
+  }
   if (!ancestor.ok && ancestor.code !== 1) {
     return {
       ok: false,
@@ -641,10 +774,17 @@ async function mergeIntoBase(opts, rec, task) {
   // Recheck after the asynchronous ancestor query; the user may have switched branches or edited the base meanwhile.
   const finalBaseCheck = await checkBaseState(opts, rec)
   if (!finalBaseCheck.ok) {
-    return { ok: false, merged: false, error: finalBaseCheck.error, warnings: [] }
+    return {
+      ok: false,
+      merged: false,
+      ...(finalBaseCheck.cancelled ? { cancelled: true } : {}),
+      error: finalBaseCheck.error,
+      warnings: [],
+    }
   }
   if (ancestor.ok) {
     const currentMergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+    if (currentMergeHead.aborted || isAborted(opts.signal)) return cancelled()
     if (!currentMergeHead.ok || !currentMergeHead.stdout.trim()) {
       return {
         ok: false,
@@ -665,10 +805,12 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const mergeOptions = await readMergeOptions(root, git, opts.signal, rec.base)
+  if (isAborted(opts.signal)) return cancelled()
   if (!mergeOptions.ok) {
     return { ok: false, merged: false, error: mergeOptions.error, warnings: [] }
   }
   const mergeHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+  if (mergeHead.aborted || isAborted(opts.signal)) return cancelled()
   if (!mergeHead.ok) {
     return {
       ok: false,
@@ -683,6 +825,7 @@ async function mergeIntoBase(opts, rec, task) {
   }
 
   const baseHead = await git.run(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, signal: opts.signal })
+  if (baseHead.aborted || isAborted(opts.signal)) return cancelled()
   if (!baseHead.ok || !baseHead.stdout.trim()) {
     return {
       ok: false,
@@ -693,6 +836,7 @@ async function mergeIntoBase(opts, rec, task) {
   }
   const expectedBaseHead = baseHead.stdout.trim()
   const expectedTree = await calculateMergeTree(root, git, opts.signal, expectedBaseHead, expectedMergeHead, mergeOptions)
+  if (isAborted(opts.signal)) return cancelled()
   if (!expectedTree.ok) {
     return { ok: false, merged: false, error: expectedTree.error, warnings: [] }
   }
@@ -706,12 +850,17 @@ async function mergeIntoBase(opts, rec, task) {
       expectedMergeHead,
     })
   } catch (err) {
+    if (isAborted(opts.signal)) return cancelled()
     return {
       ok: false,
       merged: false,
       error: `准备合并保护钩子失败：${/** @type {Error} */ (err).message}`,
       warnings: [],
     }
+  }
+  if (isAborted(opts.signal)) {
+    rmSync(guard.hooksPath, { recursive: true, force: true })
+    return cancelled()
   }
 
   try {
@@ -731,6 +880,9 @@ async function mergeIntoBase(opts, rec, task) {
       },
     )
     if (!merge.ok) {
+      if (merge.aborted || isAborted(opts.signal)) {
+        return { ok: false, merged: false, cancelled: true, error: '操作已取消（aborted）', warnings: [] }
+      }
       return {
         ok: false,
         merged: false,
@@ -751,12 +903,16 @@ async function mergeIntoBase(opts, rec, task) {
  * 校验当前主工作区仍位于账本基分支且没有未提交改动。
  * @param {OpOpts} opts
  * @param {LedgerRecord} rec
- * @returns {Promise<{ok: true} | {ok: false, error: string}>}
+ * @returns {Promise<{ok: true} | {ok: false, error: string, cancelled?: boolean}>}
  */
 async function checkBaseState(opts, rec) {
   const { root, git } = opts
   const cur = await git.run(['branch', '--show-current'], { cwd: root, signal: opts.signal })
-  if (!cur.ok) return { ok: false, error: `读取主工作区分支失败：${cur.stderr.trim()}` }
+  if (cur.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
+  if (!cur.ok) return {
+    ok: false,
+    error: `读取主工作区分支失败：${cur.stderr.trim()}`,
+  }
 
   const currentBase = cur.stdout.trim()
   if (currentBase !== rec.base) {
@@ -769,7 +925,11 @@ async function checkBaseState(opts, rec) {
   }
 
   const baseStatus = await git.run(['status', '--porcelain'], { cwd: root, signal: opts.signal })
-  if (!baseStatus.ok) return { ok: false, error: `读取基分支状态失败：${baseStatus.stderr.trim()}` }
+  if (baseStatus.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）' }
+  if (!baseStatus.ok) return {
+    ok: false,
+    error: `读取基分支状态失败：${baseStatus.stderr.trim()}`,
+  }
   if (isDirty(baseStatus.stdout)) {
     return { ok: false, error: '基分支工作区存在未提交改动，请先提交或暂存（防止合并混入未完成的工作）' }
   }
@@ -781,12 +941,13 @@ async function checkBaseState(opts, rec) {
  * 同步核心（mergeTask 与 finishTask 共用）：快照 + 合并 + 更新账本。
  * @param {OpOpts} opts
  * @param {{vault: string, ledger: Ledger, rec: LedgerRecord, mode: string}} box
- * @returns {Promise<{ok: boolean, error?: string, committed?: boolean, merged?: boolean, warnings?: string[]}>}
+ * @returns {Promise<{ok: boolean, cancelled?: boolean, error?: string, committed?: boolean, merged?: boolean, warnings?: string[]}>}
  */
 async function syncCore(opts, { vault, ledger, rec, mode }) {
   const { root, git, repo } = opts
   const task = rec.task
   const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  if (wl.aborted || isAborted(opts.signal)) return abortResult()
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
@@ -816,26 +977,48 @@ async function syncCore(opts, { vault, ledger, rec, mode }) {
   // 1) 脏检查 + 快照提交（refuse 模式直接拒绝）
   if (mode === 'refuse') {
     const st = await git.run(['status', '--porcelain'], { cwd: rec.path, signal: opts.signal })
+    if (st.aborted || isAborted(opts.signal)) return abortResult()
     if (st.ok && isDirty(st.stdout)) {
       return { ok: false, error: '任务工作区存在未提交改动，refuse 模式下拒绝合并（可改用 commit 模式自动快照）' }
     }
   }
   const snap = await snapshotCommit(opts, rec, task, mode)
-  if (!snap.ok) return { ok: false, error: snap.error }
+  if (!snap.ok) return { ok: false, ...(snap.cancelled ? { cancelled: true } : {}), error: snap.error }
 
   // 2) 合并回基分支
   const merged = await mergeIntoBase(opts, rec, task)
-  if (!merged.ok) return { ok: false, error: merged.error }
+  if (!merged.ok) return { ok: false, cancelled: merged.cancelled, error: merged.error }
   warnings.push(...merged.warnings)
+  if (isAborted(opts.signal)) {
+    return {
+      ok: false,
+      cancelled: true,
+      error: '操作已取消（aborted）',
+      committed: snap.committed,
+      merged: merged.merged,
+      warnings,
+    }
+  }
 
   // 3) on_merge 触发器（工作目录 = 主仓库）
   if (merged.merged) {
     const triggerWarnings = await runTriggers(
       repo?.triggers?.on_merge,
       { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-      { spawn: opts.triggerSpawn, cwd: root },
+      { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
     )
     warnings.push(...triggerWarnings.warnings)
+    if (triggerWasCancelled(triggerWarnings, opts.signal)) {
+      warnings.push(...triggerCancellationWarnings(triggerWarnings, 'on_merge '))
+      return {
+        ok: false,
+        cancelled: true,
+        error: triggerCancellationError(triggerWarnings, 'on_merge '),
+        committed: snap.committed,
+        merged: merged.merged,
+        warnings,
+      }
+    }
   }
 
   // 4) 更新账本时间戳
@@ -876,14 +1059,22 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   const task = rec.task
   /** @type {string[]} */
   const warnings = []
-  /** @param {string} cause */
-  const preserveAfterBranchDrift = async (cause) => {
+  /**
+   * @param {string} cause
+   * @param {boolean} [cancelled]
+   */
+  const preserveAfterBranchDrift = async (cause, cancelled = isAborted(opts.signal)) => {
     upsertRecord(ledger, rec)
     saveLedger(vault, ledger)
-    const restore = await git.run(['worktree', 'add', rec.path, rec.branch], { cwd: root, signal: opts.signal })
+    const restore = await git.run(
+      ['worktree', 'add', rec.path, rec.branch],
+      { cwd: root, ...(cancelled ? {} : { signal: opts.signal }) },
+    )
+    const restoreCancelled = cancelled || restore.aborted === true || isAborted(opts.signal)
     return {
       ok: false,
-      error: `${cause}，分支删除失败（${rec.branch}）；` +
+      ...(restoreCancelled ? { cancelled: true } : {}),
+      error: `${restoreCancelled ? '操作已取消（aborted）；' : ''}${cause}，分支删除失败（${rec.branch}）；` +
         (restore.ok
           ? '工作区已恢复，账本记录已保留，请同步新提交后重试'
           : `工作区恢复失败：${restore.stderr.trim() || 'git worktree add 失败'}；账本记录已保留，请手动恢复工作区`),
@@ -893,6 +1084,7 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
 
   // 工作区已消失（stale：注册表缺失或目录被外部删除）：直接清记录
   const wl = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  if (wl.aborted || isAborted(opts.signal)) return abortResult()
   if (!wl.ok) return { ok: false, error: `读取 worktree 列表失败：${wl.stderr.trim()}` }
   const worktrees = parseWorktreeList(wl.stdout)
   const wt = worktrees.find((w) => samePath(w.path, rec.path))
@@ -968,14 +1160,19 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   }
   /**
    * @param {string} cause
+   * @param {boolean} [cancelled]
    * @returns {Promise<OpResult>}
    */
-  const rejectAfterWorktreeRecheck = async (cause) => {
-    if (mode !== 'abandon' || !abandonWorktreePath) return { ok: false, error: cause, warnings }
+  const rejectAfterWorktreeRecheck = async (cause, cancelled = false) => {
+    if (mode !== 'abandon' || !abandonWorktreePath) {
+      return { ok: false, ...(cancelled ? { cancelled: true } : {}), error: `${cancelled ? '操作已取消（aborted）；' : ''}${cause}`, warnings }
+    }
     const restore = await restoreAbandonWorktree()
+    const restoreCancelled = cancelled || isAborted(opts.signal)
     return {
       ok: false,
-      error: `${cause}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
+      ...(restoreCancelled ? { cancelled: true } : {}),
+      error: `${restoreCancelled ? '操作已取消（aborted）；' : ''}${cause}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
       warnings,
     }
   }
@@ -984,6 +1181,7 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
       cwd: rec.path,
       signal: opts.signal,
     })
+    if (state.aborted || isAborted(opts.signal)) return abortResult()
     if (!state.ok) {
       return { ok: false, error: `检查任务工作区状态失败：${state.stderr.trim() || 'git status 失败'}；已保留工作区与账本记录` }
     }
@@ -1005,15 +1203,16 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   if (mode === 'commit') {
     // 快照提交 + 合并（abandon 模式两者都跳过）
     const snap = await snapshotCommit(opts, rec, task)
-    if (!snap.ok) return { ok: false, error: snap.error }
+    if (!snap.ok) return { ok: false, ...(snap.cancelled ? { cancelled: true } : {}), error: snap.error, warnings }
     committed = snap.committed
     const m = await mergeIntoBase(opts, rec, task)
-    if (!m.ok) return { ok: false, error: m.error }
+    if (!m.ok) return { ok: false, cancelled: m.cancelled, error: m.error, warnings }
     merged = m.merged
     mergedBranchHead = m.branchHead
     warnings.push(...m.warnings)
     if (restoreOnBranchDeleteFailure) {
       const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+      if (currentBranchHead.aborted || isAborted(opts.signal)) return { ok: false, cancelled: true, error: '操作已取消（aborted）', warnings }
       if (!currentBranchHead.ok || !currentBranchHead.stdout.trim()) {
         return {
           ok: false,
@@ -1033,9 +1232,21 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
       const mergeTriggerWarnings = await runTriggers(
         repo?.triggers?.on_merge,
         { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-        { spawn: opts.triggerSpawn, cwd: root },
+        { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
       )
       warnings.push(...mergeTriggerWarnings.warnings)
+      if (triggerWasCancelled(mergeTriggerWarnings, opts.signal)) {
+        warnings.push(...triggerCancellationWarnings(mergeTriggerWarnings, 'on_merge '))
+        return {
+          ok: false,
+          cancelled: true,
+          error: triggerCancellationError(mergeTriggerWarnings, 'on_merge '),
+          task,
+          committed,
+          merged,
+          warnings,
+        }
+      }
     }
   }
 
@@ -1046,16 +1257,26 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
     // Finish this path transition even if cancellation arrives mid-command; later checks can roll it back safely.
     const move = await git.run(['worktree', 'move', rec.path, abandonWorktreePath], { cwd: root })
     if (!move.ok) {
-      return { ok: false, error: `隔离任务工作区失败：${move.stderr.trim() || 'git worktree move 失败'}；已保留工作区与账本记录`, warnings }
+      const moveCancelled = move.aborted || isAborted(opts.signal)
+      return {
+        ok: false,
+        ...(moveCancelled ? { cancelled: true } : {}),
+        error: `${moveCancelled ? '操作已取消（aborted）；' : ''}隔离任务工作区失败：${move.stderr.trim() || 'git worktree move 失败'}；已保留工作区与账本记录`,
+        warnings,
+      }
     }
     rec.path = abandonWorktreePath
 
     const gitDir = await git.run(['rev-parse', '--absolute-git-dir'], { cwd: rec.path, signal: opts.signal })
-    if (!gitDir.ok || !gitDir.stdout.trim()) {
-      const cause = `读取隔离工作区 Git 目录失败：${gitDir.stderr.trim() || 'git rev-parse 失败'}`
+    const gitDirCancelled = gitDir.aborted || isAborted(opts.signal)
+    if (gitDirCancelled || !gitDir.ok || !gitDir.stdout.trim()) {
+      const cause = gitDirCancelled
+        ? '操作已取消（aborted）'
+        : `读取隔离工作区 Git 目录失败：${gitDir.stderr.trim() || 'git rev-parse 失败'}`
       const restore = await restoreAbandonWorktree()
       return {
         ok: false,
+        ...(gitDirCancelled ? { cancelled: true } : {}),
         error: `${cause}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
         warnings,
       }
@@ -1085,16 +1306,20 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
       cwd: rec.path,
       signal: opts.signal,
     })
-    if (!state.ok || state.stdout !== abandonWorktreeState) {
-      const cause = state.ok
+    const stateCancelled = state.aborted || isAborted(opts.signal)
+    if (stateCancelled || !state.ok || state.stdout !== abandonWorktreeState) {
+      const cause = stateCancelled
+        ? '操作已取消（aborted）'
+        : state.ok
         ? '任务工作区在检查后发生变化，已拒绝强制移除'
         : `隔离后检查任务工作区状态失败：${state.stderr.trim() || 'git status 失败'}`
       const restore = await restoreAbandonWorktree()
       if (restore.ok) {
-        return { ok: false, error: `${cause}；工作区与账本记录已恢复，请检查后重试`, warnings }
+        return { ok: false, ...(stateCancelled ? { cancelled: true } : {}), error: `${cause}；工作区与账本记录已恢复，请检查后重试`, warnings }
       }
       return {
         ok: false,
+        ...(stateCancelled ? { cancelled: true } : {}),
         error: `${cause}；工作区与账本记录保留在 ${rec.path}，${restore.error}`,
         warnings,
       }
@@ -1118,6 +1343,12 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   // validation. Bind removal to the same registered path and branch immediately
   // before cleanup; abandon restores its staged path if this check fails.
   const latestWorktrees = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  if (latestWorktrees.aborted || isAborted(opts.signal)) {
+    return rejectAfterWorktreeRecheck(
+      `读取收尾前 worktree 列表失败：${latestWorktrees.stderr.trim() || '取消期间未完成复验'}`,
+      true,
+    )
+  }
   if (!latestWorktrees.ok) {
     return rejectAfterWorktreeRecheck(`读取收尾前 worktree 列表失败：${latestWorktrees.stderr.trim()}`)
   }
@@ -1133,19 +1364,30 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
     ? ['worktree', 'remove', '--force', abandonWorktreePath ?? rec.path]
     : ['worktree', 'remove', rec.path]
   const remove = await git.run(removeArgs, mode === 'abandon' ? { cwd: root } : { cwd: root, signal: opts.signal })
+  const removeCancelled = remove.aborted || isAborted(opts.signal)
+  if (removeCancelled && !remove.ok && mode !== 'abandon') {
+    return {
+      ok: false,
+      cancelled: true,
+      error: `操作已取消（aborted）；移除工作区未能确认完成：${remove.stderr.trim() || '已保留账本记录以便恢复'}`,
+      warnings,
+    }
+  }
   if (!remove.ok) {
     if (mode === 'abandon' && abandonWorktreePath) {
       const restore = await restoreAbandonWorktree()
       if (restore.ok) {
         return {
           ok: false,
-          error: `移除工作区失败：${remove.stderr.trim()}；工作区与账本记录已恢复原路径`,
+          ...(removeCancelled ? { cancelled: true } : {}),
+          error: `${removeCancelled ? '操作已取消（aborted）；' : ''}移除工作区失败：${remove.stderr.trim()}；工作区与账本记录已恢复原路径`,
           warnings,
         }
       }
       return {
         ok: false,
-        error: `移除工作区失败：${remove.stderr.trim()}；工作区与账本记录保留在 ${abandonWorktreePath}，${restore.error}`,
+        ...(removeCancelled ? { cancelled: true } : {}),
+        error: `${removeCancelled ? '操作已取消（aborted）；' : ''}移除工作区失败：${remove.stderr.trim()}；工作区与账本记录保留在 ${abandonWorktreePath}，${restore.error}`,
         warnings,
       }
     }
@@ -1188,7 +1430,10 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   let branchDeleted = del.ok
   if (!del.ok) {
     if (mode === 'commit' && restoreOnBranchDeleteFailure) {
-      const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
+      // Worktree removal has succeeded, so complete this read-only safety check
+      // even if cancellation arrived during removal. An aborted read cannot
+      // distinguish branch drift from cancellation and would restore stale state.
+      const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root })
       if (!currentBranchHead.ok || !currentBranchHead.stdout.trim() || currentBranchHead.stdout.trim() !== mergedBranchHead) {
         const cause = currentBranchHead.ok && currentBranchHead.stdout.trim()
           ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${currentBranchHead.stdout.trim()}）`
@@ -1203,29 +1448,66 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
   const triggerWarnings = await runTriggers(
     repo?.triggers?.on_finish,
     { task, branch: rec.branch, base: rec.base, path: rec.path, root },
-    { spawn: opts.triggerSpawn, cwd: root },
+    { spawn: opts.triggerSpawn, cwd: root, signal: opts.signal },
   )
   warnings.push(...triggerWarnings.warnings)
+  let finishCancelled = triggerWasCancelled(triggerWarnings, opts.signal)
+  let finishCancellationWarningsAdded = false
+  const addFinishCancellationWarnings = () => {
+    if (finishCancellationWarningsAdded) return
+    warnings.push(...triggerCancellationWarnings(triggerWarnings, 'on_finish '))
+    finishCancellationWarningsAdded = true
+  }
+  if (finishCancelled) addFinishCancellationWarnings()
 
   if (mode === 'commit' && restoreOnBranchDeleteFailure && !branchDeleted && mergedBranchHead) {
-    const currentBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
-    if (!currentBranchHead.ok || !currentBranchHead.stdout.trim() || currentBranchHead.stdout.trim() !== mergedBranchHead) {
-      const cause = currentBranchHead.ok && currentBranchHead.stdout.trim()
+    const currentBranchHead = await git.run(
+      ['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`],
+      { cwd: root, ...(finishCancelled ? {} : { signal: opts.signal }) },
+    )
+    const branchCheckCancelled = currentBranchHead.aborted === true || isAborted(opts.signal)
+    finishCancelled ||= branchCheckCancelled
+    if (branchCheckCancelled) addFinishCancellationWarnings()
+    if (currentBranchHead.aborted || !currentBranchHead.ok || !currentBranchHead.stdout.trim() || currentBranchHead.stdout.trim() !== mergedBranchHead) {
+      const cause = currentBranchHead.aborted
+        ? '取消时未能复验任务分支尖端'
+        : currentBranchHead.ok && currentBranchHead.stdout.trim()
         ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${currentBranchHead.stdout.trim()}）`
         : `合并后读取任务分支尖端失败：${currentBranchHead.stderr.trim() || 'git rev-parse 失败'}`
-      return preserveAfterBranchDrift(cause)
+      return preserveAfterBranchDrift(cause, finishCancelled)
     }
   }
 
   removeRecord(ledger, task)
   saveLedger(vault, ledger)
   if (mode === 'commit' && restoreOnBranchDeleteFailure && !branchDeleted && mergedBranchHead) {
-    const finalBranchHead = await git.run(['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`], { cwd: root, signal: opts.signal })
-    if (!finalBranchHead.ok || !finalBranchHead.stdout.trim() || finalBranchHead.stdout.trim() !== mergedBranchHead) {
-      const cause = finalBranchHead.ok && finalBranchHead.stdout.trim()
+    const finalBranchHead = await git.run(
+      ['rev-parse', '--verify', `refs/heads/${rec.branch}^{commit}`],
+      { cwd: root, ...(finishCancelled ? {} : { signal: opts.signal }) },
+    )
+    const finalBranchCheckCancelled = finalBranchHead.aborted === true || isAborted(opts.signal)
+    finishCancelled ||= finalBranchCheckCancelled
+    if (finalBranchCheckCancelled) addFinishCancellationWarnings()
+    if (finalBranchHead.aborted || !finalBranchHead.ok || !finalBranchHead.stdout.trim() || finalBranchHead.stdout.trim() !== mergedBranchHead) {
+      const cause = finalBranchHead.aborted
+        ? '取消时未能完成最终任务分支尖端复验'
+        : finalBranchHead.ok && finalBranchHead.stdout.trim()
         ? `任务分支在合并后继续前进（已合并 ${mergedBranchHead}，当前 ${finalBranchHead.stdout.trim()}）`
         : `合并后读取任务分支尖端失败：${finalBranchHead.stderr.trim() || 'git rev-parse 失败'}`
-      return preserveAfterBranchDrift(cause)
+      return preserveAfterBranchDrift(cause, finishCancelled)
+    }
+  }
+  if (finishCancelled) {
+    return {
+      ok: false,
+      cancelled: true,
+      error: triggerCancellationError(triggerWarnings, 'on_finish '),
+      task,
+      committed,
+      merged,
+      removed: true,
+      branchDeleted,
+      warnings,
     }
   }
   return {
