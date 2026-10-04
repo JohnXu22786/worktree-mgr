@@ -122,7 +122,9 @@ test('runTriggers：逐条执行命令并传入 WTM_* 环境变量', async () =>
 test('runTriggers：关闭真实子进程 stdin 后等待其正常退出', async () => {
   /** @type {import('node:child_process').ChildProcess[]} */
   const children = []
-  const script = 'const fs = require("node:fs"); fs.readFileSync(3); fs.readFileSync(0)'
+  const script = process.platform === 'win32'
+    ? 'const fs = require("node:fs"); fs.readFileSync(0)'
+    : 'const fs = require("node:fs"); fs.readFileSync(3); fs.readFileSync(0)'
   /** @type {ReturnType<typeof setTimeout> | undefined} */
   let timer
 
@@ -788,10 +790,11 @@ test('runTriggers：进程检查异常不会阻止尽力终止 shell 与进程�
   rootFields[19] = '100'
   const rootStat = `${pid} (trigger-shell) ${rootFields.join(' ')}`
   const restoreProcFs = mockProcFs({
-    readdir: async (/** @type {any} */ path, /** @type {any[]} */ args, /** @type {Function} */ originalReaddir) => {
+    readdir: (/** @type {any} */ path, /** @type {any[]} */ args, /** @type {Function} */ originalReaddir) => {
       if (String(path) !== '/proc') return originalReaddir(path, ...args)
-      const entries = /** @type {string[]} */ (await originalReaddir(path, ...args))
-      return [...new Set([...entries, String(pid), String(unreadablePid)])]
+      // Keep the identity fixture independent of the host OS: Windows does not
+      // have /proc, but this test supplies the identities needed to exercise it.
+      return [String(process.pid), String(pid), String(unreadablePid)]
     },
     readFile: (/** @type {any} */ path, /** @type {any[]} */ args, /** @type {Function} */ originalReadFile) => {
       if (String(path) === `/proc/${pid}/stat`) return rootStat

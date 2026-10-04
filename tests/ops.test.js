@@ -773,7 +773,7 @@ test('begin：on_begin 取消时只在清理确认后回滚，不确定时保留
   }
 })
 
-test('begin：on_begin 清理已确认但回滚失败时将资源写入账本', async () => {
+test('begin：on_begin 清理不确定或回滚失败时将资源写入账本', async () => {
   const tmp = makeTmp()
   const cfg = baseCfg(tmp)
   const wtPath = join(tmp, 'vault', 't')
@@ -798,11 +798,19 @@ test('begin：on_begin 清理已确认但回滚失败时将资源写入账本', 
 
     assert.equal(result.ok, false)
     assert.equal(result.cancelled, true, JSON.stringify(result))
-    assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 1, JSON.stringify(result))
-    assert.equal(git.count(['branch', '-D', branch]), 1)
-    assert.equal(loadLedger(cfg.vault).records[0]?.path, wtPath, 'unremoved worktree must remain recoverable')
-    assert.equal(loadLedger(cfg.vault).records[0]?.branch, branch, 'remaining branch must remain recoverable')
-    assert.ok(result.warnings?.some((warning) => /回滚|恢复/.test(warning) && /写入账本/.test(warning)), JSON.stringify(result))
+    if (process.platform === 'linux') {
+      assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 1, JSON.stringify(result))
+      assert.equal(git.count(['branch', '-D', branch]), 1)
+      assert.equal(loadLedger(cfg.vault).records[0]?.path, wtPath, 'unremoved worktree must remain recoverable')
+      assert.equal(loadLedger(cfg.vault).records[0]?.branch, branch, 'remaining branch must remain recoverable')
+      assert.ok(result.warnings?.some((warning) => /回滚|恢复/.test(warning) && /写入账本/.test(warning)), JSON.stringify(result))
+    } else {
+      assert.equal(git.count(['worktree', 'remove', '--force', wtPath]), 0, JSON.stringify(result))
+      assert.equal(git.count(['branch', '-D', branch]), 0)
+      assert.equal(loadLedger(cfg.vault).records[0]?.path, wtPath, 'uncertain trigger cleanup must keep the worktree recoverable')
+      assert.equal(loadLedger(cfg.vault).records[0]?.branch, branch, 'uncertain trigger cleanup must keep the branch recoverable')
+      assert.ok(result.warnings?.some((warning) => /清理未能确认|保留.*工作区|手动检查/.test(warning)), JSON.stringify(result))
+    }
     assert.equal(fs.existsSync(join(cfg.vault, '.lock')), false, 'cancellation must release the vault lock')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
