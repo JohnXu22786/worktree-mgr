@@ -321,6 +321,24 @@ test('parseWorktreeList：保留旧版 porcelain 中路径内的换行', () => {
   }])
 })
 
+test('parseWorktreeList：NUL porcelain 保留路径内的元数据样式换行', () => {
+  const path = '/tmp/wt\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/path-text'
+  const text = [
+    `worktree ${path}`,
+    'HEAD 5555555555555555555555555555555555555555',
+    'branch refs/heads/actual',
+    '',
+  ].join('\0')
+
+  assert.deepEqual(parseWorktreeList(text), [{
+    path,
+    branch: 'actual',
+    detached: false,
+    bare: false,
+    locked: false,
+  }])
+})
+
 test('parseWorktreeList：路径内类似 HEAD 字段时不提前截断', () => {
   const text = [
     'worktree /tmp/worktree\nHEAD 4444444444444444444444444444444444444444',

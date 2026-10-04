@@ -916,7 +916,7 @@ test('finishTask：abandon 模式在最终复验发现分支漂移时拒绝删�
   }
 })
 
-test('finishTask：最终 NUL 复验完整保留含元数据样式换行的工作区路径', async () => {
+test('finishTask：最终 NUL 复验完整保留含元数据样式换行的工作区路径', { skip: process.platform === 'win32' }, async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp)
   const taskPath = join(vault, `t\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/path-text`)
