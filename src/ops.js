@@ -914,6 +914,19 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
     }
     return { ok: true }
   }
+  /**
+   * @param {string} cause
+   * @returns {Promise<OpResult>}
+   */
+  const rejectAfterWorktreeRecheck = async (cause) => {
+    if (mode !== 'abandon' || !abandonWorktreePath) return { ok: false, error: cause, warnings }
+    const restore = await restoreAbandonWorktree()
+    return {
+      ok: false,
+      error: `${cause}；${restore.ok ? '工作区与账本记录已恢复' : restore.error}`,
+      warnings,
+    }
+  }
   if (mode === 'abandon') {
     const state = await git.run(['status', '--porcelain=v2', '--branch', '--untracked-files=all'], {
       cwd: rec.path,
@@ -1048,6 +1061,20 @@ async function finishCore(opts, { vault, ledger, rec, mode, restoreOnBranchDelet
       }
     }
   }
+
+  // Commit and merge hooks can change the task worktree after the initial
+  // validation. Bind removal to the same registered path and branch immediately
+  // before cleanup; abandon restores its staged path if this check fails.
+  const latestWorktrees = await git.run(['worktree', 'list', '--porcelain', '-z'], { cwd: root, signal: opts.signal })
+  if (!latestWorktrees.ok) {
+    return rejectAfterWorktreeRecheck(`读取收尾前 worktree 列表失败：${latestWorktrees.stderr.trim()}`)
+  }
+  const latestWorktree = parseWorktreeList(latestWorktrees.stdout).find((w) => samePath(w.path, rec.path))
+  if (!latestWorktree) {
+    return rejectAfterWorktreeRecheck(`任务工作区在收尾前已不存在（${rec.path}），已拒绝清理`)
+  }
+  const latestBranchCheck = checkWorktreeBranch(latestWorktree, rec)
+  if (!latestBranchCheck.ok) return rejectAfterWorktreeRecheck(latestBranchCheck.error)
 
   // 移除工作区：commit 用安全移除，abandon 用 --force
   const removeArgs = mode === 'abandon'

@@ -868,7 +868,7 @@ test('finishTask：分支在其他工作区检出时不删除引用', async () =
     worktreeLists += 1
     const taskWorktree = `worktree ${taskPath}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/wtm/t\n`
     const otherWorktree = `worktree C:/other\nHEAD ${'4'.repeat(40)}\nbranch refs/heads/wtm/t\n`
-    return WORKTREES(`worktree C:/repo\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n${worktreeLists === 1 ? taskWorktree : otherWorktree}`)
+    return WORKTREES(`worktree C:/repo\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/main\n\n${worktreeLists < 3 ? taskWorktree : otherWorktree}`)
   })
   git.on(['worktree', 'remove', taskPath], OK())
   git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
@@ -879,9 +879,81 @@ test('finishTask：分支在其他工作区检出时不删除引用', async () =
   assert.equal(r.branchDeleted, false)
   assert.ok(r.warnings?.some((warning) => /其他工作区/.test(warning)), JSON.stringify(r))
   assert.equal(git.count(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)]), 0)
-  assert.equal(worktreeLists, 2)
+  assert.equal(worktreeLists, 3)
   assert.equal(loadLedger(vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('finishTask：abandon 模式在最终复验发现分支漂移时拒绝删除', async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, 't')
+  const abandonPath = join(vault, '.t.abandon-pending')
+  let worktreeListCalls = 0
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => {
+    worktreeListCalls += 1
+    const path = worktreeListCalls === 1 ? taskPath : abandonPath
+    const branch = worktreeListCalls === 1 ? 'wtm/t' : 'other'
+    return WORKTREES(
+      'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+      'worktree ' + path + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/' + branch + '\n',
+    )
+  })
+  git.on(['worktree', 'remove', '--force', abandonPath], OK())
+  git.on(['branch', '-D', 'wtm/t'], OK())
+
+  try {
+    const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'abandon', cfg, git, repo: null })
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /分支与账本记录不一致/)
+    assert.equal(worktreeListCalls, 2)
+    assert.equal(git.count(['worktree', 'remove', '--force', abandonPath]), 0)
+    assert.equal(git.count(['branch', '-D', 'wtm/t']), 0)
+    assert.ok(git.called(['worktree', 'move', abandonPath, taskPath]))
+    assert.deepEqual(loadLedger(vault).records.map((rec) => [rec.branch, rec.path]), [['wtm/t', taskPath]])
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('finishTask：最终 NUL 复验完整保留含元数据样式换行的工作区路径', { skip: process.platform === 'win32' }, async () => {
+  const tmp = makeTmp()
+  const { cfg, git, vault } = mergeFixture(tmp)
+  const taskPath = join(vault, `t\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/path-text`)
+  const ledger = loadLedger(vault)
+  ledger.records[0].path = taskPath
+  saveLedger(vault, ledger)
+  mkdirSync(taskPath, { recursive: true })
+  let worktreeListCalls = 0
+  /** @param {boolean} includeTask */
+  const nulListing = (includeTask) => OK([
+    'worktree C:/repo',
+    `HEAD ${'1'.repeat(40)}`,
+    'branch refs/heads/main',
+    '',
+    ...(includeTask ? [
+      `worktree ${taskPath}`,
+      `HEAD ${'2'.repeat(40)}`,
+      'branch refs/heads/wtm/t',
+    ] : []),
+    '',
+  ].join('\0'))
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => {
+    worktreeListCalls += 1
+    return nulListing(worktreeListCalls < 3)
+  })
+  git.on(['worktree', 'remove', taskPath], OK())
+  git.on(['update-ref', '-d', 'refs/heads/wtm/t', '2'.repeat(40)], OK())
+
+  try {
+    const r = await finishTask({ root: 'C:/repo', task: 'T', mode: 'commit', cfg, git, repo: null })
+    assert.equal(r.ok, true, JSON.stringify(r))
+    assert.equal(worktreeListCalls, 3)
+    assert.equal(git.count(['worktree', 'list', '--porcelain']), 0)
+    assert.ok(git.called(['worktree', 'remove', taskPath]))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('finishTask：分支尖端未变化时保留删除警告并完成清理', async () => {
@@ -904,8 +976,18 @@ test('finishTask：分支尖端未变化时保留删除警告并完成清理', a
 test('finishTask：abandon 模式跳过提交与合并，强制删除', async () => {
   const tmp = makeTmp()
   const { cfg, git, vault } = mergeFixture(tmp, { taskDirty: true })
+  const taskPath = join(vault, 't')
   const abandonPath = join(vault, '.t.abandon-pending')
   const headLockPath = join(tmp, 'task-gitdir', 'HEAD.lock')
+  let worktreeListCalls = 0
+  git.on(['worktree', 'list', '--porcelain', '-z'], () => {
+    worktreeListCalls += 1
+    const path = worktreeListCalls === 1 ? taskPath : abandonPath
+    return WORKTREES(
+      'worktree C:/repo\nHEAD ' + '1'.repeat(40) + '\nbranch refs/heads/main\n\n' +
+      'worktree ' + path + '\nHEAD ' + '2'.repeat(40) + '\nbranch refs/heads/wtm/t\n',
+    )
+  })
   git.on(['worktree', 'remove', '--force', abandonPath], () => {
     assert.equal(fs.existsSync(headLockPath), true, '移除时必须继续持有分支锁')
     return OK()
@@ -920,6 +1002,7 @@ test('finishTask：abandon 模式跳过提交与合并，强制删除', async ()
   assert.ok(git.called(['worktree', 'remove', '--force', abandonPath]))
   assert.equal(fs.existsSync(headLockPath), false, '完成移除后必须释放分支锁')
   assert.ok(git.called(['branch', '-D', 'wtm/t']))
+  assert.equal(worktreeListCalls, 2)
   assert.equal(loadLedger(vault).records.length, 0)
   rmSync(tmp, { recursive: true, force: true })
 })
