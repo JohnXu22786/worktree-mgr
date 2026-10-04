@@ -72,6 +72,26 @@ class MergeRaceGit extends GitRunner {
   }
 }
 
+class BranchSwitchBeforeSnapshotCommitGit extends GitRunner {
+  /** @type {boolean} */
+  switched
+
+  constructor() {
+    super()
+    this.switched = false
+  }
+
+  /** @param {string[]} args @param {Parameters<GitRunner['run']>[1]} opts */
+  async run(args, opts) {
+    if (!this.switched && args.includes('commit')) {
+      this.switched = true
+      const switchBranch = await super.run(['symbolic-ref', 'HEAD', 'refs/heads/other'], opts)
+      if (!switchBranch.ok) return switchBranch
+    }
+    return super.run(args, opts)
+  }
+}
+
 for (const directory of [
   'vault with spaces', 'vault "quoted"', 'vault\nwith newline',
   'vault\nHEAD deadbeef\nbranch refs/heads/other', 'vault\\literal\tcarriage\rinside',
@@ -563,6 +583,93 @@ git symbolic-ref HEAD refs/heads/develop
     if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
     gitOk(['branch', '-D', branch], root)
     gitOk(['branch', '-D', 'develop'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：snapshot ref transaction 守卫拒绝 commit 前的分支漂移', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new BranchSwitchBeforeSnapshotCommitGit()
+  const branch = 'wtm/snapshot-branch-guard'
+  let worktreePath
+  try {
+    assert.equal(gitOk(['branch', 'other'], root).status, 0)
+    const b = await begin({ root, task: 'Snapshot Branch Guard', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'snapshot.txt'), 'task change\n')
+    const taskHead = gitOk(['rev-parse', `refs/heads/${branch}`], root).stdout.trim()
+    const otherHead = gitOk(['rev-parse', 'refs/heads/other'], root).stdout.trim()
+    const baseHead = gitOk(['rev-parse', 'refs/heads/main'], root).stdout.trim()
+
+    const m = await mergeTask({ root, task: 'Snapshot Branch Guard', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, false, JSON.stringify(m))
+    assert.equal(git.switched, true)
+    assert.equal(gitOk(['rev-parse', `refs/heads/${branch}`], root).stdout.trim(), taskHead)
+    assert.equal(gitOk(['rev-parse', 'refs/heads/other'], root).stdout.trim(), otherHead)
+    assert.equal(gitOk(['rev-parse', 'refs/heads/main'], root).stdout.trim(), baseHead)
+    assert.match(m.error ?? '', /快照提交拒绝更新其他分支/)
+  } finally {
+    if (worktreePath) {
+      gitOk(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], worktreePath)
+      gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    }
+    gitOk(['branch', '-D', branch], root)
+    gitOk(['branch', '-D', 'other'], root)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(vault, { recursive: true, force: true })
+  }
+})
+
+test('集成：快照提交继续调用原始 commit hooks', { skip: !HAS_GIT, timeout: 120000 }, async () => {
+  const root = await makeRepo()
+  const vault = makeVault()
+  const cfg = {
+    vault, prefix: 'wtm',
+    commitMessage: 'snapshot {task}',
+    mergeMessage: 'fold {task} into {base}',
+    warnings: [],
+  }
+  const git = new GitRunner()
+  const hooksDirectory = join(root, '.git', 'hooks')
+  const hookLog = join(vault, 'hook-log')
+  let worktreePath
+  try {
+    const b = await begin({ root, task: 'Snapshot Hook Chain', cfg, git, repo: null })
+    assert.equal(b.ok, true, b.error ?? '')
+    worktreePath = /** @type {string} */ (b.path)
+    writeFileSync(join(worktreePath, 'snapshot.txt'), 'task change\n')
+    for (const name of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit']) {
+      installHook(hooksDirectory, name, `#!/bin/sh\nprintf '%s\\n' ${shellQuote(name)} >> ${shellQuote(hookLog)}\n`)
+    }
+    installHook(hooksDirectory, 'reference-transaction', `#!/bin/sh
+printf 'reference-%s\\n' "$1" >> ${shellQuote(hookLog)}
+cat >/dev/null
+`)
+
+    const m = await mergeTask({ root, task: 'Snapshot Hook Chain', mode: 'commit', cfg, git, repo: null })
+
+    assert.equal(m.ok, true, m.error ?? '')
+    assert.equal(m.merged, true)
+    const events = readFileSync(hookLog, 'utf8').trim().split(/\r?\n/)
+    assert.ok(events.indexOf('pre-commit') < events.indexOf('prepare-commit-msg'))
+    assert.ok(events.indexOf('prepare-commit-msg') < events.indexOf('commit-msg'))
+    assert.ok(events.indexOf('commit-msg') < events.indexOf('post-commit'))
+    assert.equal(events.filter((event) => event === 'post-commit').length, 1)
+    assert.ok(events.includes('reference-prepared'))
+    assert.ok(events.includes('reference-committed'))
+  } finally {
+    if (worktreePath) gitOk(['worktree', 'remove', '--force', worktreePath], root)
+    gitOk(['branch', '-D', 'wtm/snapshot-hook-chain'], root)
     rmSync(root, { recursive: true, force: true })
     rmSync(vault, { recursive: true, force: true })
   }
