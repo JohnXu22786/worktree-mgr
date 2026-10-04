@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, toNamespacedPath } from 'node:path'
-import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runGit, GitRunner } from '../src/git.js'
+import { parseWorktreeList, parseAheadBehind, isDirty, samePath, resolveToplevel, runWorktreeList, runGit, GitRunner } from '../src/git.js'
 
 test('samePath：Windows 风格分隔符差异不影响匹配', { skip: process.platform !== 'win32' }, () => {
   assert.equal(samePath('C:/wtm/vault/t1', 'C:\\wtm\\vault\\t1'), true)
@@ -62,6 +62,49 @@ test('resolveToplevel：保留仓库路径末尾的回车符', async () => {
   }
   const result = await resolveToplevel(git, '/tmp/repo\r')
   assert.deepEqual(result, { ok: true, root: '/tmp/repo\r' })
+})
+
+test('runWorktreeList：exit 129 时回退 legacy porcelain 并解析相同工作区', async () => {
+  const legacyOutput = [
+    'worktree /repo root',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/main',
+    '',
+    'worktree /vault/task',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/wtm/task',
+    '',
+  ].join('\n')
+  const legacyResult = {
+    ok: true,
+    code: 0,
+    stdout: legacyOutput,
+    stderr: '',
+    aborted: false,
+  }
+  /** @type {Array<{args: string[], cwd: string | undefined}>} */
+  const calls = []
+  const git = {
+    run: async (/** @type {string[]} */ args, /** @type {{cwd?: string}} */ opts) => {
+      calls.push({ args, cwd: opts.cwd })
+      if (args.includes('-z')) {
+        return { ok: false, code: 129, stdout: '', stderr: '未知选项 -z', aborted: false }
+      }
+      return legacyResult
+    },
+  }
+
+  const result = await runWorktreeList(git, { cwd: '/repo root' })
+
+  assert.equal(result, legacyResult)
+  assert.deepEqual(parseWorktreeList(result.stdout), [
+    { path: '/repo root', branch: 'main', detached: false, bare: false, locked: false },
+    { path: '/vault/task', branch: 'wtm/task', detached: false, bare: false, locked: false },
+  ])
+  assert.deepEqual(calls, [
+    { args: ['worktree', 'list', '--porcelain', '-z'], cwd: '/repo root' },
+    { args: ['worktree', 'list', '--porcelain'], cwd: '/repo root' },
+  ])
 })
 
 test('parseWorktreeList：解析 porcelain 输出（含空格路径与锁定标记）', () => {
